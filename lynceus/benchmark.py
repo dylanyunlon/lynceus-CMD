@@ -42,6 +42,8 @@ from .cost_model import (
     CostBreakdown,
     create_default_topology,
 )
+from .router import Router
+from .strategies.base import RoutingStrategyBase
 
 
 # ---------------------------------------------------------------------------
@@ -121,119 +123,60 @@ def generate_query_sequence(config: WorkloadConfig,
 
 
 # ---------------------------------------------------------------------------
-# Routing strategy implementations
+# Routing strategy implementations (M003-M004: now delegates to Router)
 # ---------------------------------------------------------------------------
 
 class StrategyExecutor:
     """Executes a routing strategy across a query sequence and records
     per-step latencies.
 
-    This is the analog of Megatron's forward_backward schedule — each
-    "micro-batch" (query) is routed to hardware and its cost recorded.
+    M001-M002: had inline strategy implementations.
+    M003-M004: now delegates to the Router and pluggable strategy objects.
+
+    Backward-compatible: execute_strategy() still works exactly as before.
+
+    Architecture references:
+        - Megatron forward_backward schedule (schedules.py:896)
+          → each micro-batch (query) is routed and its cost recorded
+        - NCCL tuner_v6 getAlgo (tuner_v6.h:73)
+          → the executor selects the algorithm, then runs it
     """
 
     def __init__(self, engine: CostModelEngine):
         self.engine = engine
-
-    def execute_gpu_only(self, queries: List[QueryDescriptor],
-                         data_location: str = "cpu0") -> List[float]:
-        """All queries go to gpu0 regardless."""
-        latencies = []
-        for q in queries:
-            cb = self.engine.estimate_on_device(q, "gpu0", data_location)
-            latencies.append(cb.total_ms)
-        return latencies
-
-    def execute_cpu_only(self, queries: List[QueryDescriptor],
-                         data_location: str = "cpu0") -> List[float]:
-        """All queries go to cpu0."""
-        latencies = []
-        for q in queries:
-            cb = self.engine.estimate_on_device(q, "cpu0", data_location)
-            latencies.append(cb.total_ms)
-        return latencies
-
-    def execute_hybrid_static(self, queries: List[QueryDescriptor],
-                              data_location: str = "cpu0",
-                              gpu_threshold_rows: int = 100_000
-                              ) -> List[float]:
-        """Static threshold: big queries → GPU, small → CPU."""
-        latencies = []
-        for q in queries:
-            if q.estimated_rows > gpu_threshold_rows:
-                cb = self.engine.estimate_on_device(q, "gpu0", data_location)
-            else:
-                cb = self.engine.estimate_on_device(q, "cpu0", data_location)
-            latencies.append(cb.total_ms)
-        return latencies
-
-    def execute_cost_model_routed(self, queries: List[QueryDescriptor],
-                                  data_location: str = "cpu0"
-                                  ) -> List[float]:
-        """Full cost-model routing: choose min-cost device per query.
-
-        This is the Lynceus core — analogous to NCCL's ncclTopoCompute
-        choosing the best ring/tree/collnet algorithm.
-        """
-        latencies = []
-        for q in queries:
-            device_id, cb = self.engine.recommend(q, data_location)
-            latencies.append(cb.total_ms)
-        return latencies
-
-    def execute_par2qo_enhanced(self, queries: List[QueryDescriptor],
-                                data_location: str = "cpu0"
-                                ) -> List[float]:
-        """Cost-model routing + PAR2QO penalty-aware robustness.
-
-        Adds a robustness margin: if GPU cost is within 20% of CPU cost,
-        prefer CPU to avoid PCIe transfer variance. This models PAR2QO's
-        parametric penalty approach (diagram.py:46 pqoByFeatureCollection).
-        """
-        latencies = []
-        robustness_margin = 0.20
-        for q in queries:
-            estimates = self.engine.estimate_all_devices(q, data_location)
-            gpu_ids = [k for k, n in self.engine.topology.nodes.items()
-                       if n.kind.name == "GPU" and k in estimates]
-            cpu_ids = [k for k, n in self.engine.topology.nodes.items()
-                       if n.kind.name == "CPU" and k in estimates]
-
-            if not gpu_ids or not cpu_ids:
-                # Fallback to basic routing
-                device_id, cb = self.engine.recommend(q, data_location)
-                latencies.append(cb.total_ms)
-                continue
-
-            best_gpu = min(gpu_ids, key=lambda k: estimates[k].total_us)
-            best_cpu = min(cpu_ids, key=lambda k: estimates[k].total_us)
-
-            gpu_cost = estimates[best_gpu].total_us
-            cpu_cost = estimates[best_cpu].total_us
-
-            # PAR2QO penalty: prefer CPU when GPU advantage is marginal
-            if gpu_cost < cpu_cost * (1.0 - robustness_margin):
-                latencies.append(estimates[best_gpu].total_ms)
-            else:
-                latencies.append(estimates[best_cpu].total_ms)
-
-        return latencies
+        self._router = Router.create_default(engine)
 
     def execute_strategy(self, strategy: RoutingStrategy,
                          queries: List[QueryDescriptor],
                          data_location: str = "cpu0") -> List[float]:
-        """Dispatch to strategy-specific executor."""
-        dispatch = {
-            RoutingStrategy.GPU_ONLY: self.execute_gpu_only,
-            RoutingStrategy.CPU_ONLY: self.execute_cpu_only,
-            RoutingStrategy.HYBRID_STATIC: self.execute_hybrid_static,
-            RoutingStrategy.COST_MODEL_ROUTED: self.execute_cost_model_routed,
-            RoutingStrategy.PAR2QO_ENHANCED: self.execute_par2qo_enhanced,
-        }
-        executor = dispatch.get(strategy)
-        if executor is None:
-            raise ValueError(f"Unsupported strategy: {strategy}")
-        return executor(queries, data_location)
+        """Dispatch to the Router-backed strategy implementation.
+
+        Returns per-query latency in milliseconds.
+        """
+        self._router.set_active(strategy.value)
+        decisions = self._router.route_batch(queries, data_location)
+        return RoutingStrategyBase.decisions_to_latencies(decisions)
+
+    # Convenience methods preserved for backward compatibility
+    def execute_gpu_only(self, queries, data_location="cpu0"):
+        return self.execute_strategy(
+            RoutingStrategy.GPU_ONLY, queries, data_location)
+
+    def execute_cpu_only(self, queries, data_location="cpu0"):
+        return self.execute_strategy(
+            RoutingStrategy.CPU_ONLY, queries, data_location)
+
+    def execute_hybrid_static(self, queries, data_location="cpu0", **_kw):
+        return self.execute_strategy(
+            RoutingStrategy.HYBRID_STATIC, queries, data_location)
+
+    def execute_cost_model_routed(self, queries, data_location="cpu0"):
+        return self.execute_strategy(
+            RoutingStrategy.COST_MODEL_ROUTED, queries, data_location)
+
+    def execute_par2qo_enhanced(self, queries, data_location="cpu0"):
+        return self.execute_strategy(
+            RoutingStrategy.PAR2QO_ENHANCED, queries, data_location)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +209,7 @@ def run_benchmark(
             RoutingStrategy.HYBRID_STATIC,
             RoutingStrategy.COST_MODEL_ROUTED,
             RoutingStrategy.PAR2QO_ENHANCED,
+            RoutingStrategy.ADAPTIVE,
         ]
 
     # Initialize
@@ -339,6 +283,7 @@ def run_cumulative_benchmark(
             RoutingStrategy.HYBRID_STATIC,
             RoutingStrategy.COST_MODEL_ROUTED,
             RoutingStrategy.PAR2QO_ENHANCED,
+            RoutingStrategy.ADAPTIVE,
         ]
 
     topology = create_default_topology()

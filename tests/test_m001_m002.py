@@ -240,8 +240,8 @@ def test_benchmark_output_format_compliance():
 
     assert meta["n_per_seed"] == 50
     assert meta["n_seeds"] == 2
-    assert meta["n_methods"] == 5
-    assert meta["total_data_points"] == 50 * 2 * 5
+    assert meta["n_methods"] == 6  # 5 original + Adaptive (M003-M004)
+    assert meta["total_data_points"] == 50 * 2 * 6  # 6 methods now
 
     panels = d["panels"]
     assert len(panels) > 0

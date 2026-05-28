@@ -40,6 +40,7 @@ class RoutingStrategy(Enum):
     COST_MODEL_ROUTED = "CostModel-Routed"
     PAR2QO_ENHANCED = "PAR2QO-Enhanced"
     VIDEX_ENHANCED = "VIDEX-Enhanced"
+    ADAPTIVE = "Adaptive"
 
 
 class MetricKind(Enum):
