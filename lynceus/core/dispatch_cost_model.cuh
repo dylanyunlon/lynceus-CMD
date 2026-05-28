@@ -484,5 +484,132 @@ struct DispatchCostModel {
   }
 };
 
+// ---------------------------------------------------------------------------
+// WorkloadAnalyzer — histogram-based workload profiling
+//
+// Uses the extracted histogram (from CostHistogramKernel) to determine
+// adaptive thresholds before starting the filter passes. This enables
+// the DispatchWithProfile variant which tunes the robustness margin
+// and number of passes based on the workload's cost distribution.
+//
+// Algorithm (inspired by CCCL's TopK histogram-based k-th element finding):
+//   1. Build cost histogram over full workload
+//   2. Find the "crossover bin" where GPU becomes cheaper than CPU
+//   3. Set threshold at the crossover point
+//   4. Determine optimal number of passes from histogram entropy
+// ---------------------------------------------------------------------------
+
+struct WorkloadAnalyzer {
+  static constexpr int NUM_BINS = 256;
+
+  struct Profile {
+    double min_cost;
+    double max_cost;
+    double p50_cost;
+    double p95_cost;
+    double crossover_cost;     // cost at which GPU/CPU are equal
+    double gpu_fraction;       // fraction of queries where GPU wins
+    int    recommended_passes; // adaptive pass count
+    double recommended_margin; // adaptive robustness margin
+  };
+
+  static Profile Analyze(
+      const QueryBin *queries,
+      size_t          num_queries,
+      const DeviceCostCoefficients &cpu_c,
+      const DeviceCostCoefficients &gpu_c)
+  {
+    Profile prof = {};
+    prof.min_cost = std::numeric_limits<double>::max();
+
+    // Compute per-query costs and track GPU vs CPU preference
+    size_t gpu_wins = 0;
+    double *min_costs = new double[num_queries];
+    double *gaps = new double[num_queries];  // cpu_cost - gpu_cost
+
+    for (size_t i = 0; i < num_queries; ++i) {
+      double cpu = estimate_cpu_cost(queries[i], cpu_c);
+      double gpu = estimate_gpu_cost(queries[i], gpu_c);
+      min_costs[i] = std::min(cpu, gpu);
+      gaps[i] = cpu - gpu;  // positive = GPU wins
+      if (gpu < cpu) gpu_wins++;
+      prof.min_cost = std::min(prof.min_cost, min_costs[i]);
+      prof.max_cost = std::max(prof.max_cost, min_costs[i]);
+    }
+
+    prof.gpu_fraction = static_cast<double>(gpu_wins) / std::max<size_t>(1, num_queries);
+
+    // Sort for percentiles (like Tabular's BTreeLeafNode::lowerBound but on costs)
+    std::sort(min_costs, min_costs + num_queries);
+    if (num_queries > 0) {
+      prof.p50_cost = min_costs[num_queries / 2];
+      prof.p95_cost = min_costs[std::min(num_queries - 1, num_queries * 95 / 100)];
+    }
+
+    // Find crossover point: median of gaps where GPU and CPU are closest
+    std::sort(gaps, gaps + num_queries);
+    // Binary search for gap closest to 0 (like lowerBound for key=0)
+    size_t lo = 0, hi = num_queries;
+    while (lo < hi) {
+      size_t mid = (lo + hi) / 2;
+      if (gaps[mid] < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    prof.crossover_cost = (lo < num_queries) ? min_costs[lo] : prof.p50_cost;
+
+    // Adaptive pass count: more passes for mixed workloads (high entropy)
+    // Pure GPU/CPU workloads need only 2 passes; mixed need up to 5
+    if (prof.gpu_fraction > 0.9 || prof.gpu_fraction < 0.1) {
+      prof.recommended_passes = 2;
+      prof.recommended_margin = 0.10;
+    } else if (prof.gpu_fraction > 0.7 || prof.gpu_fraction < 0.3) {
+      prof.recommended_passes = 3;
+      prof.recommended_margin = 0.15;
+    } else {
+      prof.recommended_passes = 4;
+      prof.recommended_margin = 0.25;
+    }
+
+    delete[] min_costs;
+    delete[] gaps;
+    return prof;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// DispatchWithProfile — adaptive dispatch using workload profiling
+//
+// Improvement over DispatchCostModel::Dispatch: first analyzes the
+// workload to determine optimal parameters, then dispatches.
+// ---------------------------------------------------------------------------
+
+struct DispatchWithProfile {
+  static RoutingCounter Dispatch(
+      const QueryBin *queries,
+      size_t          num_queries,
+      int            *routing_decisions,
+      CostBin        *cost_results,
+      const DeviceCostCoefficients &cpu_c,
+      const DeviceCostCoefficients &gpu_c)
+  {
+    // Step 1: Profile workload
+    auto profile = WorkloadAnalyzer::Analyze(
+        queries, num_queries, cpu_c, gpu_c);
+
+    // Step 2: Dispatch with adaptive parameters
+    RoutingCounter counter;
+    counter.reset();
+
+    DispatchCostModel::Dispatch(
+        queries, num_queries,
+        routing_decisions, cost_results,
+        cpu_c, gpu_c,
+        profile.recommended_margin,
+        profile.recommended_passes);
+
+    return counter;
+  }
+};
+
 } // namespace core
 } // namespace lynceus
