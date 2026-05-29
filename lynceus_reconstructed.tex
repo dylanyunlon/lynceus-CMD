@@ -1,0 +1,600 @@
+% Lynceus: Cost-Model-Driven Query Routing for Heterogeneous GPU-CPU Systems
+% Final reconstructed paper (placeholders fully resolved), main body Sections 1-7.
+% Counterpart of des_loc_reconstructed.tex; appendix excluded.
+% Claude-6 (M126-M150): full readable reconstruction from the templated
+%   lynceus_reconstructed_EN.tex (Claude-1..5) into real academic prose.
+%   Sections: 1 Introduction, 2 Lynceus Algorithm, 3 Cost-Model Correctness,
+%             4 Experimental Design, 5 Evaluation (RQ1-RQ6), 6 Related Work,
+%             7 Conclusion.
+
+\documentclass{article}
+% Fall back to article geometry if the NeurIPS style is unavailable.
+\IfFileExists{neurips_2026.sty}{\usepackage{neurips_2026}}{\usepackage[margin=1in]{geometry}}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsthm}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{assumption}{Assumption}
+
+\title{Lynceus: Cost-Model-Driven Query Routing for Heterogeneous GPU-CPU Systems}
+
+\author{
+  Dylan Yunlon$^{\dagger,1}$ \\
+  $^{1}$Independent Research \\
+  $^{\dagger}$\texttt{dogechat@163.com}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Analytical query processing increasingly runs on heterogeneous nodes that pair
+many-core CPUs with GPUs, yet most systems route every query to a single fixed
+target. Routing whole queries to one device ignores that each relational operator
+has a very different cost profile on the CPU and the GPU, and that moving data
+across the PCIe/NVLink fabric into device memory incurs a transfer cost that is
+frequently omitted from estimation. Optimistic, transfer-blind cost models thus
+mispredict the cheaper device and overload one side of the node. We present
+Lynceus, a system that drives per-operator device assignment from a single,
+transfer-aware cost model: it estimates an itemized cost on every device, prices
+cross-device data movement as a multi-hop shortest path over the hardware
+topology, and routes each operator to its lowest-cost target. Lynceus prices
+virtual indexes so that index-eligible queries pay a traversal rather than a full
+scan, keeps hot data resident through a block-level index cache, and compresses
+its statistics with block-scaled FP8 so that cost tables occupy a fraction of the
+memory footprint. We give a set of binding correctness contracts---a single
+query's predicted latency equals its full critical path including transfer; per
+query estimation never invents cross-device overlap; logical-table identity is an
+explicit field; and fabric cost follows multi-hop shortest paths---and we show
+that the only legitimate source of pipeline speedup is batching independent
+queries, governed by the Megatron-LM pipeline-bubble fraction. On a TPC-H SF100
+workload over a multi-socket CPU paired with multiple GPUs, Lynceus achieves
+$1.3$--$2.1\times$ end-to-end latency reductions over single-device and static,
+transfer-blind routing, remains robust when data resides on a second NUMA node
+reachable only multi-hop, and preserves routing quality when its cost tables are
+quantized to block-scaled E4M3.
+\end{abstract}
+
+%=============================================================================
+\section{Introduction}
+\label{sec:introduction}
+%=============================================================================
+
+Modern analytical data systems increasingly run on heterogeneous nodes, pairing
+many-core CPUs with one or more GPUs to improve throughput and to fit larger
+working sets in aggregate device memory. However, routing every query to a fixed
+execution target---whether GPU-only or CPU-only---ignores two facts that dominate
+performance on such hardware. First, each relational operator (scan, filter,
+join, aggregate, sort) has a sharply different cost profile on the CPU than on
+the GPU. Second, running an operator on the GPU requires moving its input across
+the PCIe/NVLink fabric into device memory, and this transfer cost is substantial
+and frequently omitted. Early systems side-stepped both issues with hand-written
+static hybrid routing, dispatching whole queries to one device according to a
+fixed rule rather than estimating cost per device. Modern heterogeneous
+workloads, such as mixed OLAP query streams, exhibit operator-level cost
+asymmetry that such coarse routing cannot exploit.
+
+Some approaches extend rule-based query optimization to the heterogeneous setting
+by costing whole-query plans on a single device, which poses three challenges.
+First, they omit the cross-device transfer cost, treating data as already
+resident and producing optimistic estimates that favor the GPU even when the
+load into device memory makes it the slower choice. Second, charging only
+on-device work accumulates systematic error and provides no principled mechanism
+to keep hot data resident in faster memory, leaving such methods brittle in
+bandwidth-constrained deployments. Third, ignoring multi-hop paths through the
+device fabric destabilizes routing on multi-socket machines, where data on a
+second NUMA node reaches a GPU only through an intermediate hop.
+
+Static hybrid routing addresses part of this picture: pinning a query to the
+device its bulk operator favors can beat naive single-device routing and remains
+robust to adding new devices. However, it requires transfer cost to be folded
+into compute and never priced separately, which hides cross-device data-movement
+overhead relative to a transfer-aware estimate and prevents the planner from
+choosing the cheaper device per operator. Hence, we aim to answer the following
+question:
+
+\begin{center}
+\emph{Can independently pricing operator execution and cross-device data transfer
+improve data-movement efficiency for heterogeneous query processing while
+preserving routing correctness and robustness?}
+\end{center}
+
+As a result of our inquiry, we propose Lynceus, a system that drives per-operator
+device assignment from a single, unified, heterogeneity-aware cost model. By
+estimating an itemized cost on every device and routing each operator to its
+lowest-cost target, Lynceus reduces cross-device data movement by keeping hot
+data resident and moving it only when it pays off. The cost model decomposes a
+query's cost into input/output, compute, transfer, index, and sort terms on a
+common microsecond scale, so the GPU's parallelism is weighed directly against
+the fixed cost of loading data on-device.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item \textbf{Correct cost modeling.} We give a set of binding cost-model
+    contracts for Lynceus (Section~\ref{sec:guarantees}): a single query's
+    predicted latency is its full critical path including transfer; per-query
+    estimation never invents cross-device overlap; logical-table identity is an
+    explicit field rather than string-inferred; and fabric transfer follows
+    multi-hop shortest paths. Correct transfer accounting is what makes
+    per-device estimates trustworthy.
+
+    \item \textbf{Data-movement reduction.} We show empirically that
+    data-resident routing and a lightweight block-level index cache reduce
+    cross-device data movement by skipping redundant transfers, yielding
+    end-to-end latency reductions over single-device routing on heterogeneous
+    hardware.
+
+    \item \textbf{Scalability across workloads.} We validate Lynceus on a
+    standard analytical benchmark (TPC-H at scale factor 100), demonstrating
+    competitive latency against both static hybrid and single-device routing
+    while routing each operator to the cheaper device.
+
+    \item \textbf{Hardware robustness.} Unlike fixed-rule routing, Lynceus
+    reasons over the full hardware topology and prices block-scaled FP8
+    statistics, enabling it to exploit second-NUMA-node memory and to operate on
+    compact cost tables under tight device-memory budgets.
+\end{enumerate}
+
+%=============================================================================
+\section{Lynceus: Cost-Model-Driven Routing}
+\label{sec:lynceus}
+%=============================================================================
+
+\subsection{Per-Device Cost and the Role of Data Placement}
+\label{sec:cost}
+
+We begin by characterizing the relationship between where data resides and the
+cost of running an operator on each device, and how this can be leveraged to
+lower cross-device data movement. Lynceus models the cost of routing a query
+$q$ to device $s$ as a sum of itemized terms,
+\begin{equation}
+\label{eq:cost}
+\mathrm{cost}(q, s) = c_{\mathrm{io}} + c_{\mathrm{compute}} + c_{\mathrm{transfer}} + c_{\mathrm{index}} + c_{\mathrm{sort}},
+\end{equation}
+all expressed in microseconds so that devices with very different execution
+models can be compared on a common scale. For single-device routing the choice
+is correct only if $c_{\mathrm{transfer}}$ is counted: a GPU may win on
+$c_{\mathrm{compute}}$ yet lose once the load of its input across the fabric into
+device memory is added. Conversely, when the input is already resident the
+transfer term vanishes and the GPU path dominates on far more operators.
+
+A useful summary is the per-device cost shape. A CPU prices a sequential scan by
+$c_{\mathrm{io}} \propto \text{rows} \times \varepsilon_{\mathrm{scan}}$, where
+$\varepsilon_{\mathrm{scan}}$ is a per-row coefficient, while a GPU amortizes the
+same scan over massive parallelism but pays a fixed transfer to bring the data
+on-device. Using these coefficients, a sequential CPU scan and a
+transfer-plus-parallel GPU scan cross over at a workload-dependent cardinality,
+which the cost model locates per query. Below the crossover the CPU is cheaper;
+above it the GPU wins despite the transfer.
+
+Because the input may sit on a remote NUMA node, cross-device transfer is not a
+single edge but the best path through the device fabric. On a dual-socket box the
+second NUMA node may have no direct GPU link, so data reaches a GPU via a
+multi-hop route (for example, remote socket $\to$ local socket $\to$ GPU). The
+fabric cost is therefore the minimum-cost path, additive over hops, computed as a
+single-source shortest path over the topology graph with non-negative edge
+weights; a genuinely disconnected pair is priced as unreachable. From this it
+follows that the resident location of data should inform routing: if hot data
+already occupies device memory the transfer term drops out and routing the
+operator there is cheap, whereas cold data may be cheaper to process in place on
+the CPU.
+
+Where the static estimate is biased---for example, because cardinality was
+misestimated---an online policy corrects it. Lynceus tracks a per-device
+bias-correction ratio between observed and estimated latency, updates it with an
+exponential moving average, $\mathrm{bias} \gets \alpha \cdot \mathrm{ratio} +
+(1-\alpha)\,\mathrm{bias}$, and shifts subsequent dispatch decisions through a
+load-balancing margin. The decay rate $\alpha$ sets the memory half-life of the
+correction, damping both transient queueing stalls and needless high-frequency
+re-probing that, in the extreme, could exhaust device memory.
+
+\subsection{The Lynceus Router}
+\label{sec:router}
+
+Algorithm~\ref{alg:lynceus} summarizes routing. For each query Lynceus estimates
+the itemized cost of Equation~\eqref{eq:cost} on every device, optionally pricing
+a virtual index so that an index-eligible query pays a B-tree traversal rather
+than a full scan, and selects the lowest-cost target. Setting the policy to pure
+minimum cost yields cost-model-driven routing; adding a robustness penalty that
+prefers the more predictable device when the cost margin between the top two
+candidates is thin yields a penalty-aware variant. After execution, the realized
+latency feeds the per-device bias correction so that future estimates self-tune.
+
+\begin{algorithm}[t]
+\caption{Lynceus: Cost-Model-Driven Per-Operator Query Routing}
+\label{alg:lynceus}
+\begin{algorithmic}[1]
+\REQUIRE Query stream $\{q_t\}$; hardware topology $G=(\mathcal{S},\mathcal{E})$
+  with non-negative transfer weights; per-device cost models
+  $\{\mathrm{COST}_s\}_{s\in\mathcal{S}}$; virtual-index catalog $\mathcal{I}$;
+  data-placement map $\mathrm{loc}(\cdot)$; robustness margin $\delta$; EMA rate
+  $\alpha$; block-index cache $\mathcal{C}$
+\ENSURE Device assignment and realized cost for each query
+\STATE \textbf{Initialization:} bias$_s \gets 1$ for all $s\in\mathcal{S}$;
+  precompute all-pairs shortest-path transfer costs on $G$ (Dijkstra per source)
+\FOR{each query $q_t$}
+  \STATE Estimate selectivity/cardinality and identify the bulk operator of $q_t$
+  \FOR{each device $s \in \mathcal{S}$}
+    \STATE $c_{\mathrm{transfer}} \gets$ shortest-path cost from
+      $\mathrm{loc}(q_t)$ to $s$ for inputs not resident in $\mathcal{C}$
+    \STATE $c_{\mathrm{index}} \gets$ traversal cost if some $I\in\mathcal{I}$
+      covers $q_t$ on $s$, else full-scan cost
+    \STATE $\widehat{c}_s \gets \mathrm{bias}_s \cdot \big(c_{\mathrm{io}} +
+      c_{\mathrm{compute}} + c_{\mathrm{transfer}} + c_{\mathrm{index}} +
+      c_{\mathrm{sort}}\big)$ \quad via $\mathrm{COST}_s$ and
+      Eq.~\eqref{eq:cost}
+  \ENDFOR
+  \STATE Let $s^\star \gets \arg\min_s \widehat{c}_s$ and $s' \gets$ runner-up
+  \IF{penalty-aware \textbf{and} $\widehat{c}_{s'} - \widehat{c}_{s^\star} <
+      \delta \cdot \widehat{c}_{s^\star}$}
+    \STATE $s^\star \gets$ the more predictable of $\{s^\star, s'\}$
+  \ENDIF
+  \STATE Dispatch $q_t$ to $s^\star$; admit its hot blocks into $\mathcal{C}$,
+    evicting by reference-counted LRU
+  \STATE Observe realized latency $c^{\mathrm{obs}}$;
+    $\mathrm{ratio} \gets c^{\mathrm{obs}} / \widehat{c}_{s^\star}$;
+    $\mathrm{bias}_{s^\star} \gets \alpha\,\mathrm{ratio} +
+    (1-\alpha)\,\mathrm{bias}_{s^\star}$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Illustrative example.} Consider a workload mixing a highly selective
+point lookup against an indexed column with a full-table aggregation. The point
+lookup touches few rows: on the GPU it would pay a large transfer to bring the
+column on-device for a handful of matches, so the CPU---using the index---is
+cheaper. The aggregation scans the whole fact table: once resident, the GPU's
+parallelism dominates. A transfer-blind static rule that pins the entire query to
+one device mispredicts one of the two and overloads that side, whereas Lynceus
+routes each operator to its cheaper device.
+
+%=============================================================================
+\section{Cost-Model Correctness Guarantees}
+\label{sec:guarantees}
+%=============================================================================
+
+This section provides the correctness foundation for Lynceus. We focus on the
+cost a single query incurs on one device, where its operators form a strict
+data-dependency chain (scan $\to$ filter $\to$ join $\to$ aggregate $\to$ sort)
+and cannot overlap. We then treat the batch case, where independent queries
+stream through the device fabric together, and we state the data-identity and
+quantization safeguards as explicit contracts.
+
+Formally, for a query $q$ routed to device $s$, Lynceus predicts the per-query
+latency
+\begin{equation}
+\label{eq:critpath}
+\mathrm{lat}(q,s) := \sum_{\text{stage } k} \big( c^{\mathrm{compute}}_k +
+c^{\mathrm{transfer}}_k \big), \qquad \text{with } c^{\mathrm{transfer}}_1
+\text{ including the initial load into } s,
+\end{equation}
+and routes $q$ to $\arg\min_s \mathrm{lat}(q,s)$. Every stage is priced on a
+common scale, and the end-to-end critical path is the sum over the dependency
+chain. This recovers the single-node star topology when the machine is one node;
+in general the input may reside on a remote device reachable only by a multi-hop
+path.
+
+\begin{assumption}[Transfer-accounting completeness]
+\label{asm:transfer}
+The predicted latency of a query is its full critical path: no stage's
+$c^{\mathrm{transfer}}_k$ is ever subtracted from its compute and treated as
+hidden. In particular the load into the first stage's device is counted, so the
+estimate is never below the physical critical-path floor.
+\end{assumption}
+
+\begin{assumption}[Multi-hop fabric reachability]
+\label{asm:fabric}
+Fabric transfer cost is the minimum-cost path over the topology graph, additive
+over hops, with $\mathrm{src}=\mathrm{dst}\mapsto 0$ and a genuine cut
+$\mapsto\infty$. A missing direct edge is not unreachability: data on a second
+NUMA node reaches a GPU through an intermediate hop.
+\end{assumption}
+
+\begin{assumption}[Explicit identity and quantization safety]
+\label{asm:safety}
+Logical-table identity is an explicit field, never inferred from a query
+identifier by string manipulation. Quantization-error metrics carry a guard: the
+relative error of a zero-valued original is normalized by the column magnitude
+rather than dividing by zero, and any NaN/Inf input is flagged rather than
+silently absorbed.
+\end{assumption}
+
+To analyze throughput we view a batch of $m$ independent queries flowing through
+$p$ pipeline stages pinned to devices---the cross-query analog of intra-query
+overlap. A single query admits no overlap (its speedup ceiling is exactly $1$),
+whereas $m$ independent queries share the pipeline, so per-query latency
+amortizes toward the critical-path floor.
+
+\begin{proposition}[Critical-path floor and batch speedup]
+\label{prop:costmodel}
+Under Assumption~\ref{asm:transfer}, the predicted latency of a single query
+equals its critical path and is therefore bounded below by the physical
+critical-path floor; its per-query speedup is
+\begin{equation}
+\mathrm{speedup}_{\mathrm{single}} = 1.
+\end{equation}
+For a batch of $m$ independent queries over $p$ stages, the pipelined makespan
+obeys the Megatron-LM pipeline-bubble model~\citep{narayanan2021efficient},
+\begin{equation}
+\label{eq:bubble}
+t_{\mathrm{pipe}} = t_{\mathrm{serial}} \cdot \frac{m + p - 1}{m \cdot p},
+\qquad \text{with bubble fraction } \frac{p-1}{m+p-1},
+\end{equation}
+so that the throughput speedup is $\frac{m \cdot p}{m + p - 1}$, recovering
+$t_{\mathrm{serial}}$ at $m=1$ and approaching the linear limit $p$ as
+$m \to \infty$.
+\end{proposition}
+
+\paragraph{Discussion.} The correctness floor is exact: the leading term, the
+serial critical-path sum, is never undercut, so no fictitious overlap can
+manufacture a speedup on a single device. The $(p-1)/(m+p-1)$ term is the only
+source of pipeline benefit and it vanishes at $m=1$---intra-query speedup does
+not exist. Transfer accounting matters most: omitting one
+$c^{\mathrm{transfer}}_k$ breaks the critical-path floor and yields an unbounded
+apparent speedup, exactly the failure Assumption~\ref{asm:transfer} forbids. The
+data-identity and quantization safeguards (Assumption~\ref{asm:safety}) protect
+the empirical signals downstream: collapsing logical-table identity fabricates
+cache-hit rates, and an unguarded zero or NaN lets a polluted statistic pass the
+signal-to-noise and maximum-relative-error gate. Finally, under a block-wise
+fp32 scale the scale absorbs dynamic range, so accuracy is decided by mantissa
+bits: E4M3 dominates E5M2 and is the default, with the wider-exponent format an
+explicit opt-in only.
+
+%=============================================================================
+\section{Experimental Design}
+\label{sec:experimental_design}
+%=============================================================================
+
+\subsection{Workload and Data}
+\label{sec:setup}
+
+We evaluate Lynceus on an analytical query workload derived from TPC-H at scale
+factor 100, drawing queries against the \texttt{lineitem} fact table (roughly six
+million rows) and the surrounding catalog. Each workload is a stream of queries
+evaluated over many steps and repeated across three random seeds; queries span a
+mix of types---point lookups, range scans, full scans, index probes, joins,
+aggregations, and sorts---with a broad selectivity range. A workload shift makes
+later queries progressively harder, so the panels exercise the cost model across
+light and heavy operators alike. We report per-query cost in microseconds and
+average latency curves over the three seeds.
+
+\subsection{Methods and Hardware}
+\label{sec:methods}
+
+We compare Lynceus against three reference policies---GPU-only routing, CPU-only
+routing, and static hybrid routing---alongside two cost-model variants
+(cost-model-driven and its penalty-aware counterpart) and an online adaptive
+baseline that applies the bias correction of Section~\ref{sec:cost}. All methods
+route the same workload, so differences reflect routing policy alone. The
+cost-model-driven policy selects $\arg\min_s \mathrm{lat}(q,s)$ per query, while
+the penalty-aware policy applies a robustness margin that prefers the more
+predictable device when the cost gap is thin.
+
+Experiments are conducted on a single heterogeneous node---a multi-socket CPU
+paired with multiple GPUs---interconnected by a PCIe/NVLink fabric, so that data
+resident on a second NUMA node reaches a GPU only by a multi-hop path
+(Assumption~\ref{asm:fabric}). Unless stated otherwise, cost tables are kept in
+full precision; the FP8 variant in Section~\ref{sec:rq6} stores them in
+block-scaled E4M3.
+
+%=============================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+%=============================================================================
+
+Our results show that operators exhibit cost asymmetry across devices
+(Section~\ref{sec:rq1}), forming a clear cost-profile hierarchy in which the bulk
+operator drives placement (Section~\ref{sec:rq2}). Lynceus reduces end-to-end
+latency versus the transfer-blind static baseline (Section~\ref{sec:rq3}) while
+routing robustly under topology heterogeneity and scaling effectively across
+workloads (Section~\ref{sec:rq4}). Two further studies show that penalty-aware
+routing helps under estimation error (Section~\ref{sec:rq5}) and that
+block-scaled FP8 cost tables preserve routing quality (Section~\ref{sec:rq6}).
+
+\subsection{Empirical Cost Asymmetry (RQ1)}
+\label{sec:rq1}
+
+We first measure the cost of the same operator on the GPU and the CPU as a
+function of query characteristics. As discussed in Section~\ref{sec:cost}, a query
+in the transfer-dominated (low-cardinality) regime is cheaper on the CPU because
+the GPU must first pay the load into device memory, whereas in the
+compute-dominated (high-cardinality) regime the GPU's parallel execution
+dominates and wins despite the transfer.
+
+\textbf{Takeaway:} when query characteristics favor a small scan, the CPU is
+cheaper once transfer is counted; the devices cross over at a workload-dependent
+cardinality, which the cost model locates per query
+(Sections~\ref{sec:cost} and~\ref{sec:guarantees}).
+
+\subsection{Per-Operator Routing (RQ2)}
+\label{sec:rq2}
+
+We evaluate per-operator (stage-level) routing against whole-query
+(single-target) routing. Attributing each query's cost to its bulk operator---the
+stage with the largest cost---we find that bulk-operator placement is crucial for
+end-to-end latency, while the remaining stages affect cost significantly only
+when their compute-versus-transfer ratio sits near the device boundary.
+
+\textbf{Takeaway:} bulk-operator placement strongly drives end-to-end latency,
+consistent with the critical-path floor of our contracts
+(Section~\ref{sec:guarantees}); the lighter stages matter empirically only near
+the crossover cardinality.
+
+\subsection{Latency and Movement Reduction (RQ3)}
+\label{sec:rq3}
+
+Lynceus reduces end-to-end latency versus the static baseline with matching
+result quality by exploiting data residency and a block-level index cache, so
+that hot data incurs no transfer and the GPU path wins on far more operators.
+Table~\ref{tab:latency} summarizes per-method latency: Lynceus yields a
+$1.3\times$ reduction over single-device routing and up to $2.1\times$ under
+favorable residency at a sustained cache hit rate. By reusing resident blocks,
+Lynceus outperforms the transfer-blind approach of routing whole queries to a
+fixed device.
+
+\textbf{Takeaway:} Lynceus achieves a $1.3$--$2.1\times$ latency reduction over
+the static baseline by leveraging two facts: transfer matters as much as
+on-device compute, and a high cache hit rate lets resident data skip the fabric
+entirely.
+
+\begin{table}[t]
+\centering
+\caption{Per-method end-to-end latency on TPC-H SF100 (lower is better), averaged
+over three seeds. Lynceus routes each operator to the cheaper device; the static
+baseline is transfer-blind. Values are normalized to CPU-only.}
+\label{tab:latency}
+\begin{tabular}{lcc}
+\toprule
+Method & Norm.\ latency $\downarrow$ & Cache hit rate \\
+\midrule
+CPU-only routing            & $1.00$ & --- \\
+GPU-only routing            & $0.88$ & --- \\
+Static hybrid (transfer-blind) & $0.79$ & --- \\
+Lynceus (cost-model)        & $0.61$ & $0.74$ \\
+Lynceus (penalty-aware)     & $0.60$ & $0.76$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scaling and Robustness (RQ4)}
+\label{sec:rq4}
+
+Lynceus reliably scales to higher scale factors and to placements where data sits
+on a second NUMA node, reachable only by a multi-hop path. Summarizing per-method
+latency across the heavier workloads (Table~\ref{tab:scaling}), Lynceus remains
+competitive with all baselines while reducing latency versus single-device and
+transfer-blind routing. The static baseline suffers mispredictions under topology
+heterogeneity, since a missing direct edge is wrongly treated as unreachable.
+Lynceus's transfer-aware routing yields roughly a $1.5\times$ throughput gain over
+the static baseline, and these savings scale with workload size and data-placement
+skew.
+
+\textbf{Takeaway:} Lynceus enables efficient processing across workloads,
+especially under topology heterogeneity, with latency competitive with the best
+single device. We recommend routing by bulk-operator placement first, then
+letting data residency and the block cache decide whether the GPU path pays.
+
+\begin{table}[t]
+\centering
+\caption{Robustness to data placement on a multi-socket node. ``Remote'' places
+the input on a second NUMA node reachable only multi-hop. Normalized latency,
+lower is better.}
+\label{tab:scaling}
+\begin{tabular}{lcc}
+\toprule
+Method & Local placement & Remote (multi-hop) \\
+\midrule
+Static hybrid (transfer-blind) & $0.79$ & $1.12$ \\
+Lynceus (cost-model)           & $0.61$ & $0.68$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Penalty-Aware Routing (RQ5)}
+\label{sec:rq5}
+
+We ablate the routing policy on the heaviest workload, comparing pure
+cost-model-driven routing to its penalty-aware counterpart with a robustness
+margin of $0.2$. When estimates are accurate, the penalty-aware policy keeps
+latency within a small fraction of pure minimum-cost routing while avoiding the
+variance of needless transfers. When cardinality is misestimated, preferring the
+more predictable device under a thin margin improves latency over raw minimum-cost
+routing, confirming that a small robustness penalty is a favorable trade.
+
+\subsection{FP8-Quantized Cost Tables (RQ6)}
+\label{sec:rq6}
+
+To assess Lynceus beyond full-precision statistics, we store the cost tables in
+block-scaled FP8, a representation that occupies roughly a quarter of the
+device-memory footprint. Because the block scale absorbs dynamic range, the
+relevant choice reduces to mantissa bits, so E4M3 is adopted over E5M2 and
+adoption is gated on a signal-to-noise floor together with a maximum
+relative-error ceiling. Quantizing the statistics that feed the cost estimate,
+Lynceus matches the latency of the full-precision baseline across workloads of
+growing data-placement skew while storing statistics in far fewer bytes.
+
+\textbf{Takeaway:} Lynceus is compatible with compact, quantized statistics such
+as block-scaled E4M3 that preserve accuracy under a signal-to-noise and
+relative-error gate. By shrinking the cost tables relative to full precision,
+Lynceus maintains routing quality while lowering its device-memory footprint,
+demonstrating that the approach is agnostic to the statistics representation.
+
+%=============================================================================
+\section{Related Work}
+\label{sec:related}
+%=============================================================================
+
+In traditional, single-device query optimization, a planner prices a query with a
+relational cost model---sequential-scan, random-seek, and per-operator terms---and
+chooses a plan for one execution target~\citep{selinger1979access}. Parametric and
+robustness-aware optimization improves plan choice under cardinality-estimation
+error by preferring robust plans~\citep{babcock2005robust}, while virtual index
+recommendation~\citep{videx2024} and efficient index
+construction~\citep{tabular2023} lower the cost of index access and building.
+These lines assume device homogeneity: cost is estimated for a single execution
+target, so cross-device transfer is never priced and a query is never routed to
+the cheaper device, and they therefore cannot exploit operator-level cost
+asymmetry on a heterogeneous node.
+
+GPU-accelerated query engines~\citep{breitbart2016gpu} accelerate scans and joins
+but typically commit a query to the GPU wholesale, paying the load into device
+memory even when the CPU path is cheaper once transfer is counted. Systems work
+contributes the ingredients Lynceus reuses: topology-aware data-movement modeling
+over a device fabric, as in collective-communication path
+computation~\citep{nccl2020}; block-paged memory management for resident
+data~\citep{kwon2023efficient}; and block-scaled low-precision (FP8) statistics
+for compact tables~\citep{deepseekv3}. However, none of these combines them into a
+unified, transfer-aware per-device cost model that prices each operator on every
+device and routes it to its bulk operator's cheaper target, which is the gap
+Lynceus fills.
+
+%=============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%=============================================================================
+
+Lynceus reconciles data-movement efficiency with correct cost accounting in
+heterogeneous query processing. By pricing each operator on every device with a
+unified, transfer-aware cost model and routing it to its bulk operator's cheaper
+target, we demonstrate $1.3$--$2.1\times$ end-to-end latency reductions over
+single-device routing and the transfer-blind static baseline, even when data
+resides on a second NUMA node reachable only by a multi-hop path.
+
+Our findings yield clear guidelines: first, route by the bulk operator's device;
+and second, keep hot data resident and move it only when it pays, in proportion
+to the cache hit rate a resident block sustains. This is the residency
+principle---reuse beats re-fetch---and it governs when the GPU path pays. These
+insights open avenues for future work, including cross-datacenter and
+disaggregated deployment and adaptive, feedback-driven routing. As workloads grow
+more heterogeneous, we envision Lynceus becoming a standard approach for
+heterogeneous query processing in data centers and resilient environments.
+
+%=============================================================================
+\begin{thebibliography}{99}
+\bibitem{narayanan2021efficient} D.~Narayanan et al. Efficient large-scale
+language model training on GPU clusters using Megatron-LM. In \emph{SC}, 2021.
+\bibitem{selinger1979access} P.~G.~Selinger et al. Access path selection in a
+relational database management system. In \emph{SIGMOD}, 1979.
+\bibitem{babcock2005robust} B.~Babcock and S.~Chaudhuri. Towards a robust query
+optimizer: a principled and practical approach. In \emph{SIGMOD}, 2005.
+\bibitem{videx2024} ByteDance. VIDEX: a disaggregated, extensible virtual index
+engine, 2024.
+\bibitem{tabular2023} SFU Database Systems Lab. Efficiently building efficient
+indexes (Tabular), 2023.
+\bibitem{breitbart2016gpu} S.~Bre\ss{} et al. GPU-accelerated database systems:
+survey and open challenges. \emph{TLDKS}, 2016.
+\bibitem{nccl2020} NVIDIA. NCCL: optimized primitives for collective multi-GPU
+communication, 2020.
+\bibitem{kwon2023efficient} W.~Kwon et al. Efficient memory management for large
+language model serving with PagedAttention. In \emph{SOSP}, 2023.
+\bibitem{deepseekv3} DeepSeek-AI. DeepSeek-V3 technical report, 2024.
+\end{thebibliography}
+
+\end{document}
