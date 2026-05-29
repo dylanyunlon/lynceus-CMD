@@ -365,13 +365,34 @@ def run_cumulative_benchmark(
 # ---------------------------------------------------------------------------
 
 def main():
-    """Run default benchmark and save output."""
-    import sys
+    """Run default benchmark and save output.
+
+    Reads optional overrides from the environment so the experiment runner
+    (run_lynceus.sh) can drive sweep size without editing code:
+        WORKLOAD_NAME (default TPC-H_SF100)
+        NUM_STEPS     (default 2000)  — queries per seed
+        NUM_SEEDS     (default 3)     — independent seeds for mean/std
+    """
+    import os
+
+    def _int_env(key: str, default: int) -> int:
+        raw = os.environ.get(key)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"  [warn] {key}={raw!r} is not an integer; using {default}")
+            return default
+        if v <= 0:
+            print(f"  [warn] {key}={v} must be > 0; using {default}")
+            return default
+        return v
 
     workload = WorkloadConfig(
-        name="TPC-H_SF100",
-        num_steps=2000,
-        num_seeds=3,
+        name=os.environ.get("WORKLOAD_NAME", "TPC-H_SF100"),
+        num_steps=_int_env("NUM_STEPS", 2000),
+        num_seeds=_int_env("NUM_SEEDS", 3),
     )
 
     print(f"Running Lynceus benchmark: {workload.name}")

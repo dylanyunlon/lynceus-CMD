@@ -164,3 +164,33 @@ Adoption order is E4M3 → fp32 (kept), never E4M3 → E5M2 "for accuracy": the
 per-block scale absorbs dynamic range, so mantissa bits decide and E4M3 has more.
 E5M2 is an explicit opt-in only for unscaled wide-range use. Adoption is gated on
 **both** an SNR floor and a per-element max-relative-error ceiling.
+
+---
+
+## Experiment Runner (`run_lynceus.sh`)
+
+A single, self-contained entry point reproduces the benchmark end to end on the
+lab server. It is the operational front door for the `#17 (M033–M034)` experiment
+milestone and should be kept in sync as new panels are added.
+
+**Conventions (binding):**
+- Conda environment is `walking3` (override with `CONDA_ENV_NAME`). The runner
+  reuses it if present and only creates it (Python 3.10) when missing.
+- Server paths are environment-overridable: `PROJECT_DIR`, `DATA_DIR`,
+  `OUTPUT_DIR`, `LOG_DIR`, `UPSTREAM_DIR`. Defaults are relative to the script.
+- Lynceus is a **pure-Python cost-model simulator** (stdlib only) — no GPU is
+  required. A GPU, if present, is only *inspected* (topology print) in `check`;
+  it is never a hard dependency. The C++/CUDA-style cost kernels build as host
+  C++17 with `g++` (`CXX`/`CXXFLAGS` overridable).
+- Sweep size is driven by `NUM_STEPS` / `NUM_SEEDS` / `WORKLOAD_NAME`. These are
+  honoured by `lynceus.benchmark.main()` (it reads them from the environment),
+  so the shell knobs are real — they change the produced metadata, not just the
+  log text. Any future entry point MUST keep advertised knobs functional
+  (no silently-ignored parameters).
+
+**Commands:** `check`, `setup`, `prepare`, `verify`, `benchmark`, `package`,
+`all` (= the six in order), `help`.
+
+**Verified:** `bash -n` clean; `shellcheck -S warning` clean (0 warnings); the
+full `prepare → verify → benchmark → package` chain runs on a CPU-only box and
+`NUM_STEPS`/`NUM_SEEDS` provably propagate into the output JSON metadata.
