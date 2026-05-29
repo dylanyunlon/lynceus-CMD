@@ -158,6 +158,41 @@
 %   CXLIII = a single heterogeneous node (multi-socket CPU + multi-GPU)
 %   CXLIV = PCIe / NVLink device fabric
 %   CXLV = per-seed, per-step latency curves (3 seeds x 2000 steps)
+%
+% Evaluation (CXLVI-CXC; Claude-4, Section 5):
+%   CXLVI = per-device cost asymmetry across operators
+%   CXLVII = cost-profile hierarchy (which operator drives placement)
+%   CXLVIII = transfer-dominated regime (low-cardinality queries)
+%   CXLIX = compute-dominated regime (high-cardinality queries)
+%   CL = the bulk operator (the stage that dominates a query's cost)
+%   CLI = per-operator (stage-level) routing
+%   CLII = whole-query (single-target) routing
+%   CLIII = crossover cardinality (where GPU overtakes CPU)
+%   CLIV = data residency (hot data already on-device)
+%   CLV = block-level index cache
+%   CLVI = cache hit rate
+%   CLVII = Figure 2 (empirical cost-asymmetry plot)
+%   CLVIII = the static-routing baseline (fixed-rule, transfer-blind)
+%   CLIX = query characteristics (type, selectivity, width)
+%   CLX = data placement / residency state
+%   CLXI = compute-vs-transfer cost ratio
+%   CLXII = Figure 3 (per-operator routing plot)
+%   CLXIII = end-to-end latency
+%   CLXIV = latency / cost reduction factor
+%   CLXV = 1.3x (latency reduction over single-device)
+%   CLXVI = 2.1x (latency reduction at favorable residency)
+%   CLXVII = the heterogeneous node (multi-socket CPU + multi-GPU)
+%   CLXVIII = higher scale factor (SF300+)
+%   CLXIX = robustness margin (penalty-aware threshold)
+%   CLXX = the largest workload (high scale factor)
+%   CLXXI = Table 1 (per-method latency / cost summary)
+%   CLXXII = Section 6
+%   CLXXIII = 1.5x (throughput gain at scale)
+%   CLXXIV = the most skewed workload
+%   CLXXV = substantial wall-clock savings
+%   CLXXVI = estimation error / cardinality misestimate
+%   CLXXVII = robust device choice (under thin margin)
+%   CXC = within a small fraction (near-parity with the best device)
 %================================================================================
 
 \documentclass{article}
@@ -398,5 +433,108 @@ Experiments are conducted on CXLIII -- a multi-socket CPU paired with multiple
 GPUs -- interconnected by a CXLIV, so that W resident on a second NUMA node
 reaches a GPU only by CXVI. Reported curves average over three seeds with per-J
 CV measured in microseconds.
+
+%================================================================================
+% Section 5: Evaluation (Templated)
+%================================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+
+Our results show J exhibit CXLVI across operators (Section~\ref{sec:rq1}),
+forming a clear CXLVII (Section~\ref{sec:rq2}). A reduces CLXIII CLXIV vs CLVIII
+(Section~\ref{sec:rq3}) while routing robustly under CXI and scaling effectively
+across CIX (Section~\ref{sec:rq4}).
+
+%-----------------------------------------------------------------------------
+\subsection{RQ1: Empirical Cost Asymmetry}
+\label{sec:rq1}
+
+Figure CLVII shows that the relative CVI of the same J on GPU and CPU scale with
+CLIX. Supported by our discussion of I accounting (Section~\ref{sec:lynceus}), a
+J in the CXLVIII is cheaper on CPU because the GPU must first pay the load into
+XXX, whereas in the CXLIX the GPU's parallel CVI dominates and wins despite the
+transfer.
+
+\textbf{Takeaway:} As discussed in Sections~\ref{sec:lynceus}
+and~\ref{sec:guarantees}, when CLIX favors a small scan the CPU is cheaper once
+I is counted; the devices cross over at the CLIII, which the CV locates per
+query.
+
+%-----------------------------------------------------------------------------
+\subsection{RQ2: Per-Operator Routing}
+\label{sec:rq2}
+
+Figure CLXII evaluates CLI against CLII. We attribute each J's CV to its CL,
+chosen as the stage with the largest CVI. CL placement is crucial for CLXIII,
+while the remaining stages affect CV significantly only when their CLXI is close
+to the device boundary.
+
+\textbf{Takeaway:} CL placement strongly drives CLXIII, motivated by the CVII
+floor in our contracts (Section~\ref{sec:guarantees}). The lighter stages matter
+empirically only when their CLXI sits near the CLIII.
+
+%-----------------------------------------------------------------------------
+\subsection{RQ3: Latency and Movement Reduction}
+\label{sec:rq3}
+
+A reduces CLXIII versus CLVIII with matching results by exploiting CLIV and a
+CLV, so that hot W incurs no I and the GPU path wins on far more J. This yields a
+CLXV reduction over single-CVIII routing and CLXVI under favorable CLX at the
+CLVI sustained on CLXVII.
+
+A effectively reuses resident blocks and outperforms the transfer-blind approach
+of routing whole queries to a fixed device.
+
+\textbf{Takeaway:} A achieves a CLXIV in CLXIII over CLVIII by leveraging two
+facts: I matters as much as on-device CVI, and a high CLVI lets resident W skip
+the fabric entirely.
+
+%-----------------------------------------------------------------------------
+\subsection{RQ4: Scaling and Robustness}
+\label{sec:rq4}
+
+A reliably scales to CLXVIII and to CLX where W sits on a second NUMA node,
+reachable only by CXVI. Summarizing per-method CLXIII (Table CLXXI), A is
+competitive with all baselines while reducing CLXIII versus CLVIII and single-S
+routing. The CLVIII suffers mispredictions on CXI, since a missing direct edge
+is wrongly treated as unreachable.
+
+A's transfer-aware routing yields a $\approx$ CLXXIII throughput gain over CLVIII.
+These savings scale with CIX size and CLX skew. On the CLXXIV with hot W mostly
+resident, A would save CLXXV over CLVIII and single-CVIII routing.
+
+\textbf{Takeaway:} A enables efficient processing across CIX, especially on CXI,
+with CLXIII competitive with the best single CVIII. We recommend routing by CL
+placement first, then letting CLIV and the CLV decide whether the GPU path pays.
+
+%-----------------------------------------------------------------------------
+\subsection{RQ5: Penalty-Aware Routing}
+\label{sec:rq5}
+
+We ablate the routing policy on the CLXX, comparing pure CXL to its CXLI
+counterpart with a CLXIX of 0.2. As shown in Figure, the CXLI keeps CLXIII within
+CXC of pure min-cost when estimates are accurate, and avoids the variance of
+needless transfers. Furthermore, preferring the CLXXVII under a thin margin
+improves CLXIII over raw min-cost when CLXXVI is present.
+
+%-----------------------------------------------------------------------------
+\subsection{RQ6: FP8-Quantized Cost Tables}
+\label{sec:rq6}
+
+To assess A beyond full-precision statistics, we integrate Y for the cost tables,
+a CXXIX representation that stores column statistics at $4\times$ smaller XXX
+footprint. Since the block scale absorbs dynamic range, the relevant choice
+reduces to mantissa bits, so CXXX holds and E4M3 is adopted. We apply A by
+quantizing the statistics that feed CV and gating adoption on a CXXVII--CXXVIII.
+
+A matches the CLXIII of the full-precision baseline across CIX of growing CLX
+skew. By compressing the cost tables, A stores statistics in far fewer bytes than
+the baseline, confirming that transfer-aware routing extends to compact,
+quantized statistics.
+
+\textbf{Takeaway:} A is compatible with CXXIX statistics such as block-scaled
+E4M3 that preserve accuracy under a CXXVII--CXXVIII gate. By shrinking the cost
+tables relative to full precision, A maintains routing quality while lowering XXX
+footprint, demonstrating that our approach is statistics-representation-agnostic.
 
 \end{document}
