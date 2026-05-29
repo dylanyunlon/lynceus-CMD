@@ -1,0 +1,245 @@
+%================================================================================
+% Lynceus Template Extraction (Reconstructed, EN)
+% Source project : dylanyunlon/lynceus-CMD
+% Template        : dylanyunlon/Desynced-Low-Communication
+%                   (template_extraction_des_loc_reconstructed_EN.tex)
+% Claude-1 (M001-M025): MAPPING TABLE + Section 1 (Introduction)
+%                       + Section 2 (Lynceus Cost Model & Routing)
+%
+% The placeholder skeleton (A.., M.., I.., CI..) is inherited verbatim from the
+% DES-LOC template; only the *mapping* is re-pointed to Lynceus's academic
+% narrative: cost-model-driven query routing on heterogeneous GPU-CPU systems.
+% No source-file / class / function names appear in the prose -- only the
+% scholarly concepts they implement.
+%
+% Subsequent Claudes edit THIS .tex (chained patches):
+%   Claude-2 -> Section 3 (Cost-Model Correctness Guarantees / Invariants)
+%   Claude-3 -> Section 4 (Experimental Design)
+%   Claude-4 -> Section 5 (Evaluation, RQ1-RQ6)
+%   Claude-5 -> Sections 6-7 (Related Work + Conclusion)
+%================================================================================
+
+%================================================================================
+% MAPPING TABLE (Section 1-2 scope; Claude-1)
+%================================================================================
+% Latin uppercase A-Z:
+%   A = Lynceus (the cost-model-driven router)
+%   B = the analytical-query cost model
+%   C = single-device (GPU-only / CPU-only) execution
+%   D = heterogeneous query-processing system
+%   E = framework
+%   F = heterogeneity-aware cost modeling
+%   G = (Heterogeneity-Aware Cost Models)
+%   H = static hybrid routing
+%   I = cross-device data-transfer cost
+%   J = relational operators
+%   K = execution
+%   L = data placement / residency
+%   M = device-specific cost estimates
+%   N = cross-device data-movement overhead
+%   O = rule-based query optimization
+%   P = plan-level cost estimation
+%   Q = per-device minimum-cost search
+%   R = per-operator device assignment
+%   S = hardware devices (GPUs and CPUs)
+%   T = coupling
+%   U = decoupling
+%   V = layers
+%   W = base-table / index data
+%   X = compact statistics representation
+%   Y = block-wise FP8 quantization
+%   Z = abstraction
+%
+% Greek letters:
+%   alpha = admission / integration
+%   beta  = variant
+%   gamma = management
+%   delta = component
+%   epsilon = cost-model coefficients (per-row scan, seek, per-op)
+%   zeta  = robustness penalty
+%   eta_var = estimate (a single cost estimate)
+%   theta = cardinality / selectivity estimation
+%   iota  = concrete routing strategy
+%   kappa = caller / query planner
+%   lambda = specialization
+%   mu    = decision rule
+%   nu    = warm-up
+%   xi    = query feature / parameter
+%   omicron = unified
+%   pi    = abstraction (same as Z)
+%   rho_var = virtual index
+%   sigma = block-wise
+%   tau   = quantization
+%   upsilon = data
+%   phi   = pipeline / dataflow
+%   chi   = configuration
+%   psi_var = adoption policy
+%   omega = device-load state
+%
+% Roman numerals:
+%   I    = caching
+%   II   = paged block table
+%   III  = lightweight
+%   IV   = physical block
+%   V    = block pool
+%   VI   = block identity (table, index, block-index)
+%   VII  = content-addressed
+%   VIII = tracking
+%   IX   = allocation / eviction operations
+%   X    = query routing
+%   XI   = logical table identity
+%   XII  = cache manager
+%   XIII = reference counting
+%   XIV  = channel
+%   XV   = physical copy
+%   XVI  = (reused) decay half-life of an exponential moving average
+%   XVII = awareness
+%   XVIII= adaptive frequency tuning
+%   XIX  = bias-correction ratio (observed / estimated)
+%   XX   = decay rate
+%   XXI  = device-load / bias state
+%   XXII = decoupling
+%   XXIII= feedback lifecycle
+%   XXIV = EMA update rule
+%   XXV  = dispatch
+%   XXVI = load-balancing margin
+%   XXVII= queueing stall
+%   XXVIII = high-frequency
+%   XXIX = probing
+%   XXX  = device memory (HBM)
+%   XXXI = out-of-memory (OOM)
+%   XXXII= distributed cost-model synchronization layer
+%
+% (Section 3+ mappings, e.g. invariants/contracts CI-.., are added by later
+%  Claudes starting at CI -- do NOT overwrite A-XXXII above.)
+%================================================================================
+
+\documentclass{article}
+\usepackage{amsmath,amssymb}
+
+\begin{document}
+
+%================================================================================
+% Section 1: Introduction (Templated)
+%================================================================================
+\section{Introduction}
+\label{sec:introduction}
+
+% Paragraph 1: Background
+Modern analytical data systems run on increasingly S, pairing many-core
+CPUs with GPUs in a single node for improved throughput and XXX capacity.
+However, routing every query to a fixed C target -- whether C GPU or C CPU --
+ignores that each J has a very different cost profile on each device, and
+that moving W across the device fabric incurs substantial N. Early systems
+side-stepped this by hand-written H, dispatching whole queries to one device
+according to a fixed rule rather than estimating cost per device.
+However, modern heterogeneous workloads, e.g.\ mixed OLAP query streams, exhibit
+operator-level cost asymmetry that such coarse routing cannot exploit.
+
+% Paragraph 2: Problems with existing methods
+Some approaches extend O to the heterogeneous setting by costing whole-query
+plans on a single device, which poses challenges. First, they omit I,
+treating data as already resident and producing optimistic estimates. Second,
+charging only on-device work accumulates systematic error and provides no means
+to alpha hot W into faster XXX. This makes them brittle in failure-prone or
+bandwidth-constrained deployments. Third, ignoring multi-hop paths through the
+device fabric destabilizes routing on multi-socket machines.
+
+% Paragraph 3: The single-device-routing problem
+H addresses some of these challenges, showing that pinning a query to the
+device its bulk operator favors can beat naive C, and remain robust to adding
+new S. However, it requires I to be folded into compute and never priced
+separately, hiding N relative to a transfer-aware estimate. Hence, we aim to
+answer the following question:
+
+\begin{center}
+\emph{Can independently pricing J K and cross-device I improve N
+efficiency for heterogeneous query processing while preserving routing
+correctness and robustness?}
+\end{center}
+
+% Paragraph 4: Lynceus proposal
+As a result of our inquiry, we propose A, a system that drives R from a unified,
+F. By estimating M on every device and routing each J to its lowest-cost target,
+A reduces N by keeping hot W resident and moving data only when it pays off.
+
+% Contributions
+\paragraph{Contributions:}
+\begin{enumerate}
+    \item \textbf{Correct cost modeling.} We give a set of binding cost-model
+    contracts (see Section~\ref{sec:guarantees}) for A: a single query's
+    latency is its full critical path including I; per-query R never invents
+    cross-device overlap; XI is an explicit field, not string-inferred; and
+    fabric I follows multi-hop shortest paths. Our analysis indicates correct
+    transfer accounting is what makes per-device R trustworthy.
+
+    \item \textbf{N reduction.} We empirically show that data-resident routing
+    and III block II reduce N by skipping redundant W movement, yielding
+    end-to-end latency reductions over C on heterogeneous hardware.
+
+    \item \textbf{Scalability across workloads.} We validate A on
+    standard analytical benchmarks, demonstrating competitive latency against
+    both H and C while routing each J to the cheaper device.
+
+    \item \textbf{Hardware robustness.} Unlike fixed-rule routing, A reasons
+    over the full hardware topology and prices Y, enabling it to exploit
+    second-NUMA-node memory and compact statistics under tight XXX budgets.
+\end{enumerate}
+
+%================================================================================
+% Section 2: Lynceus Cost Model and Routing (Templated)
+%================================================================================
+\section{A}
+\label{sec:lynceus}
+
+% Paragraph 1: Cost-asymmetry theory
+We start by characterizing the relation between where W resides and the cost of
+running J on each device, and how this can be leveraged to lower N. Consider the
+per-device M as a sum of itemized terms:
+\begin{equation}
+\text{cost}(J, S) = c_{\text{io}} + c_{\text{compute}} + c_{\text{transfer}} + c_{\text{index}} + c_{\text{sort}}.
+\end{equation}
+
+For C routing, the choice is correct only if $c_{\text{transfer}}$ is counted:
+a GPU may win on $c_{\text{compute}}$ yet lose once the PCIe load into XXX is
+added. Conversely, if W is already resident the transfer term vanishes and the
+GPU path dominates on far more J.
+
+% Paragraph 2: Itemized device cost
+A useful summary is the per-device cost shape: a CPU prices a scan by
+$c_{\text{io}} \propto$ rows $\times$ ε, while a GPU amortizes the same
+scan over massive parallelism but pays a fixed I to bring the data on-device.
+We use these ε to compare devices on a common microsecond scale. For
+typical coefficients, a sequential CPU scan and a transfer-plus-parallel GPU
+scan cross over at a workload-dependent cardinality, which the cost model
+locates per query.
+
+% Paragraph 3: Transfer cost over the fabric
+Because W may sit on a remote node, I is not a single edge but the best path
+through the device fabric. On a dual-socket box the second NUMA node may have no
+direct GPU link, so data reaches a GPU via a multi-hop route. The fabric cost is
+therefore the minimum-cost path, additive over hops, with disconnected cuts
+priced as unreachable.
+
+% Paragraph 4: Routing decision and half-life-style adaptation
+From the above, the resident location of W should inform R. For example, if hot
+W already occupies XXX, the transfer term drops out and routing J there is
+cheap. Where the static M is biased, an online policy corrects it: tracking a
+per-device XIX with decay rate XX and adapting XXV accordingly.
+
+%-----------------------------------------------------------------------------
+\subsection{The A Router}
+\label{sec:lynceus_router}
+
+% Router / strategy description
+A routes each J by estimating M on every device $S$ and selecting the
+lowest-cost target, optionally pricing ρ so a J that hits an index pays a
+traversal rather than a full scan. Setting the policy to pure minimum-cost
+yields cost-model routing; adding a ζ that prefers the robust device when the
+margin is thin yields a penalty-aware variant.
+
+\paragraph{Illustrative Example} Figure~\ref{fig:toy} illustrates a workload
+where A and a transfer-aware H route correctly under heterogeneous device costs,
+while fixed C routing -- which ignores I -- mispredicts and overloads one device.
+
+\end{document}
