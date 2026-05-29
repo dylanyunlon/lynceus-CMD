@@ -33,6 +33,7 @@ skip the transfer term accordingly.
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -199,8 +200,29 @@ class IndexCacheManager:
         # Cap a single query's footprint at the whole cache so one giant scan
         # cannot request more blocks than exist (it would just stream/thrash).
         n = min(n, self.num_blocks)
-        table = query.query_id.split("::", 1)[0].rstrip("0123456789_") or "t"
+        table = self._table_identity(query)
         return [BlockKey(table, index_name, i) for i in range(n)]
+
+    @staticmethod
+    def _table_identity(query: QueryDescriptor) -> str:
+        """Resolve the logical table a query reads, for cache-block keying.
+
+        Prefer the explicit QueryDescriptor.table_name. Only if it is empty do
+        we fall back to deriving an identity from query_id — and even then we
+        strip ONLY a trailing run-id suffix of the form '_<digits>' (e.g.
+        'orders_42' -> 'orders'), via an exact suffix match. We must NOT use
+        str.rstrip(digits), which removes every trailing digit/underscore
+        character regardless of structure and collapses unrelated ids:
+        'q_00000' -> 'q' would merge thousands of distinct queries onto one
+        bogus table and inflate the cache hit rate.
+        """
+        if query.table_name:
+            return query.table_name
+        stem = query.query_id.split("::", 1)[0]
+        m = re.match(r"^(.*?)_\d+$", stem)
+        if m and m.group(1):
+            return m.group(1)
+        return stem or "t"
 
     # -- core operations ---------------------------------------------------
 

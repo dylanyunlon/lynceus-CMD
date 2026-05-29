@@ -385,12 +385,15 @@ struct QuantError {
   double max_abs   = 0.0;   // worst single-element absolute error
   double max_rel   = 0.0;   // worst single-element *relative* error
   double cosine    = 1.0;   // direction preservation
+  bool   has_nonfinite = false;  // orig/recon contained NaN or Inf
 
   // SNR is energy-weighted and dominated by large elements, so it can look
   // excellent while small elements are crushed. We require BOTH a global SNR
   // floor and a per-element relative-error ceiling, so a column is only
-  // accepted when even its small values survive.
+  // accepted when even its small values survive. Non-finite input is never
+  // silently accepted.
   bool acceptable(double snr_floor_db, double max_rel_ceil = 0.5) const {
+    if (has_nonfinite) return false;
     return snr_db >= snr_floor_db && max_rel <= max_rel_ceil;
   }
 };
@@ -398,7 +401,23 @@ struct QuantError {
 inline QuantError measure_error(const double *orig, const double *recon,
                                 size_t n) {
   double sig = 0.0, noise = 0.0, dot = 0.0, no = 0.0, nr = 0.0, mx = 0.0, mrel = 0.0;
+  bool nonfinite = false;
+  // Reference scale for relative error of zero-valued originals: a 0 -> nonzero
+  // quantization (common when FP8 pollutes sparse histogram zeros) has no
+  // well-defined ratio, so we normalise by the column's max magnitude. The
+  // old `if (denom > 0)` guard silently dropped these errors.
+  double amax = 0.0;
   for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(orig[i])) nonfinite = true;
+    else amax = std::max(amax, std::fabs(orig[i]));
+  }
+  const double scale = (amax > 0.0) ? amax : 1.0;
+
+  for (size_t i = 0; i < n; ++i) {
+    if (!(std::isfinite(orig[i]) && std::isfinite(recon[i]))) {
+      nonfinite = true;
+      continue;
+    }
     const double e = orig[i] - recon[i];
     sig   += orig[i] * orig[i];
     noise += e * e;
@@ -406,12 +425,13 @@ inline QuantError measure_error(const double *orig, const double *recon,
     no    += orig[i] * orig[i];
     nr    += recon[i] * recon[i];
     mx     = std::max(mx, std::fabs(e));
-    const double denom = std::fabs(orig[i]);
-    if (denom > 0.0) mrel = std::max(mrel, std::fabs(e) / denom);
+    const double denom = (std::fabs(orig[i]) > 0.0) ? std::fabs(orig[i]) : scale;
+    mrel   = std::max(mrel, std::fabs(e) / denom);
   }
   QuantError q;
   q.max_abs = mx;
   q.max_rel = mrel;
+  q.has_nonfinite = nonfinite;
   q.rel_l2  = (sig > 0.0) ? std::sqrt(noise / sig) : 0.0;
   q.snr_db  = (noise > 0.0) ? 10.0 * std::log10(sig / noise)
                             : std::numeric_limits<double>::infinity();

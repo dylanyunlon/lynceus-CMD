@@ -11,9 +11,9 @@ Tests:
     7.  Scheduler: each stage routed to a real topology device
     8.  Scheduler: serial_cost == sum of stage costs
     9.  Scheduler: pipelined_cost <= serial_cost (overlap never hurts)
-    10. Scheduler: speedup >= 1.0
-    11. Scheduler: transfer cost only on device switches
-    12. Scheduler: single-device run has zero transfer, speedup ~1
+    10. Scheduler: single query has no self-speedup (batch m=1 -> 1.0)
+    11. Scheduler: transfer is summed over all stages (initial load included)
+    12. Scheduler: batch speedup grows with m (Megatron bubble shrinks)
     13. Scheduler: devices_used has no duplicates
     14. Scheduler: schedule_batch length matches input
     15. Integration: heavy join query pipelines across GPU+CPU
@@ -111,40 +111,46 @@ def test_07_stages_routed_to_real_devices():
         assert a.device_id in eng.topology.nodes
 
 
-def test_08_serial_cost_is_sum():
+def test_08_latency_is_compute_plus_transfer():
     sched = QueryPipelineScheduler(_engine())
     sch = sched.schedule(_full_pipeline_query())
+    # latency is the full critical path: every stage's compute + every handoff.
     expected = sum(a.cost.total_us for a in sch.assignments)
-    assert abs(sch.serial_cost_us - expected) < 1e-6
+    assert abs(sch.latency_us - expected) < 1e-6
+    assert abs(sch.latency_us - (sch.compute_cost_us + sch.transfer_cost_us)) < 1e-6
 
 
-def test_09_pipelined_not_worse_than_serial():
+def test_09_transfer_never_vanishes():
+    # The initial data load must appear in transfer_cost_us, not be silently
+    # absorbed (the bug that produced a fake 246x speedup).
     sched = QueryPipelineScheduler(_engine())
     sch = sched.schedule(_full_pipeline_query())
-    assert sch.pipelined_cost_us <= sch.serial_cost_us + 1e-6
+    total_transfer = sum(a.cost.transfer_cost_us for a in sch.assignments)
+    assert abs(sch.transfer_cost_us - total_transfer) < 1e-6
 
 
-def test_10_speedup_at_least_one():
+def test_10_single_query_no_self_speedup():
+    # One query cannot pipeline with itself: batch speedup at m=1 is exactly 1.
+    sched = QueryPipelineScheduler(_engine())
+    b = sched.schedule_pipeline([_full_pipeline_query()])
+    assert abs(b.speedup - 1.0) < 1e-9
+
+
+def test_11_transfer_is_sum_over_all_stages():
     sched = QueryPipelineScheduler(_engine())
     sch = sched.schedule(_full_pipeline_query())
-    assert sch.speedup >= 1.0 - 1e-9
-
-
-def test_11_transfer_only_on_switch():
-    sched = QueryPipelineScheduler(_engine())
-    sch = sched.schedule(_full_pipeline_query())
-    manual = sum(c.cost.transfer_cost_us
-                 for c in sch.assignments[1:])
+    manual = sum(c.cost.transfer_cost_us for c in sch.assignments)
     assert abs(sch.transfer_cost_us - manual) < 1e-6
 
 
-def test_12_single_device_zero_transfer():
-    # A tiny point lookup decomposes to one stage → one device → no transfer.
+def test_12_batch_speedup_grows_with_m():
+    # Megatron bubble (p-1)/(m+p-1): more independent queries -> more overlap.
     sched = QueryPipelineScheduler(_engine())
-    sch = sched.schedule(_point_lookup())
-    if len(sch.devices_used) == 1:
-        assert sch.transfer_cost_us == 0.0
-        assert abs(sch.speedup - 1.0) < 1e-6
+    qs = [_full_pipeline_query() for _ in range(64)]
+    b1 = sched.schedule_pipeline(qs[:1])
+    b64 = sched.schedule_pipeline(qs)
+    assert b64.speedup > b1.speedup
+    assert b64.bubble_fraction < b1.bubble_fraction
 
 
 def test_13_devices_used_unique():
@@ -165,7 +171,7 @@ def test_15_integration_heavy_join():
     sch = sched.schedule(_full_pipeline_query())
     # A multi-stage heavy query should produce a non-trivial schedule.
     assert len(sch.assignments) >= 4
-    assert sch.pipelined_cost_us > 0
+    assert sch.latency_us > 0
 
 
 def _run_all():

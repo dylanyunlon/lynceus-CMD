@@ -113,3 +113,54 @@ cost estimation kernel。
   }
 }
 ```
+
+---
+
+## Design Invariants & Audit Corrections (binding for all future milestones)
+
+> An end-to-end audit of M015–M020 (run in-environment, no new test code) found
+> 6 production-grade defects. The corrected semantics below are now **binding
+> contracts**. Future Claudes MUST preserve them; violating any one reintroduces
+> a known data-correctness or routing bug. See `AUDIT_REPORT.md` for the full
+> critique (user-perspective + system-perspective) of each.
+
+### INV-1 — Transfer cost never disappears from a query's latency
+A single query's operator stages form a **strict data-dependency chain**
+(SCAN→FILTER→JOIN→AGG→SORT) and cannot overlap. Its latency is the **full
+critical path**: `latency_us = Σ(stage compute) + Σ(stage transfer)`, where the
+transfer term includes the initial load into the first stage's device. Never
+subtract a stage's transfer from its compute and treat it as "hidden".
+*(Bug it prevents: a 15 ms PCIe load vanished, yielding a fake 246× speedup.)*
+
+### INV-2 — Pipeline speedup is a property of BATCHES, not single queries
+Intra-query speedup does not exist. Cross-query pipelining uses the Megatron-LM
+bubble fraction `(p−1)/(m+p−1)` (Narayanan et al. 2021) for m independent
+queries over p stages: `t_pipe = t_serial · (m+p−1)/(m·p)`. At m=1 this is
+exactly `t_serial` (speedup 1.0). Use `schedule_pipeline(queries)` for the batch
+case; `schedule(query)` reports single-query critical-path latency only.
+
+### INV-3 — Logical table identity is an explicit field, never string-guessed
+Cache-block keying and per-table row counts use `QueryDescriptor.table_name`.
+Never infer a table from `query_id` via `str.rstrip(<digits>)` or similar — that
+collapses unrelated ids (`q_00000`→`q`) and fabricates cache hit rates. The
+benchmark generator stamps a real table (TPC-H catalog) on every query.
+
+### INV-4 — Topology transfer cost is multi-hop shortest path
+`HardwareTopology.get_transfer_cost` runs Dijkstra over the edge graph
+(non-negative hop costs), so data on a second NUMA node reaches a GPU via
+`cpu1→cpu0→gpu0`. Never assume a direct edge must exist; absence of a direct
+link is not unreachability. Contracts: `src==dst → 0`, genuinely disconnected
+→ `inf`.
+
+### INV-5 — Quantization error metrics have zero/NaN guards
+`measure_error` must (a) normalise the relative error of a zero-valued original
+by the column's max magnitude (so FP8 polluting a 0 is not silently ignored),
+and (b) flag `has_nonfinite` on any NaN/Inf input so `acceptable()` rejects it
+rather than swallowing it through NaN comparisons. The C++ core and the Python
+port must stay bit-identical on these paths.
+
+### INV-6 — Under block-wise fp32 scaling, E4M3 dominates E5M2 on accuracy
+Adoption order is E4M3 → fp32 (kept), never E4M3 → E5M2 "for accuracy": the
+per-block scale absorbs dynamic range, so mantissa bits decide and E4M3 has more.
+E5M2 is an explicit opt-in only for unscaled wide-range use. Adoption is gated on
+**both** an SNR floor and a per-element max-relative-error ceiling.

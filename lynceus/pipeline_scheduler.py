@@ -107,32 +107,34 @@ class StageAssignment:
 
 @dataclass
 class PipelineSchedule:
-    """Executor-ready schedule for one query.
+    """Executor-ready schedule for a single query.
 
     Analogous to vLLM's SchedulerOutput: a flat object the executor consumes
-    without re-deriving anything. The three timing aggregates capture the
-    Megatron fill-drain intuition:
+    without re-deriving anything.
 
-        serial_cost_us    — sum of all stages (no overlap; the CPU/GPU-only
-                            baselines effectively pay this).
-        pipelined_cost_us — critical-path cost once independent stages on
-                            distinct devices overlap (warmup + steady + drain).
-        transfer_cost_us  — cross-device handoff cost incurred between stages
-                            assigned to different devices (the "bubble" tax).
+    A single query's stages form a STRICT data-dependency chain
+    (SCAN -> FILTER -> JOIN -> AGGREGATE -> SORT): each stage consumes the
+    previous stage's output, so they CANNOT overlap. The end-to-end latency is
+    therefore the full critical path — every stage's compute PLUS every
+    cross-device handoff (including the initial load from the data's home).
+    There is no intra-query pipeline speedup; pipelining only helps when
+    *multiple independent queries* flow through the stages (see
+    QueryPipelineScheduler.schedule_pipeline, which uses the Megatron bubble
+    formula for that case).
+
+    Fields:
+        compute_cost_us  — sum of per-stage compute (transfer excluded).
+        transfer_cost_us — sum of ALL handoffs on the critical path: the
+                           initial data load into the first stage's device,
+                           plus every device switch between consecutive stages.
+        latency_us       — compute_cost_us + transfer_cost_us. The physical
+                           lower bound for one query on a dependency chain.
     """
     query_id: str
     assignments: List[StageAssignment]
-    serial_cost_us: float
-    pipelined_cost_us: float
+    compute_cost_us: float
     transfer_cost_us: float
-    warmup_segments: int
-
-    @property
-    def speedup(self) -> float:
-        """Serial / pipelined. >= 1.0; 1.0 means pipelining bought nothing."""
-        if self.pipelined_cost_us <= 0:
-            return 1.0
-        return self.serial_cost_us / self.pipelined_cost_us
+    latency_us: float
 
     @property
     def devices_used(self) -> List[str]:
@@ -141,6 +143,39 @@ class PipelineSchedule:
             if a.device_id not in seen:
                 seen.append(a.device_id)
         return seen
+
+
+@dataclass
+class PipelineBatchSchedule:
+    """Throughput estimate for a BATCH of independent queries.
+
+    This is where pipelining actually pays off. With m independent queries
+    streaming through p pipeline stages (devices), the synchronous-pipeline
+    bubble fraction is (p-1)/(m+p-1) (Narayanan et al. 2021, the Megatron-LM
+    pipeline-bubble result). We apply it to estimate aggregate makespan vs the
+    fully-serial baseline.
+
+    Fields:
+        num_queries      — m, number of independent queries in the batch.
+        num_stages       — p, the pipeline depth actually used.
+        serial_makespan_us   — Σ over queries of each query's full latency
+                               (no cross-query overlap).
+        pipelined_makespan_us — estimated makespan once queries overlap across
+                                stages, using the Megatron bubble fraction.
+        bubble_fraction  — (p-1)/(m+p-1), the idle fraction.
+    """
+    num_queries: int
+    num_stages: int
+    serial_makespan_us: float
+    pipelined_makespan_us: float
+    bubble_fraction: float
+
+    @property
+    def speedup(self) -> float:
+        """Serial / pipelined makespan. 1.0 when m=1 (no overlap possible)."""
+        if self.pipelined_makespan_us <= 0:
+            return 1.0
+        return self.serial_makespan_us / self.pipelined_makespan_us
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +206,7 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
         table_rows=query.table_rows,
         index_available=query.index_available,
         index_depth=query.index_depth,
+        table_name=query.table_name,
     )
 
     def mk(kind: StageKind, qtype: QueryType, in_rows: int,
@@ -241,13 +277,15 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
 class QueryPipelineScheduler:
     """Segment a query into operator stages and pipeline them across devices.
 
-    The scheduler reuses CostModelEngine.recommend per stage, then estimates
-    end-to-end latency under a Megatron-style fill-drain overlap model rather
-    than summing stage costs. Stages pinned to *different* devices can overlap
-    once the pipe is full; stages on the *same* device serialize.
+    The scheduler reuses CostModelEngine.recommend per stage. For a single
+    query it reports the full critical-path latency (compute + all transfers),
+    with no intra-query speedup, because a query's stages form a strict
+    dependency chain. Cross-query pipelining — where speedup actually comes
+    from — is handled by schedule_pipeline() using the Megatron-LM pipeline
+    bubble fraction (p-1)/(m+p-1) for m queries over p stages.
 
-    Lifecycle (mirrors Megatron schedule construction):
-        1. decompose      → stage graph (forward stage order).
+    Lifecycle:
+        1. decompose      → stage graph (operator dependency chain).
         2. assign         → per-stage device via cost model (ncclTopoCompute).
         3. compute phases → warmup / steady / cooldown critical path.
     """
@@ -289,95 +327,105 @@ class QueryPipelineScheduler:
             current_location = device_id
         return assignments
 
-    # -- fill-drain timing -------------------------------------------------
+    # -- critical path (single query) -------------------------------------
 
-    def _pipelined_cost(self, assignments: List[StageAssignment]
-                        ) -> Tuple[float, float, int]:
-        """Estimate overlapped latency under a Megatron fill-drain model.
+    @staticmethod
+    def _critical_path(assignments: List[StageAssignment]
+                       ) -> Tuple[float, float, float]:
+        """End-to-end latency of one query as a strict dependency chain.
 
-        Intuition: collapse adjacent stages on the same device into "runs"
-        (one device cannot overlap with itself). A single run is a plain
-        serial chain — no speedup. With two or more runs on distinct devices
-        the pipe can fill and drain: the bottleneck run sets the floor, and
-        non-bottleneck work is hidden behind it up to the bottleneck's own
-        length, scaled by how full the pipe gets (warmup_segments / runs).
-        Cross-device handoffs add a transfer tax — the pipeline bubble.
+        The stages of a single query cannot overlap (each consumes the
+        previous one's output). The latency is therefore the FULL critical
+        path: every stage's compute plus every handoff on the path. Each
+        StageAssignment.cost already includes the transfer the cost model
+        charged to move that stage's input to its device — that is exactly
+        the initial load for the first stage and the device-switch handoff
+        for later stages. We must NOT subtract it; doing so was the bug that
+        made a 15 ms PCIe load vanish and produced a fake 246x speedup.
 
-        Returns (pipelined_us, transfer_us, warmup_segments).
+        Returns (compute_us, transfer_us, latency_us) with
+        latency_us == compute_us + transfer_us.
         """
-        if not assignments:
-            return 0.0, 0.0, 0
-
-        # Transfer tax: charged whenever two adjacent stages differ in device.
+        compute_us = 0.0
         transfer_us = 0.0
-        for prev, cur in zip(assignments, assignments[1:]):
-            transfer_us += cur.cost.transfer_cost_us
-
-        # Group into maximal runs on the same device. Within a run, stages
-        # serialize (one device, no overlap). Across runs on distinct devices,
-        # the runs overlap up to max_pipeline_depth, so the critical path is
-        # the heaviest run plus the fill/drain of the rest.
-        runs: List[float] = []
-        run_cost = 0.0
-        run_device: Optional[str] = None
         for a in assignments:
-            compute = a.cost.total_us - a.cost.transfer_cost_us
-            if a.device_id == run_device:
-                run_cost += compute
-            else:
-                if run_device is not None:
-                    runs.append(run_cost)
-                run_cost = compute
-                run_device = a.device_id
-        if run_device is not None:
-            runs.append(run_cost)
-
-        total = sum(runs)
-
-        # Single run = single device: nothing overlaps, the pipeline is a
-        # plain serial chain. This is the degenerate (and common) case and
-        # must NOT report any speedup.
-        if len(runs) <= 1:
-            return total + transfer_us, transfer_us, 0
-
-        bottleneck = max(runs)
-        non_bottleneck = total - bottleneck
-        # Warmup/drain segments: runs that fill and drain the pipe, capped by
-        # pipeline depth (Megatron num_warmup_microbatches = min(pp-1, mb)).
-        warmup_segments = min(self.max_pipeline_depth, len(runs) - 1)
-
-        # Overlap can hide non-bottleneck work behind the bottleneck run, but
-        # never more than the bottleneck itself (you cannot hide 100µs of work
-        # behind a 10µs stage), and the effect scales with how full the pipe
-        # gets relative to its depth. This keeps pipelined in
-        # [bottleneck + transfer, serial].
-        fill_fraction = warmup_segments / len(runs)
-        hidden = min(non_bottleneck, bottleneck) * fill_fraction
-        pipelined = total - hidden + transfer_us
-        return pipelined, transfer_us, warmup_segments
+            transfer_us += a.cost.transfer_cost_us
+            compute_us += (a.cost.total_us - a.cost.transfer_cost_us)
+        return compute_us, transfer_us, compute_us + transfer_us
 
     # -- public API --------------------------------------------------------
 
     def schedule(self, query: QueryDescriptor,
                  data_location: str = "cpu0") -> PipelineSchedule:
-        """Build a full pipeline schedule for one query."""
+        """Build the schedule for one query.
+
+        latency_us is the full critical path (compute + all transfers). There
+        is deliberately no intra-query speedup: a single query's stages are a
+        dependency chain. For cross-query pipelining use schedule_pipeline().
+        """
         stages = decompose_query(query)
         assignments = self.assign_stages(stages, data_location)
-
-        serial = sum(a.cost.total_us for a in assignments)
-        pipelined, transfer, warmup = self._pipelined_cost(assignments)
-
+        compute, transfer, latency = self._critical_path(assignments)
         return PipelineSchedule(
             query_id=query.query_id,
             assignments=assignments,
-            serial_cost_us=serial,
-            pipelined_cost_us=pipelined,
+            compute_cost_us=compute,
             transfer_cost_us=transfer,
-            warmup_segments=warmup,
+            latency_us=latency,
         )
 
     def schedule_batch(self, queries: List[QueryDescriptor],
                        data_location: str = "cpu0"
                        ) -> List[PipelineSchedule]:
-        """Schedule a batch of queries independently."""
+        """Schedule a batch of queries independently (one schedule each)."""
         return [self.schedule(q, data_location) for q in queries]
+
+    # -- cross-query pipelining (the real speedup) ------------------------
+
+    def schedule_pipeline(self, queries: List[QueryDescriptor],
+                          data_location: str = "cpu0"
+                          ) -> PipelineBatchSchedule:
+        """Estimate makespan when m independent queries pipeline across stages.
+
+        This is where pipelining genuinely helps. Following Narayanan et al.
+        (2021) — the Megatron-LM pipeline-bubble result — a synchronous
+        pipeline of m microbatches over p stages spends a fraction
+        (p-1)/(m+p-1) of the time idle. We treat each query as a microbatch
+        and the per-query critical path as the per-microbatch time.
+
+        Model:
+            per_query_latency_i = critical path of query i (already correct).
+            t_serial   = Σ per_query_latency_i        (no overlap)
+            t_ideal    = t_serial / p                 (perfect p-way overlap)
+            bubble     = (p-1)/(m+p-1)
+            t_pipe     = t_ideal / (1 - bubble)
+                       = t_serial * (m + p - 1) / (m * p)
+
+        For m=1 this collapses to t_serial (bubble = (p-1)/p, no overlap),
+        which is exactly correct: one query cannot pipeline with itself.
+        """
+        if not queries:
+            return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
+
+        schedules = [self.schedule(q, data_location) for q in queries]
+        t_serial = sum(s.latency_us for s in schedules)
+
+        m = len(queries)
+        # p = number of distinct pipeline stages = max stage count across the
+        # batch, capped by available devices (you cannot run more concurrent
+        # stages than you have compute devices).
+        max_stages = max(len(s.assignments) for s in schedules)
+        p = min(max_stages, self.max_pipeline_depth)
+        p = max(1, p)
+
+        bubble = (p - 1) / (m + p - 1)
+        # t_pipe = t_serial * (m + p - 1) / (m * p), guarding p>=1.
+        t_pipe = t_serial * (m + p - 1) / (m * p)
+
+        return PipelineBatchSchedule(
+            num_queries=m,
+            num_stages=p,
+            serial_makespan_us=t_serial,
+            pipelined_makespan_us=t_pipe,
+            bubble_fraction=bubble,
+        )

@@ -67,6 +67,8 @@ class QueryDescriptor:
     num_joins: int = 0
     sort_required: bool = False
     group_by_cardinality: int = 0
+    table_name: str = ""             # logical table identity (for cache keying);
+                                     # empty => fall back to query_id stem.
 
     def __post_init__(self):
         """Validate that estimated_rows and other fields are non-negative."""

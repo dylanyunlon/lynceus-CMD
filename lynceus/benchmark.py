@@ -72,6 +72,17 @@ class WorkloadConfig:
     })
     selectivity_range: Tuple[float, float] = (0.001, 0.5)
     index_availability_prob: float = 0.6
+    # Logical table catalog: name -> row count. Queries are drawn against
+    # these tables so cache locality is real and measurable, instead of every
+    # query implicitly hitting one anonymous table. Defaults model a few
+    # TPC-H tables at SF100 scale. Empty => single table named after `name`.
+    tables: Dict[str, int] = field(default_factory=lambda: {
+        "lineitem": 6_000_000,
+        "orders": 1_500_000,
+        "customer": 150_000,
+        "part": 200_000,
+        "supplier": 10_000,
+    })
 
 
 def generate_query_sequence(config: WorkloadConfig,
@@ -89,18 +100,31 @@ def generate_query_sequence(config: WorkloadConfig,
     types = [t for t, _ in types_weights]
     weights = [w for _, w in types_weights]
 
+    # Resolve the table catalog. Empty catalog => one table named after the
+    # workload, with base_table_rows (preserves old single-table behaviour).
+    catalog = dict(config.tables) if config.tables else {
+        config.name: config.base_table_rows
+    }
+    table_names = list(catalog.keys())
+
     for step in range(config.num_steps):
         qt = rng.choices(types, weights=weights, k=1)[0]
 
+        # Pick the logical table this query reads, and use ITS row count
+        # (not a single global base_table_rows) so per-table footprints and
+        # cache locality are physically meaningful.
+        table_name = rng.choice(table_names)
+        table_rows = catalog[table_name]
+
         selectivity = rng.uniform(*config.selectivity_range)
-        estimated_rows = max(1, int(config.base_table_rows * selectivity))
+        estimated_rows = max(1, int(table_rows * selectivity))
 
         # Workload shift: as step increases, queries get harder
         # (simulates realistic workload evolution)
         difficulty_factor = 1.0 + 0.5 * (step / config.num_steps)
         estimated_rows = min(
             int(estimated_rows * difficulty_factor),
-            config.base_table_rows,  # clamp: cannot exceed table size
+            table_rows,  # clamp: cannot exceed this table's size
         )
 
         q = QueryDescriptor(
@@ -110,12 +134,13 @@ def generate_query_sequence(config: WorkloadConfig,
             estimated_width_bytes=rng.randint(50, 500),
             num_predicates=rng.randint(1, 5),
             selectivity=selectivity,
-            table_rows=config.base_table_rows,
+            table_rows=table_rows,
             index_available=rng.random() < config.index_availability_prob,
             index_depth=rng.randint(2, 5),
             num_joins=rng.randint(0, 3) if qt == QueryType.JOIN else 0,
             sort_required=(qt == QueryType.SORT or rng.random() < 0.2),
             group_by_cardinality=rng.randint(10, 1000) if qt == QueryType.AGGREGATE else 0,
+            table_name=table_name,
         )
         queries.append(q)
 

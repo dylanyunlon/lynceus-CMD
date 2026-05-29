@@ -315,19 +315,58 @@ class HardwareTopology:
         self.edges.append(edge)
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
-        """Estimate data transfer cost in microseconds.
+        """Estimate data transfer cost in microseconds along the best path.
 
-        Inspired by NCCL's path cost computation in ncclTopoComputePaths.
+        Computes the minimum-cost route from src to dst over the topology
+        graph, allowing multi-hop paths (e.g. cpu1 -> cpu0 -> gpu0 on a
+        dual-socket box where the second NUMA node has no direct GPU link).
+        This mirrors NCCL's ncclTopoComputePaths, which finds shortest paths
+        over the whole topology rather than requiring a direct edge.
+
+        Per-hop cost = edge.latency_us + bytes / bandwidth. Hop costs add along
+        the path (store-and-forward), so the path cost is the sum of its edges.
+        Dijkstra is correct here because every edge cost is non-negative.
+
+        Contracts preserved for callers:
+            src == dst            -> 0.0
+            no path / zero-bw cut -> inf
         """
         if src == dst:
             return 0.0
+        if src not in self.nodes or dst not in self.nodes:
+            return float("inf")
+
+        # Per-hop weight for the given payload size. A non-positive bandwidth
+        # edge is an impassable cut (weight inf) — never usable.
+        def hop_cost(e: "TopologyEdge") -> float:
+            if e.bandwidth_gbps <= 0:
+                return float("inf")
+            return e.latency_us + (data_bytes / (e.bandwidth_gbps * 1e9 / 8)) * 1e6
+
+        # Adjacency: src -> list of (neighbor, weight). Built per call; the
+        # graph is tiny (a single node's device fabric).
+        adj: Dict[str, List[Tuple[str, float]]] = {}
         for e in self.edges:
-            if e.src == src and e.dst == dst:
-                if e.bandwidth_gbps <= 0:
-                    return float("inf")
-                transfer_us = (data_bytes / (e.bandwidth_gbps * 1e9 / 8)) * 1e6
-                return e.latency_us + transfer_us
-        return float("inf")  # no direct path
+            w = hop_cost(e)
+            if w != float("inf"):
+                adj.setdefault(e.src, []).append((e.dst, w))
+
+        # Dijkstra with a binary heap.
+        import heapq
+        dist: Dict[str, float] = {src: 0.0}
+        pq: List[Tuple[float, str]] = [(0.0, src)]
+        while pq:
+            d, u = heapq.heappop(pq)
+            if u == dst:
+                return d
+            if d > dist.get(u, float("inf")):
+                continue  # stale entry
+            for v, w in adj.get(u, ()):  # noqa: E741
+                nd = d + w
+                if nd < dist.get(v, float("inf")):
+                    dist[v] = nd
+                    heapq.heappush(pq, (nd, v))
+        return dist.get(dst, float("inf"))
 
     def get_node(self, node_id: str) -> Optional[HardwareNode]:
         return self.nodes.get(node_id)

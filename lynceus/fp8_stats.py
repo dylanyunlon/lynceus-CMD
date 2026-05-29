@@ -138,14 +138,36 @@ class QuantError:
     max_abs: float = 0.0
     max_rel: float = 0.0
     cosine: float = 1.0
+    has_nonfinite: bool = False   # True if orig/recon contained NaN or Inf
 
     def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.5) -> bool:
+        # Non-finite input is never silently accepted: the caller must handle
+        # NaN/Inf explicitly rather than have it swallowed by NaN comparisons.
+        if self.has_nonfinite:
+            return False
         return self.snr_db >= snr_floor_db and self.max_rel <= max_rel_ceil
 
 
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     sig = noise = dot = no = nr = mx = mrel = 0.0
+    nonfinite = False
+    # Reference scale for relative error of zero-valued originals: when the
+    # true value is 0 but the reconstruction is not, a ratio is undefined, so
+    # we normalise that element's error by the column's max magnitude instead.
+    # This catches FP8 polluting zeros (common in sparse histogram columns),
+    # which the old `if abs(o) > 0` guard silently ignored.
+    amax = 0.0
+    for o in orig:
+        if not math.isfinite(o):
+            nonfinite = True
+        else:
+            amax = max(amax, abs(o))
+    scale = amax if amax > 0.0 else 1.0
+
     for o, r in zip(orig, recon):
+        if not (math.isfinite(o) and math.isfinite(r)):
+            nonfinite = True
+            continue
         e = o - r
         sig += o * o
         noise += e * e
@@ -153,9 +175,10 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
         no += o * o
         nr += r * r
         mx = max(mx, abs(e))
-        if abs(o) > 0.0:
-            mrel = max(mrel, abs(e) / abs(o))
-    q = QuantError(max_abs=mx, max_rel=mrel)
+        denom = abs(o) if abs(o) > 0.0 else scale
+        mrel = max(mrel, abs(e) / denom)
+
+    q = QuantError(max_abs=mx, max_rel=mrel, has_nonfinite=nonfinite)
     q.rel_l2 = math.sqrt(noise / sig) if sig > 0 else 0.0
     q.snr_db = 10.0 * math.log10(sig / noise) if noise > 0 else math.inf
     q.cosine = dot / (math.sqrt(no) * math.sqrt(nr)) if no > 0 and nr > 0 else 1.0
