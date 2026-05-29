@@ -110,12 +110,44 @@
 %   XXXI = out-of-memory (OOM)
 %   XXXII= distributed cost-model synchronization layer
 %
-% (Section 3+ mappings, e.g. invariants/contracts CI-.., are added by later
-%  Claudes starting at CI -- do NOT overwrite A-XXXII above.)
+% Cost-model correctness (CI-CXXX; Claude-2, Section 3):
+%   CI    = cost-model correctness guarantees
+%   CII   = strict data-dependency chain (SCAN->FILTER->JOIN->AGG->SORT)
+%   CIII  = batch (set of independent queries)
+%   CIV   = cost-estimation problem
+%   CV    = per-query latency (objective being predicted)
+%   CVI   = per-stage cost (compute + transfer of one operator)
+%   CVII  = end-to-end critical path
+%   CVIII = device (a GPU or CPU in the topology)
+%   CIX   = workload (stream of queries D)
+%   CX    = single-node / star topology
+%   CXI   = topology heterogeneity (multi-socket, multi-NUMA)
+%   CXII  = physical lower bound (critical-path floor)
+%   CXIII = transfer-accounting completeness (no hidden moves)
+%   CXIV  = unbiased per-device estimate
+%   CXV   = bounded estimation error
+%   CXVI  = multi-hop reachability over the fabric
+%   CXVII = pipeline depth p (number of stages/devices)
+%   CXVIII= per-query speedup ceiling (=1 for a single query)
+%   CXIX  = asymptotically linear (throughput in batch size m)
+%   CXX   = leading term (serial critical-path sum)
+%   CXXI  = bubble overhead term (p-1)/(m+p-1)
+%   CXXII = bubble fraction (the Megatron pipeline-bubble factor)
+%   CXXIII= batch-pipelining equivalence (m queries over p stages)
+%   CXXIV = throughput speedup (m*p)/(m+p-1)
+%   CXXV  = finite, explicit table identity (never string-inferred)
+%   CXXVI = quantization-error guard (zero / NaN-Inf safety)
+%   CXXVII= signal-to-noise ratio (SNR) floor
+%   CXXVIII = per-element max-relative-error ceiling
+%   CXXIX = block-wise fp32 scale (absorbs dynamic range)
+%   CXXX  = mantissa-bit dominance (E4M3 over E5M2 under scaling)
 %================================================================================
 
 \documentclass{article}
 \usepackage{amsmath,amssymb}
+\usepackage{amsthm}
+\newtheorem{theorem}{Theorem}
+\newtheorem{assumption}{Assumption}
 
 \begin{document}
 
@@ -241,5 +273,88 @@ margin is thin yields a penalty-aware variant.
 \paragraph{Illustrative Example} Figure~\ref{fig:toy} illustrates a workload
 where A and a transfer-aware H route correctly under heterogeneous device costs,
 while fixed C routing -- which ignores I -- mispredicts and overloads one device.
+
+%================================================================================
+% Section 3: Cost-Model Correctness Guarantees (Templated)
+%================================================================================
+\section{CI for A}
+\label{sec:guarantees}
+
+% Paragraph 1: Section intro
+This section provides the correctness foundation for the proposed A approach. We
+focus on the cost a single J incurs on one CVIII, where its operators form a CII
+and cannot overlap. Extensions to the CIII case, where independent J stream
+through the device fabric together, are treated in the batch model below, and
+the data-identity and quantization safeguards are stated as explicit contracts.
+
+% Paragraph 2: Cost-estimation problem definition
+Formally, we consider the following CIV: for a J routed to CVIII $s$, predict
+\begin{equation}
+\mathrm{CV}(J, s) := \sum_{\text{stage } k} \big( c^{\text{compute}}_k + c^{\text{transfer}}_k \big), \quad \text{with } c^{\text{transfer}}_1 \text{ including the initial load into } s,
+\end{equation}
+and route $J$ to $\arg\min_s \mathrm{CV}(J,s)$. In this setup, every CVI is priced
+on a common scale, and the CVII is the sum over the CII. This recovers the CX
+case when the topology is a single node; in general W may reside on a remote
+CVIII reachable only by CXVI.
+
+% Paragraph 3: Contracts (assumptions playing the role of correctness premises)
+\begin{assumption}[CXIII]
+\label{asm:transfer}
+The CV of a J is its CVII: no stage's $c^{\text{transfer}}_k$ is ever subtracted
+from its compute and treated as hidden. In particular the load into the first
+stage's CVIII is counted, so the estimate is never below the CXII.
+\end{assumption}
+
+\begin{assumption}[CXVI]
+\label{asm:fabric}
+Fabric I is the minimum-cost path over the topology graph, additive over hops,
+with $\text{src}=\text{dst}\to 0$ and a genuine cut $\to\infty$. A missing direct
+edge is not unreachability: data on a second NUMA node reaches a GPU multi-hop.
+\end{assumption}
+
+\begin{assumption}[CXXV and CXXVI]
+\label{asm:safety}
+XI is an explicit field, never inferred from a query identifier by string
+surgery. Quantization-error metrics carry a CXXVI: the relative error of a
+zero-valued original is normalized by the column magnitude, and any NaN/Inf
+input is flagged rather than silently swallowed.
+\end{assumption}
+
+% Paragraph 4: Batch view (probabilistic-sync analog)
+To analyze throughput we view a CIII of $m$ independent J flowing through $p$
+stages pinned to devices, the cross-J analog of intra-query overlap. A single J
+admits no overlap (CXVIII is exactly $1$), whereas $m$ independent J share the
+pipeline (CXXIII), so per-J latency amortizes toward the CXXII floor.
+
+% Paragraph 5: Proposition (the rate result analog)
+\begin{theorem}[Critical-path floor and CIII speedup]
+\label{thm:costmodel}
+Under Assumption~\ref{asm:transfer}, the predicted CV of a single J equals its
+CVII and is therefore bounded below by the CXII; its CXVIII is
+\begin{equation}
+\text{speedup}_{\text{single}} = 1.
+\end{equation}
+For a CIII of $m$ independent J over $p$ stages, the pipelined makespan obeys the
+Megatron-LM pipeline-bubble model
+\begin{equation}
+t_{\text{pipe}} = t_{\text{serial}} \cdot \frac{m + p - 1}{m \cdot p}, \quad \text{where } \mathrm{CXXII} = \frac{p-1}{m+p-1},
+\end{equation}
+so that CXXIV $= \frac{m \cdot p}{m + p - 1}$, recovering $t_{\text{serial}}$ at
+$m=1$ and approaching the CXIX limit $p$ as $m \to \infty$.
+\end{theorem}
+
+% Paragraph 6: Discussion
+The correctness floor is exact: CXX, the serial CVII sum, is never undercut, so
+no fictitious overlap can manufacture a speedup on a single CVIII.
+CXXI, the $(p-1)/(m+p-1)$ term, is the only source of pipeline benefit and it
+vanishes at $m=1$ -- intra-query speedup does not exist. Transfer accounting
+matters most: omitting one $c^{\text{transfer}}_k$ breaks the CXII and yields an
+unbounded apparent speedup, exactly the failure Assumption~\ref{asm:transfer}
+forbids. The data-identity and quantization safeguards
+(Assumption~\ref{asm:safety}) protect the empirical signals downstream:
+collapsing XI fabricates cache-hit rates, and an unguarded zero/NaN lets a
+polluted statistic pass a CXXVII--CXXVIII gate. Finally, under a CXXIX the scale
+absorbs dynamic range, so CXXX holds: E4M3 dominates E5M2 on accuracy and is the
+default, with the wider format an explicit opt-in only.
 
 \end{document}
