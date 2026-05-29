@@ -141,6 +141,23 @@
 %   CXXVIII = per-element max-relative-error ceiling
 %   CXXIX = block-wise fp32 scale (absorbs dynamic range)
 %   CXXX  = mantissa-bit dominance (E4M3 over E5M2 under scaling)
+%
+% Experimental design (CXXXI-CXLV; Claude-3, Section 4):
+%   CXXXI = analytical query workload
+%   CXXXII = TPC-H at scale factor 100 (SF100)
+%   CXXXIII = the fact table (lineitem, ~6M rows)
+%   CXXXIV = query-type mix (point / range / scan / index / join / agg / sort)
+%   CXXXV = selectivity range
+%   CXXXVI = workload shift (queries harden as the stream advances)
+%   CXXXVII = routing methods under comparison
+%   CXXXVIII = GPU-only routing
+%   CXXXIX = CPU-only routing
+%   CXL = cost-model-driven routing (the Lynceus router)
+%   CXLI = penalty-aware (robustness-margin) routing
+%   CXLII = online adaptive routing (EMA bias correction + load balancing)
+%   CXLIII = a single heterogeneous node (multi-socket CPU + multi-GPU)
+%   CXLIV = PCIe / NVLink device fabric
+%   CXLV = per-seed, per-step latency curves (3 seeds x 2000 steps)
 %================================================================================
 
 \documentclass{article}
@@ -356,5 +373,30 @@ collapsing XI fabricates cache-hit rates, and an unguarded zero/NaN lets a
 polluted statistic pass a CXXVII--CXXVIII gate. Finally, under a CXXIX the scale
 absorbs dynamic range, so CXXX holds: E4M3 dominates E5M2 on accuracy and is the
 default, with the wider format an explicit opt-in only.
+
+%================================================================================
+% Section 4: Experimental Design (Templated)
+%================================================================================
+\section{Experimental Design}
+\label{sec:experimental_design}
+
+% Paragraph 1: Workload and data
+We evaluate A on a CXXXI derived from CXXXII, drawing queries against CXXXIII and
+the surrounding catalog. Each CIX is a stream of CXLV: queries span the CXXXIV
+with a CXXXV, and a CXXXVI makes later queries progressively harder, so the
+panels exercise the cost model across light and heavy J alike.
+
+% Paragraph 2: Method configuration
+We compare A against the CXXXVII: CXXXVIII, CXXXIX, and H, alongside two
+cost-model variants -- CXL and its CXLI counterpart -- and a CXLII baseline. All
+methods route the same CIX so that differences reflect routing policy alone;
+CXL selects $\arg\min_s \mathrm{CV}(J,s)$ per query, while CXLI applies a ζ that
+prefers the robust CVIII when the margin is thin.
+
+% Paragraph 3: Hardware
+Experiments are conducted on CXLIII -- a multi-socket CPU paired with multiple
+GPUs -- interconnected by a CXLIV, so that W resident on a second NUMA node
+reaches a GPU only by CXVI. Reported curves average over three seeds with per-J
+CV measured in microseconds.
 
 \end{document}
