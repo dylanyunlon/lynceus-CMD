@@ -32,11 +32,6 @@ import math
 import time
 import json
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import hashlib
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Callable
@@ -835,3 +830,26 @@ def debug_dump_all(analyzer: HeterogeneousRobustnessAnalyzer):
         print(f"  penalties: {[f'{p:.1f}' for p in analyzer.penalties]}")
     print(f"  robust_plan_idx: {analyzer.robust_plan_idx}")
     print("=" * 60)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_robustness_histogram(self) -> str:
+        """★ 改写: 鲁棒性评分分布直方图."""
+        from .. import _dbg
+        if not self._scores:
+            return "(no scores)"
+        buckets = [0] * 10
+        for s in self._scores:
+            idx = min(9, int(s * 10))
+            buckets[idx] += 1
+        total = len(self._scores)
+        lines = ["┌── Robustness Score Distribution ──"]
+        for i, cnt in enumerate(buckets):
+            lo, hi = i * 0.1, (i + 1) * 0.1
+            bar = "█" * max(1, int(cnt / max(1, total) * 40))
+            lines.append(f"│ {lo:.1f}-{hi:.1f}: {bar} ({cnt})")
+        lines.append(f"│ mean={sum(self._scores)/total:.3f}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

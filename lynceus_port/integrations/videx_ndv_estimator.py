@@ -31,11 +31,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
@@ -525,3 +520,27 @@ class NDVEstimator:
 
         print(f"  └────────────────────────────────────────────────────")
         return results
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_estimation_accuracy(self) -> str:
+        """★ 改写: NDV 估计精度审计."""
+        from .. import _dbg
+        if not self._estimation_log:
+            return "(no estimations)"
+        lines = ["┌── NDV Estimation Accuracy ──"]
+        errors = []
+        for entry in self._estimation_log[-10:]:
+            est = entry.get('estimated', 0)
+            actual = entry.get('actual', 0)
+            if actual > 0:
+                err = abs(est - actual) / actual
+                errors.append(err)
+                lines.append(f"│ {entry.get('column','?')}: "
+                             f"est={est:,} actual={actual:,} err={err:.2%}")
+        if errors:
+            lines.append(f"│ mean_error = {sum(errors)/len(errors):.2%}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

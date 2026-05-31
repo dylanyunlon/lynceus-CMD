@@ -19,11 +19,6 @@ References:
   PostgreSQL costsize.c  — CPU/IO cost model fundamentals
 """
 from __future__ import annotations
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 
 import math
 from dataclasses import dataclass, field
@@ -231,3 +226,21 @@ class CostCalibrator:
 
     def calibrate(self, estimated_us: float) -> float:
         return estimated_us * self.calibration_factor()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+def dump_cost_breakdown_table(costs: "Dict[str, float]") -> str:
+    """★ 改写: ASCII 代价分解表."""
+    if not costs:
+        return "(empty)"
+    total = sum(costs.values())
+    lines = ["┌── Cost Breakdown ──"]
+    for name, val in sorted(costs.items(), key=lambda x: -x[1]):
+        pct = val / max(1e-12, total) * 100
+        bar = "█" * max(1, int(pct / 2.5))
+        lines.append(f"│ {name:>15}: {bar} {val:.1f}µs ({pct:.1f}%)")
+    lines.append(f"│ TOTAL: {total:.1f}µs")
+    lines.append("└──────────────────")
+    return "\n".join(lines)

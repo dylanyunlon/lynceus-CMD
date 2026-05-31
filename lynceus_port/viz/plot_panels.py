@@ -1,6 +1,5 @@
 """
-lynceus_port/viz/ — 移植版
-# plot_panels.py — Visualization and figure generation.
+lynceus/viz/plot_panels.py — Visualization and figure generation.
 
 Architecture references (ported/adapted from):
   - PAR2QO diagram.py (par2qo/code/diagram.py:1-565)
@@ -52,11 +51,6 @@ import math
 import time
 import json
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum, auto
@@ -674,3 +668,62 @@ def build_benchmark_report(
         print(figure.dump_debug("    "))
 
     return figure
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区 — ASCII 图表 + 异常检测 + 趋势线
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ascii_sparkline(values: "List[float]", width: int = 40) -> str:
+    """★ 改写: ASCII 迷你趋势线 (断点辅助, 快速可视化)."""
+    if not values:
+        return ""
+    vmin, vmax = min(values), max(values)
+    chars = " ▁▂▃▄▅▆▇█"
+    rng = vmax - vmin
+    if rng < 1e-12:
+        return chars[-1] * min(width, len(values))
+    step = max(1, len(values) // width)
+    spark = []
+    for i in range(0, len(values), step):
+        chunk = values[i:i+step]
+        avg = sum(chunk) / len(chunk)
+        idx = min(len(chars) - 1, int((avg - vmin) / rng * (len(chars) - 1)))
+        spark.append(chars[idx])
+    return "".join(spark[:width])
+
+
+def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
+    """★ 改写: 趋势变化点检测 (CUSUM-like).
+
+    返回趋势反转的索引列表 — 用于识别策略切换点、性能拐点.
+    """
+    if len(values) < 2 * window:
+        return []
+    changepoints = []
+    for i in range(window, len(values) - window):
+        left_mean = sum(values[i-window:i]) / window
+        right_mean = sum(values[i:i+window]) / window
+        overall_std = (sum((v - (left_mean + right_mean) / 2) ** 2
+                          for v in values[i-window:i+window]) /
+                      (2 * window)) ** 0.5
+        if overall_std > 1e-12:
+            z = abs(right_mean - left_mean) / overall_std
+            if z > 3.0:  # 3σ 阈值
+                if not changepoints or i - changepoints[-1] > window:
+                    changepoints.append(i)
+    from .. import _dbg
+    if changepoints:
+        _dbg(f"trend_changes: {len(changepoints)} points at {changepoints}")
+    return changepoints
+
+
+def dump_panel_ascii(panel_name: str, x: "List[float]",
+                     methods: "Dict[str, List[float]]") -> str:
+    """★ 改写: ASCII 面板对比 — 所有策略的趋势线并排."""
+    lines = [f"┌── Panel: {panel_name} ──"]
+    for name, vals in sorted(methods.items()):
+        spark = ascii_sparkline(vals, width=50)
+        final = vals[-1] if vals else 0.0
+        lines.append(f"│ {name:>20}: {spark} → {final:.2f}")
+    lines.append("└──────────────────────────────────────────────────")
+    return "\n".join(lines)

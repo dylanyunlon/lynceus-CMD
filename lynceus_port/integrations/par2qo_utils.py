@@ -32,11 +32,6 @@ import json
 import re
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from typing import List, Dict, Optional, Tuple, Any, Union
 
 logger = logging.getLogger("lynceus.par2qo_utils")
@@ -387,3 +382,29 @@ def debug_print_selectivities(
         bar = "█" * int(min(s * 50, 50))
         print(f"  │    [{j:2d}] {s:.6f} {bar}")
     print(f"  └────────────────────────────────────────────────────")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_sample_coverage(samples: "List[float]",
+                          domain_lo: float, domain_hi: float,
+                          n_bins: int = 10) -> str:
+    """★ 改写: 采样覆盖率检查 — 标记空洞区间."""
+    from .. import _dbg
+    if not samples:
+        return "(no samples)"
+    bin_width = (domain_hi - domain_lo) / n_bins
+    bins = [0] * n_bins
+    for s in samples:
+        idx = min(n_bins - 1, max(0, int((s - domain_lo) / max(1e-12, bin_width))))
+        bins[idx] += 1
+    lines = ["┌── Sample Coverage ──"]
+    for i, cnt in enumerate(bins):
+        lo = domain_lo + i * bin_width
+        bar = "█" * min(30, cnt) if cnt > 0 else "  ∅ EMPTY"
+        lines.append(f"│ [{lo:.2f}, {lo + bin_width:.2f}): {bar} ({cnt})")
+    empty = sum(1 for b in bins if b == 0)
+    lines.append(f"│ coverage: {n_bins - empty}/{n_bins} bins filled")
+    lines.append("└──────────────────────────────")
+    return "\n".join(lines)

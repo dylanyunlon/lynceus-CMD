@@ -1,6 +1,5 @@
 """
-lynceus_port/distributed/ — 移植版
-# optimizer.py — Distributed cost-model parameter optimizer.
+lynceus/distributed/optimizer.py — Distributed cost-model parameter optimizer.
 
 Architecture references (ported/adapted from):
   - APEX DistributedFusedAdam
@@ -34,11 +33,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
@@ -303,3 +297,38 @@ class DistributedCostModelOptimizer:
                         f"sync={s.sync_us:8.1f}µs  grad={s.grad_norm:.4f}  "
                         f"Δparam={s.param_delta_norm:.4f}")
         return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_lr_schedule(self) -> str:
+        """★ 改写: ASCII 学习率变化曲线."""
+        if not self._history:
+            return "(no history)"
+        lines = ["┌── LR Schedule ──"]
+        for step in self._history[-20:]:
+            lr = step.learning_rate
+            bar = "█" * max(1, int(lr / max(1e-9, self._config.learning_rate) * 30))
+            lines.append(f"│ step{step.step_id:>4}: {bar} lr={lr:.6f} "
+                         f"loss={step.loss:.4f}")
+        lines.append("└──────────────────")
+        return "\n".join(lines)
+
+    def estimate_convergence(self, window: int = 20) -> float:
+        """★ 改写: 基于滑动窗口斜率估算收敛速度.
+
+        返回: loss 斜率 (负值=收敛中, 正值=发散, ~0=平台).
+        """
+        if len(self._history) < window:
+            return 0.0
+        recent = self._history[-window:]
+        n = len(recent)
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(s.loss for s in recent) / n
+        num = sum((i - x_mean) * (s.loss - y_mean) for i, s in enumerate(recent))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        slope = num / max(1e-12, den)
+        from . import _dbg
+        _dbg(f"convergence: slope={slope:.6f} (window={window})")
+        return slope

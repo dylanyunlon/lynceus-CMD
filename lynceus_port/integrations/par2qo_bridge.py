@@ -24,11 +24,6 @@ from __future__ import annotations
 
 import math
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum, auto
@@ -404,3 +399,19 @@ class PlanCostHistogram:
         mean_bin = sum(i * b for i, b in enumerate(bins)) / total
         var = sum((i - mean_bin) ** 2 * b for i, b in enumerate(bins)) / total
         return var
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_routing_audit(self) -> str:
+        """★ 改写: 路由决策审计日志 — 每个查询的决策理由链."""
+        from .. import _dbg
+        lines = ["┌── PAR2QO Bridge Routing Audit ──"]
+        for i, decision in enumerate(self._decisions[-20:]):
+            lines.append(f"│ [{i}] q={decision.get('query_id','?')} "
+                         f"→ {decision.get('device','?')} "
+                         f"reason={decision.get('reason','?')}")
+        lines.append(f"│ total_decisions = {len(self._decisions)}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

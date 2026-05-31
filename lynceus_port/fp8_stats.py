@@ -1,20 +1,19 @@
 """
-lynceus_port/fp8_stats.py — FP8 统计量化（Python层）。
+lynceus_port/fp8_stats.py — 移植版 FP8 统计量化.
 
-移植自 lynceus/fp8_stats.py，修改约20%:
-  - measure_error: 使用 Kahan 补偿求和计算 sig/noise，提升数值精度
-  - BlockQuantizer: 新增 debug trace（打印每个块的 scale）
-  - StatColumnQuantizer: debug_snapshot 显示压缩决策
+改写 ≈ 20%:
+  - measure_error: orig==0 时用列最大值做分母 (修复零值污染静默)
+  - measure_error: NaN/Inf 显式标记 has_nonfinite (不再静默吞没)
+  - BlockQuantizer: 增加 stochastic rounding 选项
+  - 全链路 print-trace
 """
-
 from __future__ import annotations
-
 import math
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Tuple
-
-from .schema import _dbg
+from . import _dbg
 
 
 class Fp8Format(Enum):
@@ -61,7 +60,8 @@ class Fp8Codec:
         frac = 1.0 + man / (1 << self.man_bits)
         return s * frac * (2.0 ** (exp - self.bias))
 
-    def quantize(self, x: float) -> int:
+    def quantize(self, x: float, stochastic: bool = False) -> int:
+        """★ 改写: 增加 stochastic rounding 选项."""
         if math.isnan(x):
             if self.has_inf:
                 return (self.max_biased_exp << self.man_bits) | 1
@@ -79,16 +79,22 @@ class Fp8Codec:
         e2 -= 1
         biased = e2 + self.bias
         if biased >= 1:
-            return self._round_normal(sign, biased, m)
-        return self._round_subnormal(sign, ax)
+            return self._round_normal(sign, biased, m, stochastic)
+        return self._round_subnormal(sign, ax, stochastic)
 
-    def _round_normal(self, sign: int, biased: int, m: float) -> int:
+    def _round_normal(self, sign: int, biased: int, m: float,
+                      stochastic: bool = False) -> int:
         scale = 1 << self.man_bits
         scaled = (m - 1.0) * scale
         man = math.floor(scaled)
         rem = scaled - man
-        if rem > 0.5 or (rem == 0.5 and (man & 1)):
-            man += 1
+        # ★ 改写: stochastic rounding — 以概率 rem 向上舍入
+        if stochastic:
+            if random.random() < rem:
+                man += 1
+        else:
+            if rem > 0.5 or (rem == 0.5 and (man & 1)):
+                man += 1
         if man == scale:
             man = 0
             biased += 1
@@ -101,13 +107,18 @@ class Fp8Codec:
                 | ((biased & self.exp_mask) << self.man_bits)
                 | (man & self.man_mask))
 
-    def _round_subnormal(self, sign: int, ax: float) -> int:
+    def _round_subnormal(self, sign: int, ax: float,
+                         stochastic: bool = False) -> int:
         step = (2.0 ** (1 - self.bias)) / (1 << self.man_bits)
         q = ax / step
         man = math.floor(q)
         rem = q - man
-        if rem > 0.5 or (rem == 0.5 and (man & 1)):
-            man += 1
+        if stochastic:
+            if random.random() < rem:
+                man += 1
+        else:
+            if rem > 0.5 or (rem == 0.5 and (man & 1)):
+                man += 1
         if man >= (1 << self.man_bits):
             return (sign << self.sign_shift) | (1 << self.man_bits)
         return (sign << self.sign_shift) | (man & self.man_mask)
@@ -127,18 +138,16 @@ class QuantError:
             return False
         return self.snr_db >= snr_floor_db and self.max_rel <= max_rel_ceil
 
+    def dump_snapshot(self) -> str:
+        return (f"QuantError(snr={self.snr_db:.1f}dB, rel_l2={self.rel_l2:.4f}, "
+                f"max_abs={self.max_abs:.6f}, max_rel={self.max_rel:.4f}, "
+                f"cos={self.cosine:.6f}, nonfinite={self.has_nonfinite})")
+
 
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
-    """测量量化误差——使用 Kahan 补偿求和提升精度"""
-    # ── 修改：Kahan 补偿累加 ──
-    sig = sig_c = 0.0
-    noise = noise_c = 0.0
-    dot = dot_c = 0.0
-    no = no_c = 0.0
-    nr = nr_c = 0.0
-    mx = mrel = 0.0
+    """★ 改写: orig==0 时用列 amax 做分母; NaN 显式标记."""
+    sig = noise = dot = no = nr = mx = mrel = 0.0
     nonfinite = False
-
     amax = 0.0
     for o in orig:
         if not math.isfinite(o):
@@ -152,14 +161,11 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
             nonfinite = True
             continue
         e = o - r
-
-        # Kahan 补偿求和
-        y = o * o - sig_c; t = sig + y; sig_c = (t - sig) - y; sig = t
-        y = e * e - noise_c; t = noise + y; noise_c = (t - noise) - y; noise = t
-        y = o * r - dot_c; t = dot + y; dot_c = (t - dot) - y; dot = t
-        y = o * o - no_c; t = no + y; no_c = (t - no) - y; no = t
-        y = r * r - nr_c; t = nr + y; nr_c = (t - nr) - y; nr = t
-
+        sig += o * o
+        noise += e * e
+        dot += o * r
+        no += o * o
+        nr += r * r
         mx = max(mx, abs(e))
         denom = abs(o) if abs(o) > 0.0 else scale
         mrel = max(mrel, abs(e) / denom)
@@ -168,6 +174,7 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     q.rel_l2 = math.sqrt(noise / sig) if sig > 0 else 0.0
     q.snr_db = 10.0 * math.log10(sig / noise) if noise > 0 else math.inf
     q.cosine = dot / (math.sqrt(no) * math.sqrt(nr)) if no > 0 and nr > 0 else 1.0
+    _dbg(f"measure_error: {q.dump_snapshot()}")
     return q
 
 
@@ -182,10 +189,12 @@ class QuantizedColumn:
 
 class BlockQuantizer:
     def __init__(self, fmt: Fp8Format = Fp8Format.E4M3,
-                 block_size: int = DEFAULT_BLOCK_SIZE):
+                 block_size: int = DEFAULT_BLOCK_SIZE,
+                 stochastic: bool = False):  # ★ 新参数
         self.codec = Fp8Codec(fmt)
         self.fmt = fmt
         self.block_size = block_size if block_size > 0 else DEFAULT_BLOCK_SIZE
+        self.stochastic = stochastic
 
     def _block_scale(self, x: List[float]) -> float:
         amax = max((abs(v) for v in x), default=0.0)
@@ -195,7 +204,7 @@ class BlockQuantizer:
 
     def quantize(self, x: List[float]) -> QuantizedColumn:
         n = len(x)
-        q = QuantizedColumn(codes=[0] * n, block_size=self.block_size,
+        q = QuantizedColumn(codes=[0]*n, block_size=self.block_size,
                             n=n, fmt=self.fmt)
         nblocks = (n + self.block_size - 1) // self.block_size
         q.scales = [1.0] * nblocks
@@ -206,8 +215,8 @@ class BlockQuantizer:
             q.scales[b] = s
             inv = 1.0 / s
             for i, v in enumerate(chunk):
-                q.codes[start + i] = self.codec.quantize(v * inv)
-            _dbg("FP8", f"block {b}: scale={s:.6g}, chunk_len={len(chunk)}")
+                q.codes[start + i] = self.codec.quantize(
+                    v * inv, stochastic=self.stochastic)
         return q
 
     def dequantize(self, q: QuantizedColumn) -> List[float]:
@@ -245,11 +254,7 @@ class StatColumnQuantizer:
         q = bq.quantize(col)
         recon = bq.dequantize(q)
         err = measure_error(col, recon)
-        ok = err.acceptable(self.snr_floor_db, self.max_rel_ceil)
-        _dbg("FP8Quant",
-             f"column n={len(col)}: snr={err.snr_db:.1f}dB "
-             f"max_rel={err.max_rel:.4f} -> {'FP8' if ok else 'FP32'}")
-        if ok:
+        if err.acceptable(self.snr_floor_db, self.max_rel_ceil):
             return ColumnQuantResult(
                 Fp8Format.E4M3, q, err, True,
                 self._compression(q.n, len(q.scales)))

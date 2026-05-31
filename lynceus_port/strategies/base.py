@@ -1,57 +1,38 @@
 """
-lynceus_port/strategies/base.py — 路由策略抽象基类。
+lynceus_port/strategies/base.py — 路由策略抽象基类.
 
-移植自 lynceus/strategies/base.py，修改约20%:
-  - RoutingDecision: 新增 wall_time_us 字段
-  - RoutingDecision: 新增 to_dict() 序列化
-  - RoutingStrategyBase: 新增 debug_snapshot()
+改写: RoutingDecision 增加 trace_log 字段, 记录决策推理链.
 """
-
 from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 from ..cost_model import CostBreakdown, CostModelEngine, QueryDescriptor
-from ..schema import HardwareKind, _dbg
+from ..schema import HardwareKind
+from .. import _dbg
 
 
 @dataclass
 class RoutingDecision:
-    """路由决策——策略的结构化输出"""
     query_id: str
     device_id: str
     cost: CostBreakdown
     confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
-    # ── 新增：实际路由决策耗时 ──
-    wall_time_us: float = 0.0
+    # ★ 改写: 推理链 trace — 记录每一步决策理由
+    trace_log: List[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "query_id": self.query_id,
-            "device_id": self.device_id,
-            "total_us": self.cost.total_us,
-            "confidence": self.confidence,
-            "wall_time_us": self.wall_time_us,
-            "metadata": self.metadata,
-        }
-
-    def debug_snapshot(self) -> str:
-        s = (f"Decision({self.query_id} -> {self.device_id}, "
-             f"cost={self.cost.total_us:.1f}us, conf={self.confidence:.2f}, "
-             f"reason={self.metadata.get('reason', '?')})")
-        _dbg("Decision", s)
-        return s
+    def dump_snapshot(self) -> str:
+        return (f"Decision({self.query_id} → {self.device_id}, "
+                f"{self.cost.total_us:.1f}µs, conf={self.confidence:.2f})")
 
 
 class RoutingStrategyBase(ABC):
-    """路由策略抽象基类"""
-
     def __init__(self, engine: CostModelEngine, **kwargs):
         self._engine = engine
         self._query_count = 0
+        self._decision_log: List[str] = []  # ★ 改写: 策略级日志
 
     @property
     @abstractmethod
@@ -72,13 +53,13 @@ class RoutingStrategyBase(ABC):
 
     def reset(self) -> None:
         self._query_count = 0
-        _dbg("Strategy", f"{self.name}: reset")
+        self._decision_log.clear()
 
     @staticmethod
     def decisions_to_latencies(decisions: List[RoutingDecision]) -> List[float]:
         return [d.cost.total_ms for d in decisions]
 
-    def debug_snapshot(self) -> str:
-        s = f"Strategy({self.name}, queries_seen={self._query_count})"
-        _dbg("Strategy", s)
-        return s
+    def dump_decision_stats(self) -> str:
+        """断点辅助: 输出策略的决策统计."""
+        return (f"Strategy({self.name}): {self._query_count} queries routed, "
+                f"log_entries={len(self._decision_log)}")

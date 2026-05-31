@@ -25,11 +25,6 @@ from __future__ import annotations
 import hashlib
 import itertools
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Set
@@ -534,3 +529,19 @@ def debug_dump_querylet(qlet: Querylet):
     print(f"  │  fingerprint: {qlet.fingerprint()}")
     print(f"  │  SQL:\n{qlet.to_sql()}")
     print(f"  └────────────────────────────────────────────────────")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_template_fingerprints(self) -> str:
+        """★ 改写: 查询模板指纹摘要."""
+        from .. import _dbg
+        lines = ["┌── Querylet Templates ──"]
+        for tid, tmpl in sorted(self._templates.items()):
+            n_instances = len(tmpl.get('instances', []))
+            lines.append(f"│ T{tid}: {tmpl.get('pattern','?')} "
+                         f"({n_instances} instances)")
+        lines.append(f"│ {len(self._templates)} templates total")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

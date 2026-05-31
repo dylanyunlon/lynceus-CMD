@@ -1,6 +1,5 @@
 """
-lynceus_port/distributed/ — 移植版
-# collector.py — NCCL-backend all_reduce statistics collector.
+lynceus/distributed/collector.py — NCCL-backend all_reduce statistics collector.
 
 Architecture references (ported/adapted from):
   - PAR2QO utility.py (par2qo/code/utility.py:1-497)
@@ -38,11 +37,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Set
@@ -573,3 +567,49 @@ class AllReduceCollector:
                 "per_worker": agg.per_worker_means,
             }
         return json.dumps(export, indent=2)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区 — 追加在线方差追踪 + 异常值检测
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def detect_outlier_workers(self, kind: "StatisticKind",
+                               z_threshold: float = 2.5) -> "List[str]":
+        """★ 改写: 基于 z-score 的异常工作节点检测.
+
+        收集各 worker 对同一种类统计量的均值, 标记偏差 > z_threshold 的节点.
+        断点辅助: 快速定位行为异常的节点 (校准偏移、硬件降速等).
+        """
+        from . import _dbg
+        worker_means: "Dict[str, float]" = {}
+        for wid, buf in self._buffers.items():
+            vals = [s.value for s in buf._samples if s.kind == kind]
+            if vals:
+                worker_means[wid] = sum(vals) / len(vals)
+        if len(worker_means) < 2:
+            return []
+        grand_mean = sum(worker_means.values()) / len(worker_means)
+        var = sum((v - grand_mean) ** 2 for v in worker_means.values()) / len(worker_means)
+        std = var ** 0.5
+        if std < 1e-12:
+            return []
+        outliers = [wid for wid, m in worker_means.items()
+                    if abs(m - grand_mean) / std > z_threshold]
+        if outliers:
+            _dbg(f"outlier_workers({kind.name}): {outliers} "
+                 f"(grand_mean={grand_mean:.2f}, std={std:.2f})")
+        return outliers
+
+    def dump_worker_heatmap(self) -> str:
+        """断点辅助: 各 worker 按统计类别的样本数热力图."""
+        lines = ["┌── Worker × StatKind Heatmap ──"]
+        kinds = list(StatisticKind)
+        hdr = "│ worker   " + "  ".join(f"{k.name:>8}" for k in kinds)
+        lines.append(hdr)
+        for wid, buf in sorted(self._buffers.items()):
+            counts = []
+            for k in kinds:
+                n = sum(1 for s in buf._samples if s.kind == k)
+                counts.append(f"{n:>8}")
+            lines.append(f"│ {wid:>8} " + "  ".join(counts))
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

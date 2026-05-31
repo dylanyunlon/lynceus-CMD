@@ -22,11 +22,6 @@ from __future__ import annotations
 import json
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -326,3 +321,22 @@ class RobustPlanCache:
                   f"penalty={entry.expected_penalty:.1f} "
                   f"accesses={entry.access_count}")
         print(f"  └────────────────────────────────────────────────────")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_hit_rate_trend(self, window: int = 20) -> str:
+        """★ 改写: 缓存命中率滑动窗口趋势."""
+        from .. import _dbg
+        if not self._access_log:
+            return "(no accesses)"
+        lines = ["┌── Plan Cache Hit Rate Trend ──"]
+        for i in range(0, len(self._access_log), window):
+            chunk = self._access_log[i:i+window]
+            hits = sum(1 for x in chunk if x)
+            rate = hits / max(1, len(chunk))
+            bar = "█" * int(rate * 30) + "░" * (30 - int(rate * 30))
+            lines.append(f"│ [{i:>5}-{i+len(chunk):>5}]: {bar} {rate:.1%}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

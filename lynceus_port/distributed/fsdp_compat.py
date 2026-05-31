@@ -1,6 +1,5 @@
 """
-lynceus_port/distributed/ — 移植版
-# fsdp_compat.py — FSDP compatibility layer for cost model.
+lynceus/distributed/fsdp_compat.py — FSDP compatibility layer for cost model.
 
 Architecture references (ported/adapted from):
   - PAR2QO plan_reduction_by_similarity.py (par2qo/code/plan_reduction_by_similarity.py:1-217)
@@ -39,11 +38,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Set
 from enum import Enum, auto
@@ -563,3 +557,40 @@ class FSDPCompatLayer:
                        f"params={s.n_params}, bytes={s.size_bytes}")
         lines.append("╚════════════════════════════════════════════════════════")
         return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_shard_visual(self) -> str:
+        """★ 改写: ASCII 分片可视化 — 断点调试用."""
+        if not self._shards:
+            return "(no shards)"
+        lines = ["┌── FSDP Shard Layout ──"]
+        total = self._config.total_params
+        for s in self._shards:
+            bar_len = max(1, int(s.param_count / max(1, total) * 50))
+            bar = "█" * bar_len
+            lines.append(f"│ Shard{s.shard_id} [{s.device}]: {bar} "
+                         f"({s.param_count} params, {s.size_bytes:,}B)")
+        lines.append(f"│ Strategy: {self._config.strategy.name}")
+        lines.append(f"│ Mixed precision: {self._config.mixed_precision.name}")
+        lines.append("└──────────────────────")
+        return "\n".join(lines)
+
+    def estimate_memory_per_device(self) -> "Dict[str, int]":
+        """★ 改写: 设备级内存占用估算 (断点辅助).
+
+        考虑: 参数 + 梯度 + 优化器状态 (Adam 需 2x 额外).
+        """
+        mem: "Dict[str, int]" = {}
+        multiplier = {"FULL_SHARD": 1, "SHARD_GRAD_OP": 2, "NO_SHARD": 3}
+        m = multiplier.get(self._config.strategy.name, 1)
+        # Adam: params + grads + 2 × optimizer state
+        state_factor = 4  # param + grad + m + v
+        for s in self._shards:
+            dev_mem = s.size_bytes * state_factor * m
+            mem[s.device] = mem.get(s.device, 0) + dev_mem
+        from . import _dbg
+        _dbg(f"fsdp_memory: {mem}")
+        return mem

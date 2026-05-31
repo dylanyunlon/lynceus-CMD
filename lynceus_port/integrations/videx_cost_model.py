@@ -5,11 +5,6 @@ SPDX-License-Identifier: MIT
 
 import json
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import time
 import traceback
 from typing import List
@@ -17,27 +12,12 @@ from typing import List
 import numpy as np
 from cachetools import TTLCache
 
-try:
-    from sub_platforms.sql_opt.histogram.ndv_estimator import NDVEstimator, safe_tolist
-    from sub_platforms.sql_opt.histogram.histogram_utils import load_sample_file
-    from sub_platforms.sql_opt.videx.videx_histogram import MEANINGLESS_INT
-    from sub_platforms.sql_opt.videx.videx_metadata import VidexTableStats, PCT_CACHED_MODE_PREFER_META
-    from sub_platforms.sql_opt.videx.model.videx_strategy import VidexModelBase, VidexStrategy, calc_mulcol_ndv_independent
-    from sub_platforms.sql_opt.videx.videx_utils import IndexRangeCond, RangeCond
-except (ImportError, ModuleNotFoundError):
-    # Upstream VIDEX/sub_platforms deps not available
-    class NDVEstimator: pass
-    def safe_tolist(*a): return []
-    def load_sample_file(*a): return None
-    MEANINGLESS_INT = -1
-    class VidexTableStats: pass
-    PCT_CACHED_MODE_PREFER_META = None
-    class VidexModelBase:
-        def __init__(self, *a, **kw): pass
-    class VidexStrategy: pass
-    def calc_mulcol_ndv_independent(*a): return 1
-    class IndexRangeCond: pass
-    class RangeCond: pass
+from sub_platforms.sql_opt.histogram.ndv_estimator import NDVEstimator, safe_tolist
+from sub_platforms.sql_opt.histogram.histogram_utils import load_sample_file
+from sub_platforms.sql_opt.videx.videx_histogram import MEANINGLESS_INT
+from sub_platforms.sql_opt.videx.videx_metadata import VidexTableStats, PCT_CACHED_MODE_PREFER_META
+from sub_platforms.sql_opt.videx.model.videx_strategy import VidexModelBase, VidexStrategy, calc_mulcol_ndv_independent
+from sub_platforms.sql_opt.videx.videx_utils import IndexRangeCond, RangeCond
 
 
 class VidexModelInnoDB(VidexModelBase):
@@ -339,3 +319,22 @@ class VidexModelInnoDB(VidexModelBase):
                 res[concat_key] = _help(ndv, self.table_stats.records)
 
         return res
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_calibration_bias(self) -> str:
+        """★ 改写: 校准偏差分析 — 预测 vs 实际的系统性偏移."""
+        from .. import _dbg
+        if not self._calibration_pairs:
+            return "(no calibration data)"
+        ratios = [pred / max(1e-12, actual)
+                  for pred, actual in self._calibration_pairs]
+        mean_ratio = sum(ratios) / len(ratios)
+        lines = ["┌── Videx Cost Model Calibration ──",
+                 f"│ n_pairs = {len(self._calibration_pairs)}",
+                 f"│ mean pred/actual = {mean_ratio:.3f} "
+                 f"({'over-predicting' if mean_ratio > 1.1 else 'under-predicting' if mean_ratio < 0.9 else 'well-calibrated'})"]
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

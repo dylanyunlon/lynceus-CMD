@@ -1,6 +1,5 @@
 """
-lynceus_port/distributed/ — 移植版
-# sync.py — Distributed cost-model synchronization.
+lynceus/distributed/sync.py — Distributed cost-model synchronization.
 
 Architecture references (ported/adapted from):
   - BytePS push_pull() (byteps/byteps/torch/ops.py:127)
@@ -31,11 +30,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum, auto
@@ -343,3 +337,40 @@ def compare_sync_strategies(data_bytes: int, n_workers: int = 4,
     print(f"\n  → Winner: {best[0]} at {best[1].total_time_us:,.1f}µs")
 
     return results
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+def estimate_gossip_convergence_rounds(n_workers: int,
+                                       target_error: float = 0.01) -> int:
+    """★ 改写: Gossip 协议收敛轮数估算.
+
+    基于 exponential mixing: error ≤ (1 - 2/n)^rounds
+    → rounds ≥ log(target_error) / log(1 - 2/n)
+    """
+    import math
+    if n_workers < 2:
+        return 0
+    mixing = 1.0 - 2.0 / n_workers
+    if mixing <= 0:
+        return 1
+    rounds = math.ceil(math.log(target_error) / math.log(mixing))
+    from . import _dbg
+    _dbg(f"gossip_convergence: n={n_workers} → {rounds} rounds "
+         f"for err<{target_error}")
+    return max(1, rounds)
+
+
+def dump_sync_comparison(data_bytes: int, n_workers: int = 4) -> str:
+    """断点辅助: 同步策略对比表."""
+    results = compare_sync_strategies(data_bytes, n_workers)
+    lines = ["┌── Sync Strategy Comparison ──",
+             f"│ data={data_bytes:,}B, workers={n_workers}"]
+    for name, metrics in sorted(results.items(), key=lambda x: x[1].total_us):
+        lines.append(f"│ {name:>12}: {metrics.total_us:>10.1f}µs "
+                     f"(lat={metrics.latency_us:.1f} "
+                     f"bw={metrics.bandwidth_us:.1f} "
+                     f"eff={metrics.efficiency:.2f})")
+    lines.append("└──────────────────────────────")
+    return "\n".join(lines)

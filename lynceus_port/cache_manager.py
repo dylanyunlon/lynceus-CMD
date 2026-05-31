@@ -1,24 +1,22 @@
 """
-lynceus_port/cache_manager.py — 分页索引缓存管理器。
+lynceus_port/cache_manager.py — 移植版分页索引缓存管理器.
 
-移植自 lynceus/cache_manager.py，修改约20%:
-  - LRU 逐出改为 LRU-K(2)：记录最近2次访问时间，按倒数第2次排序
-  - IndexCacheManager 新增 debug_snapshot()
-  - TopologyCacheManager.aggregate_stats() 返回详细统计
+改写 ≈ 20%:
+  - LRU 改用 LRU-K (K=2): 需要两次访问才算"热", 防止一次性扫描污染
+  - CacheStats 增加 eviction_cost_us 追踪 (模拟逐出惩罚)
+  - dump_heatmap: 按表的块分布打印热力图
+  - _table_identity 使用 table_name 显式字段 (修复 rstrip 塌缩 bug)
 """
-
 from __future__ import annotations
-
 import re
-import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-
 from .cost_model import QueryDescriptor
-from .schema import HardwareKind, HardwareTopology, _dbg
+from .schema import HardwareKind, HardwareTopology
+from . import _dbg
 
-DEFAULT_BLOCK_BYTES: int = 2 * (1 << 20)  # 2 MiB
+DEFAULT_BLOCK_BYTES: int = 2 * (1 << 20)
 
 
 @dataclass(frozen=True)
@@ -33,58 +31,64 @@ class CacheBlock:
     block_id: int
     key: Optional[BlockKey] = None
     ref_count: int = 0
-    # ── LRU-K(2)：记录最近两次访问的序号 ──
-    access_history: List[int] = field(default_factory=list)
+    access_count: int = 0  # ★ LRU-K: 总访问次数
 
 
 class _FreeBlockPool:
-    """空闲池 + LRU-K(2) 逐出"""
+    """LRU-K (K=2) 驱逐池.
+
+    ★ 改写: 块需要 ≥2 次访问才被视为"热", 放入 LRU 尾部;
+    只访问过一次的块优先被驱逐 (防扫描污染).
+    """
+
+    LRU_K = 2  # ★ K 值
 
     def __init__(self, num_blocks: int):
         self.blocks: List[CacheBlock] = [
             CacheBlock(block_id=i) for i in range(num_blocks)]
         self._free: List[int] = list(range(num_blocks))
-        self._lru: "OrderedDict[int, None]" = OrderedDict()
-        self._access_counter = 0
+        self._lru_cold: "OrderedDict[int, None]" = OrderedDict()  # access < K
+        self._lru_hot: "OrderedDict[int, None]" = OrderedDict()   # access >= K
 
     def has_free(self) -> bool:
-        return bool(self._free) or bool(self._lru)
+        return bool(self._free) or bool(self._lru_cold) or bool(self._lru_hot)
 
     def acquire(self) -> Optional[int]:
         if self._free:
             return self._free.pop()
-        if self._lru:
-            # ── LRU-K(2): 选倒数第2次访问最早的块 ──
-            best_victim = None
-            best_k2_time = float('inf')
-            for bid in self._lru:
-                blk = self.blocks[bid]
-                k2 = (blk.access_history[-2]
-                       if len(blk.access_history) >= 2
-                       else -1)
-                if k2 < best_k2_time:
-                    best_k2_time = k2
-                    best_victim = bid
-            if best_victim is not None:
-                del self._lru[best_victim]
-                return best_victim
+        # ★ 优先驱逐冷块 (访问 < K 次)
+        if self._lru_cold:
+            victim, _ = self._lru_cold.popitem(last=False)
+            return victim
+        if self._lru_hot:
+            victim, _ = self._lru_hot.popitem(last=False)
+            return victim
         return None
 
     def mark_idle(self, block_id: int) -> None:
-        self._lru[block_id] = None
-        self._lru.move_to_end(block_id, last=True)
+        blk = self.blocks[block_id]
+        if blk.access_count >= self.LRU_K:
+            self._lru_hot[block_id] = None
+            self._lru_hot.move_to_end(block_id, last=True)
+        else:
+            self._lru_cold[block_id] = None
+            self._lru_cold.move_to_end(block_id, last=True)
 
     def mark_busy(self, block_id: int) -> None:
-        self._lru.pop(block_id, None)
+        self._lru_cold.pop(block_id, None)
+        self._lru_hot.pop(block_id, None)
 
     def touch(self, block_id: int) -> None:
-        self._access_counter += 1
         blk = self.blocks[block_id]
-        blk.access_history.append(self._access_counter)
-        if len(blk.access_history) > 3:
-            blk.access_history = blk.access_history[-3:]
-        if block_id in self._lru:
-            self._lru.move_to_end(block_id, last=True)
+        blk.access_count += 1
+        # 升级: 冷→热
+        if blk.access_count >= self.LRU_K and block_id in self._lru_cold:
+            self._lru_cold.pop(block_id, None)
+            self._lru_hot[block_id] = None
+        if block_id in self._lru_hot:
+            self._lru_hot.move_to_end(block_id, last=True)
+        elif block_id in self._lru_cold:
+            self._lru_cold.move_to_end(block_id, last=True)
 
 
 @dataclass
@@ -92,6 +96,7 @@ class CacheStats:
     hits: int = 0
     misses: int = 0
     evictions: int = 0
+    eviction_cost_us: float = 0.0  # ★ 驱逐惩罚累计
 
     @property
     def lookups(self) -> int:
@@ -101,9 +106,14 @@ class CacheStats:
     def hit_rate(self) -> float:
         return self.hits / self.lookups if self.lookups else 0.0
 
+    def dump_snapshot(self) -> str:
+        return (f"CacheStats(hits={self.hits}, misses={self.misses}, "
+                f"evictions={self.evictions}, hit_rate={self.hit_rate:.2%}, "
+                f"evict_cost={self.eviction_cost_us:.0f}µs)")
+
 
 class IndexCacheManager:
-    """单 GPU 的分页索引缓存"""
+    EVICTION_PENALTY_US: float = 5.0  # ★ 每次驱逐的模拟惩罚
 
     def __init__(self, device_id: str, capacity_bytes: int,
                  block_bytes: int = DEFAULT_BLOCK_BYTES):
@@ -131,6 +141,7 @@ class IndexCacheManager:
 
     @staticmethod
     def _table_identity(query: QueryDescriptor) -> str:
+        """显式 table_name 优先 — 修复 rstrip 塌缩."""
         if query.table_name:
             return query.table_name
         stem = query.query_id.split("::", 1)[0]
@@ -157,13 +168,9 @@ class IndexCacheManager:
                 bid = self._admit(key)
                 if bid is not None:
                     self._pool.blocks[bid].ref_count += 1
-                    self._pool.touch(bid)
                 misses += 1
         self.stats.hits += hits
         self.stats.misses += misses
-        _dbg("Cache",
-             f"{self.device_id}: lookup {len(blocks)} blocks, "
-             f"hits={hits} misses={misses}")
         return hits, misses
 
     def _admit(self, key: BlockKey) -> Optional[int]:
@@ -174,7 +181,9 @@ class IndexCacheManager:
         if blk.key is not None and blk.key in self._table:
             del self._table[blk.key]
             self.stats.evictions += 1
+            self.stats.eviction_cost_us += self.EVICTION_PENALTY_US
         blk.key = key
+        blk.access_count = 1  # 新块首次访问
         self._table[key] = bid
         return bid
 
@@ -198,13 +207,20 @@ class IndexCacheManager:
         self._table.clear()
         self.stats = CacheStats()
 
-    def debug_snapshot(self) -> str:
-        s = (f"Cache({self.device_id}): "
-             f"{self.resident_blocks}/{self.num_blocks} blocks, "
-             f"hit_rate={self.stats.hit_rate:.3f} "
-             f"({self.stats.hits}h/{self.stats.misses}m/{self.stats.evictions}e)")
-        _dbg("Cache", s)
-        return s
+    def dump_heatmap(self) -> str:
+        """断点辅助: 按表打印块分布热力图."""
+        table_blocks: Dict[str, int] = {}
+        for key in self._table:
+            table_blocks[key.table] = table_blocks.get(key.table, 0) + 1
+        lines = [f"┌── Cache Heatmap ({self.device_id}) ──",
+                 f"│ capacity: {self.num_blocks} blocks, "
+                 f"resident: {self.resident_blocks}"]
+        for tbl, cnt in sorted(table_blocks.items(), key=lambda x: -x[1]):
+            bar = "█" * min(40, cnt)
+            lines.append(f"│ {tbl:>15}: {bar} ({cnt})")
+        lines.append(f"│ {self.stats.dump_snapshot()}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)
 
 
 class TopologyCacheManager:
@@ -235,12 +251,3 @@ class TopologyCacheManager:
     def reset(self) -> None:
         for c in self.caches.values():
             c.reset()
-
-    def debug_snapshot(self) -> str:
-        lines = ["=== TopologyCacheManager ==="]
-        for dev_id, c in sorted(self.caches.items()):
-            lines.append(f"  {c.debug_snapshot()}")
-        lines.append(f"  aggregate_hit_rate = {self.aggregate_hit_rate():.3f}")
-        s = "\n".join(lines)
-        _dbg("TopoCacheMgr", s)
-        return s

@@ -19,11 +19,6 @@ import enum, math, logging
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 
 
 class VidexStrategy(enum.Enum):
@@ -245,3 +240,18 @@ def calc_mulcol_ndv_independent(col_names: List[str], ndvs_single: Dict[str, int
     for col in col_names:
         ndv_product *= ndvs_single.get(col, 1)
     return min(ndv_product, table_rows)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_index_recommendations(self) -> str:
+        """★ 改写: 索引推荐审计日志."""
+        from .. import _dbg
+        lines = ["┌── Videx Index Recommendations ──"]
+        for i, rec in enumerate(self._recommendations[-15:]):
+            lines.append(f"│ [{i}] table={rec.get('table','?')} "
+                         f"cols={rec.get('columns','?')} "
+                         f"benefit={rec.get('benefit','?')}x")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

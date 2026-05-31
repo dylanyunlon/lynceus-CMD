@@ -1,6 +1,5 @@
 """
-lynceus_port/integrations/ — 移植版
-# tabular_bridge.py — Tabular index-build cost bridge.
+lynceus/integrations/tabular_bridge.py — Tabular index-build cost bridge.
 
 Ported from upstream/tabular (sfu-dis/tabular):
   - src/tabular/table_group.{h,cc}    → TableGroup lifecycle simulation
@@ -34,11 +33,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
@@ -591,3 +585,20 @@ def compare_index_types(table_name: str, n_rows: int, key_size: int = 8) -> Dict
     print(f"  Range scan:   BTree={bt.avg_scan_per_key_ns:.1f}ns/key  vs  Hash=N/A (not ordered)")
 
     return results
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_table_status(self) -> str:
+        """★ 改写: 所有表的当前状态快照."""
+        from .. import _dbg
+        lines = ["┌── Tabular Bridge Table Status ──"]
+        for tid, table in sorted(self._tables.items()):
+            epoch = table.get('epoch', 0)
+            n_rows = table.get('n_rows', 0)
+            lines.append(f"│ T{tid}: rows={n_rows:,} epoch={epoch} "
+                         f"shards={table.get('n_shards', '?')}")
+        lines.append(f"│ {len(self._tables)} tables registered")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

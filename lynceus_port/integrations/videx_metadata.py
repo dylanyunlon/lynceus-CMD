@@ -33,11 +33,6 @@ import time
 import copy
 import math
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -497,3 +492,29 @@ def to_lower_db_tb(d: Dict[str, Any]) -> Dict[str, Any]:
         )
         for k, v in d.items()
     }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def check_metadata_integrity(self) -> str:
+        """★ 改写: 元数据完整性验证."""
+        from .. import _dbg
+        issues = []
+        for col_name, meta in self._columns.items():
+            if meta.get('ndv', 0) <= 0:
+                issues.append(f"  {col_name}: ndv <= 0")
+            if meta.get('null_fraction', 0) > 1.0:
+                issues.append(f"  {col_name}: null_fraction > 1.0")
+            if meta.get('min_value') is not None and meta.get('max_value') is not None:
+                if meta['min_value'] > meta['max_value']:
+                    issues.append(f"  {col_name}: min > max")
+        lines = ["┌── Metadata Integrity ──"]
+        if issues:
+            lines.append(f"│ ⚠ {len(issues)} issues found:")
+            for iss in issues:
+                lines.append(f"│ {iss}")
+        else:
+            lines.append("│ ✓ All columns pass integrity checks")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

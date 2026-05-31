@@ -6,11 +6,6 @@ SPDX-License-Identifier: MIT
 import base64
 import json
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from collections import defaultdict
 from typing import List, Optional, Union, Dict, Any, Tuple
 from pydantic import BaseModel, PlainSerializer, BeforeValidator
@@ -19,45 +14,23 @@ import time
 import math
 import numpy as np
 
-try:
-    from sub_platforms.sql_opt.common.pydantic_utils import PydanticDataClassJsonMixin
-    from sub_platforms.sql_opt.databases.mysql.mysql_command import MySQLVersion
-    from sub_platforms.sql_opt.env.rds_env import Env
-    from sub_platforms.sql_opt.meta import Table, Column
-    from sub_platforms.sql_opt.videx import videx_logging
-    from sub_platforms.sql_opt.videx.videx_utils import BTreeKeySide, target_env_available_for_videx, parse_datetime, \
-        data_type_is_int, reformat_datetime_str
-    from sub_platforms.sql_opt.histogram.histogram_utils import (
-        block_level_sample,
-        sort_and_validate,
-        fit_c_from_cv_curve,
-        compute_required_rblk,
-        build_histogram_from_samples,
-        merge_sorted_samples,
-        estimate_null_ratio,
-        calculate_optimal_buckets,
-    )
-except (ImportError, ModuleNotFoundError):
-    # Upstream VIDEX/sub_platforms deps not available
-    class PydanticDataClassJsonMixin: pass
-    class MySQLVersion: pass
-    class Env: pass
-    class Table: pass
-    class Column: pass
-    videx_logging = None
-    BTreeKeySide = None
-    def target_env_available_for_videx(*a): return False
-    def parse_datetime(*a): return None
-    def data_type_is_int(*a): return False
-    def reformat_datetime_str(*a): return ""
-    def block_level_sample(*a): return []
-    def sort_and_validate(*a): return []
-    def fit_c_from_cv_curve(*a): return 0
-    def compute_required_rblk(*a): return 0
-    def build_histogram_from_samples(*a): return []
-    def merge_sorted_samples(*a): return []
-    def estimate_null_ratio(*a): return 0.0
-    def calculate_optimal_buckets(*a): return 100
+from sub_platforms.sql_opt.common.pydantic_utils import PydanticDataClassJsonMixin
+from sub_platforms.sql_opt.databases.mysql.mysql_command import MySQLVersion
+from sub_platforms.sql_opt.env.rds_env import Env
+from sub_platforms.sql_opt.meta import Table, Column
+from sub_platforms.sql_opt.videx import videx_logging
+from sub_platforms.sql_opt.videx.videx_utils import BTreeKeySide, target_env_available_for_videx, parse_datetime, \
+    data_type_is_int, reformat_datetime_str
+from sub_platforms.sql_opt.histogram.histogram_utils import (
+    block_level_sample,
+    sort_and_validate,
+    fit_c_from_cv_curve,
+    compute_required_rblk,
+    build_histogram_from_samples,
+    merge_sorted_samples,
+    estimate_null_ratio,
+    calculate_optimal_buckets,
+)
 
 MEANINGLESS_INT = -1357
 
@@ -381,7 +354,7 @@ class HistogramStats(BaseModel, PydanticDataClassJsonMixin):
                     # MySQL bucket is closed interval
                     if cur.min_value <= value <= cur.max_value:
                         bucket_found = True
-
+                
                 if bucket_found:
                     # a float number between [0, 1], it's the width of one value in the bucket,
                     # 1 means that all values in the bucket are same.
@@ -496,7 +469,7 @@ class HistogramStats(BaseModel, PydanticDataClassJsonMixin):
             number_of_buckets_specified=data['number-of-buckets-specified'],
             database_type=data.get('database-type')
         )
-
+    
     @staticmethod
     def init_from_mariadb_json(env: Env, dbname: str, table_name: str, col_name: str, hist_dict: dict):
         """
@@ -522,19 +495,19 @@ class HistogramStats(BaseModel, PydanticDataClassJsonMixin):
         }
         """
         buckets: List[HistogramBucket] = []
-
+    
         if 'histogram_hb' in hist_dict:
             histogram_hb = hist_dict['histogram_hb']
 
             cumulative_freq = 0.0
-
+        
             for i, bucket_raw in enumerate(histogram_hb):
                 start_value = bucket_raw.get('start', '')
                 size = bucket_raw.get('size', 0.0)
                 ndv = bucket_raw.get('ndv', 1)
-
+            
                 cumulative_freq += size
-
+            
                 if 'end' in bucket_raw:
                     # if end is specified, use the specified value
                     end_value = bucket_raw['end']
@@ -547,7 +520,7 @@ class HistogramStats(BaseModel, PydanticDataClassJsonMixin):
                 else:
                     # the last bucket, use start as end (equi-height bucket)
                     end_value = start_value
-
+            
                 bucket = HistogramBucket(
                     min_value=start_value,
                     max_value=end_value,
@@ -973,7 +946,7 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
         r1 = int(max(2000, beta * max(1, n_buckets) / max(1e-6, float(delta_req) ** 2)))
     else:
         r1 = int(r1_hint)
-
+    
     # 获取表大小信息，用于动态调整采样量
     table_rows = None
     try:
@@ -987,8 +960,8 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
         max_initial_sample = max(1000, int(table_rows * 0.1))  # 最多采样表大小的10%
         r1 = min(r1, max_initial_sample)
         print(f"Table has {table_rows} rows, limiting r1 to {r1}")
-
-
+    
+    
     initial_size = max(2 * r1, 1)
     samples_phase1 = block_level_sample(env, db_name, table_name, col_name, rows_target=initial_size)
     if not samples_phase1:
@@ -1000,7 +973,7 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
                                                     histogram_builder=histogram_builder)
     # If we cannot fit, fallback to using phase1 only
     c = fit_c_from_cv_curve(sample_sizes, sq_err_levels) if sample_sizes and sq_err_levels else 0.0
-
+    
     # 检查c值的合理性
     if c > 1e6:
         print(f"Warning: c value very large ({c}), this may indicate:")
@@ -1013,18 +986,18 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
             rblk = max(len(samples_phase1), max(int(2 * r1), int(table_rows * 0.10)))
         else:
             rblk = max(len(samples_phase1), int(2 * r1))
-
-
+    
+    
     rblk = compute_required_rblk(c, delta_req) if c > 0.0 else len(samples_phase1)
-
-
+    
+    
     if table_rows and table_rows > 0:
         hard_cap = max(int(2 * r1), int(table_rows * 0.10))
         if rblk > hard_cap:
             print(f"Limiting rblk from {rblk} to hard cap {hard_cap} (<=10% or 2*r1)")
             rblk = hard_cap
-
-
+    
+    
     rblk = max(len(samples_phase1), rblk)
 
     # Phase II: collect remaining samples and build final histogram
@@ -1037,36 +1010,36 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
         final_samples = sorted(samples_phase1)[: rblk]
 
     #buckets = build_histogram_from_samples(final_samples, k=n_buckets, histogram_builder=histogram_builder)
-
+    
     column_meta = env.get_column_meta(db_name, table_name, col_name)
     data_type = column_meta.data_type if column_meta else 'unknown'
-
+    
     # 智能调整桶数
     optimal_buckets = calculate_optimal_buckets(final_samples, data_type, ndv)
     actual_buckets = min(n_buckets, optimal_buckets)
-
+    
     print(f"Original buckets: {n_buckets}, Optimal buckets: {optimal_buckets}, Using: {actual_buckets}")
-
+    
     # 使用调整后的桶数构建直方图
     buckets = build_histogram_from_samples(final_samples, k=actual_buckets, 
                                          histogram_builder=histogram_builder,
                                          data_type=data_type, ndv=ndv)
-
-
+    
+    
     if not buckets:
         return force_generate_histogram_by_sdc_for_col(env, db_name, table_name, col_name, n_buckets)
 
     # Assemble HistogramStats JSON-like dict
     total = sum(cnt for _, _, cnt in buckets) or 1
     cum = 0.0
-
+    
     # Get table metadata to avoid full table scan for sampling rate
     try:
         table_meta = env.get_table_meta(db_name, table_name)
         total_rows = getattr(table_meta, 'rows', None) if table_meta else None
     except Exception:
         total_rows = None
-
+    
     # Calculate sampling rate using metadata or fallback
     if total_rows and total_rows > 0:
         # sampling_rate = min(1.0, float(rblk) / float(total_rows))
@@ -1075,7 +1048,7 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
         # Fallback: use sample count as approximation
         # sampling_rate = min(1.0, float(rblk) / float(len(final_samples) * 10))  # Rough estimate
         sampling_rate = min(1.0, float(len(final_samples)) / float(len(samples_phase1) * 10))
-
+    
     print(f"Sampling rate: {sampling_rate:.4f} ({len(final_samples)}/{total_rows})")
 
     res_dict = {
@@ -1087,12 +1060,12 @@ def force_generate_histogram_by_2phase_for_col(env: Env, db_name: str, table_nam
         "sampling-rate": sampling_rate,
         "number-of-buckets-specified": actual_buckets
     }
-
+    
     # Fill bucket information: [min_value, max_value, cumulative_frequency, row_count]
     for mn, mx, cnt in buckets:
         cum += cnt / total
         res_dict["buckets"].append([str(mn), str(mx), float(cum), max(1, int(cnt))])
-
+    
     return HistogramStats.init_from_mysql_json(res_dict)
 
 
@@ -1118,13 +1091,13 @@ def fetch_col_histogram(env: Env, dbname: str, table_name: str, col_name: str, n
     """
     if algo == 'compare':
         print(f"=== Comparing histogram algorithms for {dbname}.{table_name}.{col_name} ===")
-
+        
         # 运行原有算法（作为基准）
         start_time = time.time()
         hist_original = fetch_col_histogram(env, dbname, table_name, col_name, n_buckets, 
                                           force, hist_mem_size, ndv, None, delta_req, lmax, r1_hint, histogram_builder)
         time_original = time.time() - start_time
-
+        
         # 运行2phase算法
         start_time = time.time()
         hist_2phase = force_generate_histogram_by_2phase_for_col(env, dbname, table_name, col_name,
@@ -1132,20 +1105,20 @@ def fetch_col_histogram(env: Env, dbname: str, table_name: str, col_name: str, n
                                                                 lmax=lmax, r1_hint=r1_hint,
                                                                 histogram_builder=histogram_builder, ndv=ndv)
         time_2phase = time.time() - start_time
-
+        
         # 计算准确性指标
         accuracy_metrics = compare_histogram_accuracy(hist_original, hist_2phase, env, dbname, table_name, col_name)
-
+        
         # 输出对比结果
         print(f"=== Results for {dbname}.{table_name}.{col_name} ===")
         print(f"Original algorithm: {len(hist_original.buckets)} buckets, {time_original:.2f}s")
         print(f"2Phase algorithm: {len(hist_2phase.buckets)} buckets, {time_2phase:.2f}s")
         print(f"Speedup: {time_original/time_2phase:.2f}x")
         print(f"Accuracy metrics: {accuracy_metrics}")
-
+        
         return hist_2phase  # 返回2phase结果
-
-
+  
+    
     # Optional algorithm switch. Default (None) preserves existing behavior.
     if algo == 'block_2phase':
         print("----This is new Histogram Construction Block_2phase----")
@@ -1190,17 +1163,17 @@ def query_histogram_mariadb(env: Env, dbname: str, table_name: str, col_name: st
     res = env.query_for_dataframe(sql)
     if len(res) == 0:
         return None
-
+    
     assert len(res) == 1 and 'HISTOGRAM' in res.iloc[0].to_dict(), f"Invalid result from query_histogram: {res}"
-
+    
     # Check if HISTOGRAM is None
     histogram_value = res.iloc[0].to_dict()['HISTOGRAM']
     if histogram_value is None:
         logging.warning(f"HISTOGRAM is None, force generate histogram for {dbname=}, {table_name=}, {col_name=}")
         return force_generate_histogram_by_sdc_for_col(env, dbname, table_name, col_name, n_buckets)
-
+    
     hist_dict = json.loads(histogram_value)
-
+    
     return HistogramStats.init_from_mariadb_json(env, dbname, table_name, col_name, hist_dict)
 
 def update_histogram_mariadb(env: Env, dbname: str, table_name: str, n_buckets: int = 32) -> bool:
@@ -1257,7 +1230,7 @@ def generate_fetch_histogram_mariadb(env: Env, target_db: str, all_table_names: 
                                   f"Generating with {n_buckets} n_buckets")
         else:
             logging.debug(f"force generate histogram for {target_db}.{table_name}")
-
+            
         try:
             res_update = update_histogram_mariadb(env, target_db, table_name, n_buckets)
         except Exception as e:
@@ -1285,11 +1258,11 @@ def generate_fetch_histogram_mariadb(env: Env, target_db: str, all_table_names: 
                     number_of_buckets_specified=0,
                     database_type='mariadb'
                 )
-
+            
             if ret_json:
                 hist = hist.to_dict()
             res_tables[str(table_name).lower()][col.name] = hist
-
+    
     if drop_hist_after_fetch:
         try:
             drop_histogram_mariadb(env, target_db)
@@ -1376,41 +1349,41 @@ def compare_histogram_accuracy(hist_original: HistogramStats, hist_2phase: Histo
     比较两种直方图算法的准确性（不包含实际查询测试）
     """
     metrics = {}
-
+    
     # 1. 桶数量比较
     metrics['bucket_count_diff'] = abs(len(hist_2phase.buckets) - len(hist_original.buckets))
     metrics['bucket_count_ratio'] = len(hist_2phase.buckets) / max(len(hist_original.buckets), 1)
-
+    
     # 2. 采样率比较
     metrics['sampling_rate_original'] = getattr(hist_original, 'sampling_rate', 1.0)
     metrics['sampling_rate_2phase'] = getattr(hist_2phase, 'sampling_rate', 1.0)
-
+    
     # 3. 累积频率分布比较
     if hist_original.buckets and hist_2phase.buckets:
         # 计算KL散度
         kl_divergence = calculate_kl_divergence(hist_original, hist_2phase)
         metrics['kl_divergence'] = kl_divergence
-
+        
         # 计算Earth Mover's Distance
         emd = calculate_earth_movers_distance(hist_original, hist_2phase)
         metrics['earth_movers_distance'] = emd
-
+    
     # 4. 直方图统计信息对比
     if hist_original.buckets and hist_2phase.buckets:
         # 比较桶的分布范围
         orig_ranges = [(bucket.min_value, bucket.max_value) for bucket in hist_original.buckets]
         phase2_ranges = [(bucket.min_value, bucket.max_value) for bucket in hist_2phase.buckets]
-
+        
         metrics['range_coverage_original'] = f"{orig_ranges[0][0]} to {orig_ranges[-1][1]}"
         metrics['range_coverage_2phase'] = f"{phase2_ranges[0][0]} to {phase2_ranges[-1][1]}"
-
+        
         # 比较桶的密度分布
         orig_densities = [bucket.row_count for bucket in hist_original.buckets]
         phase2_densities = [bucket.row_count for bucket in hist_2phase.buckets]
-
+        
         metrics['density_variance_original'] = np.var(orig_densities) if orig_densities else 0
         metrics['density_variance_2phase'] = np.var(phase2_densities) if phase2_densities else 0
-
+    
     return metrics
 
 
@@ -1420,59 +1393,59 @@ def calculate_kl_divergence(hist1: HistogramStats, hist2: HistogramStats) -> flo
     """
     if not hist1.buckets or not hist2.buckets:
         return float('inf')
-
+    
     # 方法1：使用概率密度（推荐）
     def get_probability_density(buckets):
         """从累积频率计算概率密度"""
         if not buckets:
             return []
-
+        
         probs = []
         prev_cum_freq = 0.0
-
+        
         for bucket in buckets:
             # 当前桶的概率 = 当前累积频率 - 前一个累积频率
             current_prob = bucket.cum_freq - prev_cum_freq
             probs.append(max(0.0, current_prob))  # 确保非负
             prev_cum_freq = bucket.cum_freq
-
+        
         return probs
-
+    
     # 方法2：使用桶的row_count（更直接）
     def get_probability_from_counts(buckets):
         """直接从桶的计数计算概率"""
         if not buckets:
             return []
-
+        
         total_count = sum(bucket.row_count for bucket in buckets)
         if total_count <= 0:
             return []
-
+        
         return [bucket.row_count / total_count for bucket in buckets]
-
+    
     # 使用方法2（更简单直接）
     probs1 = get_probability_from_counts(hist1.buckets)
     probs2 = get_probability_from_counts(hist2.buckets)
-
+    
     if not probs1 or not probs2:
         return float('inf')
-
+    
     # 确保长度一致
     max_len = max(len(probs1), len(probs2))
     probs1.extend([0.0] * (max_len - len(probs1)))
     probs2.extend([0.0] * (max_len - len(probs2)))
-
+    
     # 计算KL散度
     kl_div = 0.0
     for i in range(max_len):
         p1 = probs1[i]
         p2 = probs2[i]
-
+        
         if p1 > 0 and p2 > 0:
             kl_div += p1 * math.log(p1 / p2)
         elif p1 > 0 and p2 == 0:
             return float('inf')
-
+    
     return max(0.0, kl_div)
 
 # def calculate_kl_divergence(hist1: HistogramStats, hist2: HistogramStats) -> float:
@@ -1481,26 +1454,26 @@ def calculate_kl_divergence(hist1: HistogramStats, hist2: HistogramStats) -> flo
 #     """
 #     if not hist1.buckets or not hist2.buckets:
 #         return float('inf')
-
+    
 #     # 获取两个直方图的累积频率
 #     cum_freq1 = [bucket.cum_freq for bucket in hist1.buckets]
 #     cum_freq2 = [bucket.cum_freq for bucket in hist2.buckets]
-
+    
 #     # 确保长度一致
 #     max_len = max(len(cum_freq1), len(cum_freq2))
 #     cum_freq1.extend([1.0] * (max_len - len(cum_freq1)))
 #     cum_freq2.extend([1.0] * (max_len - len(cum_freq2)))
-
+    
 #     # 计算KL散度
 #     kl_div = 0.0
 #     for i in range(max_len):
 #         p1 = cum_freq1[i] if i < len(cum_freq1) else 1.0
 #         p2 = cum_freq2[i] if i < len(cum_freq2) else 1.0
-
+        
 #         # 避免log(0)
 #         if p1 > 0 and p2 > 0:
 #             kl_div += p1 * math.log(p1 / p2)
-
+    
 #     return kl_div
 
 def calculate_earth_movers_distance(hist1: HistogramStats, hist2: HistogramStats) -> float:
@@ -1509,23 +1482,58 @@ def calculate_earth_movers_distance(hist1: HistogramStats, hist2: HistogramStats
     """
     if not hist1.buckets or not hist2.buckets:
         return float('inf')
-
+    
     # 简化实现：计算累积频率的L1距离
     cum_freq1 = [bucket.cum_freq for bucket in hist1.buckets]
     cum_freq2 = [bucket.cum_freq for bucket in hist2.buckets]
-
+    
     # 确保长度一致
     max_len = max(len(cum_freq1), len(cum_freq2))
     cum_freq1.extend([1.0] * (max_len - len(cum_freq1)))
     cum_freq2.extend([1.0] * (max_len - len(cum_freq2)))
-
+    
     # 计算L1距离
     emd = sum(abs(p1 - p2) for p1, p2 in zip(cum_freq1, cum_freq2))
-
+    
     return emd
 
 
 
 if __name__ == '__main__':
-    pass  # Upstream test code requires sub_platforms; removed in transplant
+    videx_logging.initial_config()
+    # some database with tpch
+    from sub_platforms.sql_opt.env.rds_env import Env, OpenMySQLEnv
+    from sub_platforms.sql_opt.benchmark.bench_utils import TPCH_UT_INS_80
+    my_env = OpenMySQLEnv.from_db_instance(TPCH_UT_INS_80)
 
+    # varchar(44)
+    hist = force_generate_histogram_by_sdc_for_col(my_env, 'tpch_rong', 'lineitem', col_name='L_COMMENT', n_buckets=16, ndv=4580554)
+    print(hist.buckets)
+    # int
+    hist = force_generate_histogram_by_sdc_for_col(my_env, 'tpch_rong', 'lineitem', col_name='L_LINENUMBER', n_buckets=16, )
+    print(hist)
+    # date
+    hist = force_generate_histogram_by_sdc_for_col(my_env, 'tpch_rong', 'lineitem', col_name='L_SHIPDATE', n_buckets=16, )
+    print(hist)
+    # decimal
+    hist = force_generate_histogram_by_sdc_for_col(my_env, 'tpch_rong', 'lineitem', col_name='L_DISCOUNT', n_buckets=16, )
+    print(hist)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+    def dump_histogram_summary(self) -> str:
+        """★ 改写: 直方图桶统计摘要."""
+        from .. import _dbg
+        n_buckets = len(self._buckets)
+        total_count = sum(b.get('count', 0) for b in self._buckets)
+        lines = ["┌── Histogram Summary ──",
+                 f"│ n_buckets  = {n_buckets}",
+                 f"│ total_count= {total_count:,}"]
+        if self._buckets:
+            widths = [b.get('upper', 0) - b.get('lower', 0) for b in self._buckets]
+            lines.append(f"│ min_width  = {min(widths):.4f}")
+            lines.append(f"│ max_width  = {max(widths):.4f}")
+        lines.append("└──────────────────────────────")
+        return "\n".join(lines)

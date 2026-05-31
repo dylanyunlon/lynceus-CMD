@@ -32,11 +32,6 @@ from __future__ import annotations
 import json
 import math
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -486,3 +481,25 @@ def get_column_data_type(column_type: str) -> str:
     if any(t in ct for t in ("date", "time", "timestamp")):
         return "date"
     return "varchar"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PERF_LOG: "Dict[str, List[float]]" = {}
+
+def track_perf(func_name: str, elapsed_us: float) -> None:
+    """★ 改写: 工具函数性能追踪."""
+    if func_name not in _PERF_LOG:
+        _PERF_LOG[func_name] = []
+    _PERF_LOG[func_name].append(elapsed_us)
+
+def dump_perf_summary() -> str:
+    """★ 改写: 性能追踪摘要."""
+    lines = ["┌── Videx Utils Perf Summary ──"]
+    for name, times in sorted(_PERF_LOG.items()):
+        avg = sum(times) / len(times)
+        lines.append(f"│ {name:>20}: n={len(times):>5} avg={avg:.1f}µs "
+                     f"max={max(times):.1f}µs")
+    lines.append("└──────────────────────────────")
+    return "\n".join(lines)

@@ -35,11 +35,6 @@ from __future__ import annotations
 import math
 import time
 import logging
-import sys
-
-def _dbg(tag, msg):
-    print(f"[DBG][{tag}] {msg}", file=sys.stderr)
-
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Union
 
@@ -491,3 +486,19 @@ def debug_print_histogram(
               f"{b.count:>7} ({pct:5.1f}%) {bar}")
 
     print(f"  └────────────────────────────────────────────────────")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ 移植改写区
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_merge_quality(before_buckets: int, after_buckets: int,
+                        info_loss: float) -> str:
+    """★ 改写: 桶合并质量检查."""
+    from .. import _dbg
+    ratio = after_buckets / max(1, before_buckets)
+    verdict = ("good" if info_loss < 0.05 else
+               "acceptable" if info_loss < 0.15 else "poor")
+    result = (f"Merge: {before_buckets}→{after_buckets} buckets "
+              f"(ratio={ratio:.2f}, info_loss={info_loss:.3f}, {verdict})")
+    _dbg(result)
+    return result
