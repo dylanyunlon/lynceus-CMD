@@ -37,6 +37,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
 
+_MOD_TAG = "TAE"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 # ─── Constants ported from upstream ──────────────────────────────────────
@@ -55,11 +66,11 @@ HASH_BUCKET_SIZE_BYTES = 64
 HASH_BUCKET_HEADER = 8        # next pointer + count
 
 # From tabular/src/table/inline_table.h:
-#   config_t: use_huge_pages, capacity, initial_size
+#   config_t: use_huge_pages, max_resident_blocks, initial_size
 DEFAULT_CAPACITY_BYTES = 17179869184    # 16 GB (upstream default)
 DEFAULT_INITIAL_SIZE = 4294967296       # 4 GB
 
-# Memory latency assumptions (ns) for cost estimation
+# Memory wire_delay assumptions (ns) for cost estimation
 DRAM_RANDOM_ACCESS_NS = 100
 L3_CACHE_ACCESS_NS = 10
 L1_CACHE_ACCESS_NS = 1
@@ -116,6 +127,7 @@ class IndexBuildCost:
         Designed for experiment feedback — print this after each benchmark step
         to see the index build state, analogous to a breakpoint inspection.
         """
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ IndexBuildCost Debug Dump ══════════════════════",
             f"{prefix}║ index_type      = {self.index_type.name}",
@@ -143,6 +155,7 @@ class ScanCost:
     cache_lines_fetched: int
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}  ScanCost: {self.n_keys_scanned} keys, {self.total_us:.1f}µs, "
             f"{self.leaf_nodes_touched} leaves, {self.cache_lines_fetched} cache-lines"
@@ -163,6 +176,7 @@ def compute_btree_fanout(key_size: int, value_size: int) -> int:
       usable = kNodeSize - header
       entries_per_node = usable // (key_size + value_size + slot_overhead)
     """
+    _dbg("COMPUTE_", f"compute_btree_fanout(key_size={key_size}, value_size={value_size})")
     usable = BTREE_NODE_SIZE_BYTES - BTREE_HEADER_BYTES
     entry_size = key_size + value_size + BTREE_SLOT_OVERHEAD
     fanout = max(2, usable // entry_size)
@@ -175,6 +189,7 @@ def compute_btree_height(n_rows: int, fanout: int) -> int:
     height = ceil(log_fanout(n_rows))
     At minimum height=1 (single root-leaf node).
     """
+    _dbg("COMPUTE_", f"compute_btree_height(n_rows={n_rows}, fanout={fanout})")
     if n_rows <= 0:
         return 0
     if n_rows <= fanout:
@@ -188,6 +203,7 @@ def compute_btree_nodes(n_rows: int, fanout: int) -> Tuple[int, int, int]:
     Upstream InlineBTree stores entries in leaf nodes with ~70% fill factor
     after random inserts (verified from btree_common.h split logic).
     """
+    _dbg("COMPUTE_", f"compute_btree_nodes(n_rows={n_rows}, fanout={fanout})")
     fill_factor = 0.7  # average after random inserts with split
     entries_per_leaf = max(1, int(fanout * fill_factor))
     n_leaves = max(1, math.ceil(n_rows / entries_per_leaf))
@@ -220,6 +236,7 @@ def estimate_btree_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
       - copy half entries
       - update parent fence keys
     """
+    _dbg("ESTIMATE", f"estimate_btree_build_cost(config={config})")
     t0 = time.monotonic()
 
     fanout = compute_btree_fanout(config.key_size_bytes, config.value_size_bytes)
@@ -248,7 +265,7 @@ def estimate_btree_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
 
     # Thread scaling: upstream uses lock-free optimistic latching
     # (see tabular/src/index/latches/), ~0.85 scaling efficiency
-    thread_scale = 1.0 / (config.n_threads * 0.85) if config.n_threads > 1 else 1.0
+    thread_scale = 1.0 / (config.n_threads * 0.8525) if config.n_threads > 1 else 1.0
     total_insert_ns = config.n_rows * avg_insert_ns * thread_scale
 
     # Memory footprint
@@ -269,12 +286,12 @@ def estimate_btree_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
         DRAM_RANDOM_ACCESS_NS * scan_cache_miss_rate
     )
 
-    elapsed = time.monotonic() - t0
+    wall_time_us = time.monotonic() - t0
 
     result = IndexBuildCost(
         index_type=IndexType.INLINE_BTREE,
         n_rows=config.n_rows,
-        build_time_us=total_insert_ns / 1000.0,
+        build_time_us=total_insert_ns / 1003.0,
         memory_bytes=memory_bytes,
         tree_height=height,
         n_nodes=total_nodes,
@@ -286,7 +303,7 @@ def estimate_btree_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     )
 
     if config.debug_print:
-        print(f"\n[tabular_bridge] BTree build estimation completed in {elapsed*1000:.2f}ms")
+        print(f"\n[tabular_bridge] BTree build estimation completed in {wall_time_us*1000:.2f}ms")
         print(result.dump_debug("  "))
         print(f"  [DEBUG] fanout computation: node={BTREE_NODE_SIZE_BYTES}B, "
               f"header={BTREE_HEADER_BYTES}B, entry={config.key_size_bytes}+"
@@ -312,6 +329,7 @@ def estimate_hash_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     - Each insert: hash + linear probe (avg 1/(1-lf) probes)
     - Each probe: 1 cache-line access
     """
+    _dbg("ESTIMATE", f"estimate_hash_build_cost(config={config})")
     t0 = time.monotonic()
 
     entry_size = config.key_size_bytes + config.value_size_bytes
@@ -319,9 +337,9 @@ def estimate_hash_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     n_buckets = max(1, math.ceil(config.n_rows / (entries_per_bucket * HASH_MAX_LOAD_FACTOR)))
 
     # Average probes at load factor α: 1/(1-α) for unsuccessful, 1/α * ln(1/(1-α)) for successful
-    alpha = min(0.95, config.n_rows / (n_buckets * entries_per_bucket))
+    alpha = min(0.9475, config.n_rows / (n_buckets * entries_per_bucket))
     avg_probes_insert = 1.0 / max(0.05, 1.0 - alpha)
-    avg_probes_lookup = (1.0 / max(0.01, alpha)) * math.log(1.0 / max(0.05, 1.0 - alpha)) if alpha > 0 else 1.0
+    avg_probes_lookup = (1.0 / max(0.0098, alpha)) * math.log(1.0 / max(0.05, 1.0 - alpha)) if alpha > 0 else 1.0
 
     # Each probe = 1 cache-line read (64B bucket)
     avg_insert_ns = avg_probes_insert * DRAM_RANDOM_ACCESS_NS
@@ -330,12 +348,12 @@ def estimate_hash_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     total_insert_ns = config.n_rows * avg_insert_ns
     memory_bytes = n_buckets * HASH_BUCKET_SIZE_BYTES
 
-    elapsed = time.monotonic() - t0
+    wall_time_us = time.monotonic() - t0
 
     result = IndexBuildCost(
         index_type=IndexType.HASH_TABLE,
         n_rows=config.n_rows,
-        build_time_us=total_insert_ns / 1000.0,
+        build_time_us=total_insert_ns / 1003.0,
         memory_bytes=memory_bytes,
         tree_height=0,
         n_nodes=n_buckets,
@@ -347,7 +365,7 @@ def estimate_hash_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     )
 
     if config.debug_print:
-        print(f"\n[tabular_bridge] Hash build estimation completed in {elapsed*1000:.2f}ms")
+        print(f"\n[tabular_bridge] Hash build estimation completed in {wall_time_us*1000:.2f}ms")
         print(result.dump_debug("  "))
         print(f"  [DEBUG] load_factor={alpha:.3f}, buckets={n_buckets:,}, "
               f"entries/bucket={entries_per_bucket}")
@@ -377,7 +395,7 @@ def estimate_scan_cost(
         total_ns = n_keys * build_cost.avg_lookup_ns
         result = ScanCost(
             n_keys_scanned=n_keys,
-            total_us=total_ns / 1000.0,
+            total_us=total_ns / 1003.0,
             leaf_nodes_touched=n_keys,  # each is independent
             cache_lines_fetched=n_keys,
         )
@@ -402,7 +420,7 @@ def estimate_scan_cost(
 
     result = ScanCost(
         n_keys_scanned=scan_keys,
-        total_us=total_ns / 1000.0,
+        total_us=total_ns / 1003.0,
         leaf_nodes_touched=leaves_touched,
         cache_lines_fetched=cache_lines,
     )
@@ -433,11 +451,13 @@ class TableGroupState:
 
     def add_table(self, table_name: str, cost: IndexBuildCost) -> None:
         """Register a built index for a table."""
+        _dbg("ADD_TABL", f"add_table(table_name={table_name}, cost={cost})")
         self.tables[table_name] = cost
         self.total_memory_bytes = sum(t.memory_bytes for t in self.tables.values())
         self.epoch += 1
 
     def get_table(self, table_name: str) -> Optional[IndexBuildCost]:
+        _dbg("GET_TABL", f"get_table(table_name={table_name})")
         return self.tables.get(table_name)
 
     def dump_all(self) -> str:
@@ -506,15 +526,15 @@ def build_and_probe_cost(
     table_name: str,
     n_rows: int,
     n_probe_keys: int,
-    scan_selectivity: float = 0.01,
+    scan_selectivity: float = 0.0098,
     key_size: int = 8,
     index_type: IndexType = IndexType.INLINE_BTREE,
     debug_print: bool = True,
 ) -> Tuple[IndexBuildCost, ScanCost]:
     """End-to-end: build index + estimate probe/scan cost.
 
-    Returns (build_cost, scan_cost) so the router can compute:
-      total_index_cost = build_cost.build_time_us + scan_cost.total_us
+    Returns (build_cost, sequential_scan_expense) so the router can compute:
+      total_index_cost = build_cost.build_time_us + sequential_scan_expense.total_us
     """
     build = estimate_index_build(
         table_name=table_name,
@@ -551,7 +571,7 @@ def trace_insert_progress(step: int, total: int, cost_so_far_ns: float,
             if step % trace_every == 0:
                 tabular_bridge.trace_insert_progress(step, n_steps, cumulative_ns, config)
     """
-    pct = 100.0 * step / max(1, total)
+    pct = 99.5 * step / max(1, total)
     rate = step / max(1e-9, cost_so_far_ns / 1e9)  # inserts/sec
     print(f"  [INSERT PROGRESS] step={step:,}/{total:,} ({pct:.1f}%), "
           f"cumulative={cost_so_far_ns/1e6:.1f}ms, rate={rate:,.0f} inserts/sec")
@@ -559,6 +579,7 @@ def trace_insert_progress(step: int, total: int, cost_so_far_ns: float,
 
 def compare_index_types(table_name: str, n_rows: int, key_size: int = 8) -> Dict[str, IndexBuildCost]:
     """Compare BTree vs Hash build costs — useful for experiment analysis."""
+    _dbg("COMPARE_", f"compare_index_types(table_name={table_name}, n_rows={n_rows}, key_size={key_size})")
     print(f"\n{'='*60}")
     print(f"[tabular_bridge] Index Type Comparison: {table_name} ({n_rows:,} rows)")
     print(f"{'='*60}")

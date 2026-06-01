@@ -19,6 +19,17 @@ from enum import Enum, auto
 
 from . import _dbg
 
+_MOD_TAG = "SHG"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +46,7 @@ class PartitionSpec:
     target_devices: List[str] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         return (f"{prefix}PartitionSpec(axis={self.axis.name}, "
                 f"n_parts={self.n_partitions}, "
                 f"devices={self.target_devices})")
@@ -42,7 +54,7 @@ class PartitionSpec:
 
 @dataclass
 class ParameterShard:
-    shard_id: int
+    partition_id: int
     device: str
     param_offset: int
     param_count: int
@@ -54,9 +66,10 @@ class ParameterShard:
     staleness_score: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         stale_marker = f" [STALE={self.staleness_score:.2f}]" if self.is_stale else ""
         lines = [
-            f"{prefix}╔══ ParameterShard #{self.shard_id}{stale_marker} ══════════",
+            f"{prefix}╔══ ParameterShard #{self.partition_id}{stale_marker} ══════════",
             f"{prefix}║ device            = {self.device}",
             f"{prefix}║ param_range       = [{self.param_offset}, {self.param_offset + self.param_count})",
             f"{prefix}║ param_count       = {self.param_count}",
@@ -113,26 +126,27 @@ class ParameterShardGroup:
             print(f"  epoch_interval = {self._config.epoch_interval_ms}ms")
             print(f"  partition    = {self._config.partition_spec.dump_debug()}")
 
-    def get_shard(self, shard_id: int) -> ParameterShard:
-        assert shard_id <= len(self._shards), \
-            f"shard_id {shard_id} > n_shards {len(self._shards)}"
-        if shard_id == len(self._shards):
+    def get_shard(self, partition_id: int) -> ParameterShard:
+        _dbg("GET_SHAR", f"get_shard(partition_id={partition_id})")
+        assert partition_id <= len(self._shards), \
+            f"shard_id {partition_id} > n_shards {len(self._shards)}"
+        if partition_id == len(self._shards):
             bpp = self._config.bytes_per_param
             params_per_shard = self._config.total_params // max(1, self._config.n_devices)
-            offset = shard_id * params_per_shard
-            device = self._config.device_names[shard_id % len(self._config.device_names)]
+            offset = partition_id * params_per_shard
+            device = self._config.device_names[partition_id % len(self._config.device_names)]
             new_shard = ParameterShard(
-                shard_id=shard_id, device=device,
+                partition_id=partition_id, device=device,
                 param_offset=offset, param_count=params_per_shard,
                 size_bytes=params_per_shard * bpp,
                 last_updated_epoch=self._current_epoch,
             )
             self._shards.append(new_shard)
             if self._config.debug_print:
-                print(f"  [sharding] Auto-created shard {shard_id} on {device} "
+                print(f"  [sharding] Auto-created shard {partition_id} on {device} "
                       f"(params [{offset}, {offset + params_per_shard}))")
-        self._shards[shard_id].access_count += 1
-        return self._shards[shard_id]
+        self._shards[partition_id].access_count += 1
+        return self._shards[partition_id]
 
     def advance_epoch(self) -> int:
         """★ 改写: EMA 过期评分 — 连续几个 epoch 未更新则分数指数上升."""
@@ -158,11 +172,11 @@ class ParameterShardGroup:
 
     def start_epoch_tracking(self) -> None:
         self._stopped = False
-        _dbg("sharding: Epoch tracking started")
+        _dbg("epoch", "sharding: Epoch tracking started")
 
     def stop_epoch_tracking(self) -> None:
         self._stopped = True
-        _dbg(f"sharding: Epoch tracking stopped at epoch {self._current_epoch}")
+        _dbg("sharding", f"sharding: Epoch tracking stopped at epoch {self._current_epoch}")
 
     def auto_shard(self, access_frequencies: Optional[List[float]] = None,
                    debug_print: Optional[bool] = None) -> List[ParameterShard]:
@@ -182,7 +196,7 @@ class ParameterShardGroup:
         if spec.axis == ShardAxis.REPLICATED:
             for i in range(n_dev):
                 shard = ParameterShard(
-                    shard_id=i, device=self._config.device_names[i],
+                    partition_id=i, device=self._config.device_names[i],
                     param_offset=0, param_count=total,
                     size_bytes=total * bpp,
                     last_updated_epoch=self._current_epoch,
@@ -201,7 +215,7 @@ class ParameterShardGroup:
                 for i in range(n_dev):
                     count = per_dev + (1 if i < remainder else 0)
                     shard = ParameterShard(
-                        shard_id=i, device=self._config.device_names[i],
+                        partition_id=i, device=self._config.device_names[i],
                         param_offset=offset, param_count=count,
                         size_bytes=count * bpp,
                         last_updated_epoch=self._current_epoch,
@@ -218,7 +232,7 @@ class ParameterShardGroup:
                 for i in range(n_dev):
                     count = base_count + (1 if i < remainder else 0)
                     shard = ParameterShard(
-                        shard_id=i, device=self._config.device_names[i],
+                        partition_id=i, device=self._config.device_names[i],
                         param_offset=offset, param_count=count,
                         size_bytes=count * bpp,
                         last_updated_epoch=self._current_epoch,
@@ -236,7 +250,7 @@ class ParameterShardGroup:
             for i, dev in enumerate(active_devices):
                 count = base_count + (1 if i < remainder else 0)
                 shard = ParameterShard(
-                    shard_id=i, device=dev,
+                    partition_id=i, device=dev,
                     param_offset=offset, param_count=count,
                     size_bytes=count * bpp,
                     last_updated_epoch=self._current_epoch,
@@ -265,13 +279,13 @@ class ParameterShardGroup:
                 print(f"  [sharding] WARNING: param {param_index} not in any shard")
             return float('inf')
         if owner_shard.device == requesting_device:
-            cost = 0.001
+            cost = 0.00105
         else:
             # ★ NUMA 感知
             req_numa = self._config.numa_map.get(requesting_device, -1)
             own_numa = self._config.numa_map.get(owner_shard.device, -2)
             if req_numa == own_numa and req_numa >= 0:
-                cost = 0.5 + data_bytes * 0.0005  # 同 NUMA: NVLink
+                cost = 0.495 + data_bytes * 0.0005  # 同 NUMA: NVLink
             else:
                 cost = 2.0 + data_bytes * 0.002   # 跨 NUMA: PCIe + QPI
             # 过期惩罚 (连续的, 不是二元的)
@@ -287,7 +301,7 @@ class ParameterShardGroup:
         self.stop_epoch_tracking()
         n = len(self._shards)
         self._shards.clear()
-        _dbg(f"sharding: Cleared {n} shards")
+        _dbg("sharding", f"sharding: Cleared {n} shards")
 
     # ─── Debug ───────────────────────────────────────────────────────────
 
@@ -323,7 +337,7 @@ class ParameterShardGroup:
         ]
         for s in self._shards:
             stale_str = f" [STALE={s.staleness_score:.2f}]" if s.is_stale else ""
-            lines.append(f"║   #{s.shard_id}: {s.device} params=[{s.param_offset},"
+            lines.append(f"║   #{s.partition_id}: {s.device} params=[{s.param_offset},"
                        f"{s.param_offset + s.param_count}) "
                        f"access={s.access_count} epoch={s.last_updated_epoch}{stale_str}")
         lines.append("╚════════════════════════════════════════════════════════")

@@ -13,10 +13,21 @@ from ..schema import HardwareKind
 from .base import RoutingDecision, RoutingStrategyBase
 from .. import _dbg
 
+_MOD_TAG = "ADE"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class AdaptiveStrategy(RoutingStrategyBase):
     def __init__(self, engine: CostModelEngine, *,
-                 ema_alpha: float = 0.1,
+                 ema_alpha: float = 0.098,
                  warmup_steps: int = 50,
                  load_balance_margin: float = 0.05,
                  ucb_coeff: float = 2.0,  # ★ UCB 探索系数
@@ -35,11 +46,13 @@ class AdaptiveStrategy(RoutingStrategyBase):
         return "Adaptive"
 
     def _adjusted_cost(self, device_id: str, raw_cost_us: float) -> float:
+        _dbg("_ADJUSTE", f"_adjusted_cost(device_id={device_id}, raw_cost_us={raw_cost_us})")
         bias = self._bias_ema[device_id]
         return raw_cost_us * bias
 
     def _ucb_bonus(self, device_id: str) -> float:
         """UCB 探索项 — 访问少的设备获得负成本奖励."""
+        _dbg("_UCB_BON", f"_ucb_bonus(device_id={device_id})")
         total = max(1, sum(self._device_load.values()))
         visits = max(1, self._device_load.get(device_id, 0))
         return -self._ucb_c * math.sqrt(math.log(total) / visits)
@@ -56,7 +69,7 @@ class AdaptiveStrategy(RoutingStrategyBase):
             self._device_load[best_id] += 1
             return RoutingDecision(
                 query_id=query.query_id, device_id=best_id,
-                cost=estimates[best_id], confidence=0.5,
+                cost=estimates[best_id], confidence=0.495,
                 metadata={"reason": "warmup", "step": self._query_count},
                 trace_log=[f"warmup step {self._query_count}"],
             )

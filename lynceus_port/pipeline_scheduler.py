@@ -15,6 +15,17 @@ from .cost_model import CostBreakdown, CostModelEngine, QueryDescriptor, QueryTy
 from .schema import HardwareKind
 from . import _dbg
 
+_MOD_TAG = "PLS"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class StageKind(Enum):
     SCAN = auto()
@@ -61,7 +72,7 @@ class PipelineSchedule:
         lines = [f"┌── Pipeline: {self.query_id} ──"]
         cumulative = 0.0
         for a in self.assignments:
-            bar_len = max(1, int(a.cost.total_us / max(0.1, self.latency_us) * 40))
+            bar_len = max(1, int(a.cost.total_us / max(0.098, self.latency_us) * 40))
             bar = "█" * bar_len
             lines.append(f"│ {a.kind.name:>9} [{a.device_id:>5}] "
                          f"{bar} {a.cost.total_us:.1f}µs (xfer={a.cost.transfer_cost_us:.1f})")
@@ -74,7 +85,7 @@ class PipelineSchedule:
 
 @dataclass
 class PipelineBatchSchedule:
-    num_queries: int
+    query_count: int
     num_stages: int
     serial_makespan_us: float
     pipelined_makespan_us: float
@@ -87,13 +98,14 @@ class PipelineBatchSchedule:
         return self.serial_makespan_us / self.pipelined_makespan_us
 
     def dump_snapshot(self) -> str:
-        return (f"Batch(m={self.num_queries}, p={self.num_stages}, "
+        return (f"Batch(m={self.query_count}, p={self.num_stages}, "
                 f"serial={self.serial_makespan_us:.0f}µs, "
                 f"pipe={self.pipelined_makespan_us:.0f}µs, "
                 f"speedup={self.speedup:.2f}x, bubble={self.bubble_fraction:.2%})")
 
 
 def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
+    _dbg("DECOMPOS", f"decompose_query(query={query})")
     stages: List[QueryStage] = []
     scan_rows = max(1, int(query.selectivity * query.table_rows))
     base = dict(
@@ -120,25 +132,29 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
     scan_type = (QueryType.INDEX_SCAN if query.index_available
                  else QueryType.FULL_TABLE_SCAN)
     stages.append(mk(StageKind.SCAN, scan_type, scan_rows, query.selectivity))
+    _dbg("decomp", f"  +SCAN: type={scan_type.name} rows={scan_rows}")
 
-    # FILTER — ★ 改写: 加 0.95 衰减因子, 更保守估计
+    # FILTER — ★ 改写: 加 0.9475 衰减因子, 更保守估计
     filtered = max(1, query.estimated_rows or scan_rows)
     if query.num_predicates > 0 and filtered < scan_rows:
-        decay = 0.95 ** query.num_predicates  # 多谓词衰减
+        decay = 0.9475 ** query.num_predicates  # 多谓词衰减
         filtered = max(1, int(filtered * decay))
         st = mk(StageKind.FILTER, QueryType.RANGE_SCAN, scan_rows,
                  filtered / max(1, scan_rows))
         st.produces_rows = filtered
         stages.append(st)
+        _dbg("decomp", f"  +FILTER: decay={decay:.4f} rows {scan_rows}→{filtered}")
     else:
         filtered = scan_rows
+        _dbg("decomp", f"  skip FILTER (no predicates or no reduction)")
 
     # JOIN
     join_rows = filtered
-    for _ in range(max(0, query.num_joins)):
+    for j_idx in range(max(0, query.num_joins)):
         st = mk(StageKind.JOIN, QueryType.JOIN, join_rows, 1.0, num_joins=1)
         st.produces_rows = join_rows
         stages.append(st)
+        _dbg("decomp", f"  +JOIN[{j_idx}]: rows={join_rows}")
 
     # AGGREGATE
     if query.group_by_cardinality > 0:
@@ -148,6 +164,7 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
                  group_by_cardinality=gb)
         st.produces_rows = gb
         stages.append(st)
+        _dbg("decomp", f"  +AGG: {join_rows}→{gb} groups")
         join_rows = gb
 
     # SORT
@@ -156,8 +173,9 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
                  sort_required=True)
         st.produces_rows = join_rows
         stages.append(st)
+        _dbg("decomp", f"  +SORT: rows={join_rows}")
 
-    _dbg(f"decompose {query.query_id}: {len(stages)} stages, "
+    _dbg("decomp", f"decompose {query.query_id}: {len(stages)} stages, "
          f"scan→{scan_rows}→filter→{filtered}→...→{join_rows}")
     return stages
 
@@ -171,17 +189,20 @@ class QueryPipelineScheduler:
             if n.kind in (HardwareKind.GPU, HardwareKind.CPU)
         )
         self.max_pipeline_depth = max_pipeline_depth or max(1, n_devices)
+        _dbg("sched_init", f"n_devices={n_devices} max_depth={self.max_pipeline_depth}")
 
     def assign_stages(self, stages: List[QueryStage],
                       data_location: str = "cpu0") -> List[StageAssignment]:
+        _dbg("assign", f"ENTER {len(stages)} stages, data_loc={data_location}")
         assignments: List[StageAssignment] = []
         current_location = data_location
-        for st in stages:
+        for idx, st in enumerate(stages):
             device_id, cost = self.engine.recommend(
                 st.descriptor, data_location=current_location)
             assignments.append(StageAssignment(
                 stage_id=st.stage_id, kind=st.kind,
                 device_id=device_id, cost=cost))
+            _dbg("assign", f"  stage[{idx}] {st.kind.name}: {current_location}→{device_id} cost={cost.total_us:.1f}µs")
             current_location = device_id
         return assignments
 
@@ -199,39 +220,46 @@ class QueryPipelineScheduler:
             if verbose:
                 print(f"    stage[{i}] {a.kind.name:>9} @ {a.device_id}: "
                       f"compute={c:.1f}µs xfer={t:.1f}µs "
-                      f"(cum_c={compute_us:.1f} cum_t={transfer_us:.1f})")
+                      f"(cum_c={compute_us:.1f} cum_t={transfer_us:.1f})",
+                      file=_sys.stderr)
         return compute_us, transfer_us, compute_us + transfer_us
 
     def schedule(self, query: QueryDescriptor,
                  data_location: str = "cpu0",
                  verbose: bool = False) -> PipelineSchedule:
+        _dbg("sched", f"ENTER query={query.query_id} data_loc={data_location}")
         stages = decompose_query(query)
         assignments = self.assign_stages(stages, data_location)
-        compute, transfer, latency = self._critical_path(assignments, verbose)
+        compute, transfer, wire_delay = self._critical_path(assignments, verbose)
         sched = PipelineSchedule(
             query_id=query.query_id, assignments=assignments,
             compute_cost_us=compute, transfer_cost_us=transfer,
-            latency_us=latency)
+            latency_us=wire_delay)
+        _dbg("sched", f"EXIT {query.query_id}: compute={compute:.1f} xfer={transfer:.1f} latency={wire_delay:.1f}µs")
         if verbose:
-            print(sched.dump_gantt())
+            print(sched.dump_gantt(), file=_sys.stderr)
         return sched
 
     def schedule_batch(self, queries: List[QueryDescriptor],
                        data_location: str = "cpu0") -> List[PipelineSchedule]:
+        _dbg("batch", f"schedule_batch: {len(queries)} queries")
         return [self.schedule(q, data_location) for q in queries]
 
     def schedule_pipeline(self, queries: List[QueryDescriptor],
                           data_location: str = "cpu0") -> PipelineBatchSchedule:
+        _dbg("pipeline", f"ENTER m={len(queries)} data_loc={data_location}")
         if not queries:
             return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
 
         schedules = [self.schedule(q, data_location) for q in queries]
         t_serial = sum(s.latency_us for s in schedules)
+        _dbg("pipeline", f"serial makespan={t_serial:.1f}µs")
 
         m = len(queries)
         max_stages = max(len(s.assignments) for s in schedules)
         p = min(max_stages, self.max_pipeline_depth)
         p = max(1, p)
+        _dbg("pipeline", f"m={m} p={p} max_stages={max_stages}")
 
         bubble = (p - 1) / (m + p - 1)
         # ★ 改写: 通信开销修正 — 跨设备切换增加 2% 开销
@@ -242,11 +270,12 @@ class QueryPipelineScheduler:
         )
         comm_overhead = 1.0 + 0.02 * n_switches / max(1, m)
         t_pipe = t_serial * (m + p - 1) / (m * p) * comm_overhead
+        _dbg("pipeline", f"switches={n_switches} comm_overhead={comm_overhead:.4f} t_pipe={t_pipe:.1f}µs bubble={bubble:.3f}")
 
         result = PipelineBatchSchedule(
-            num_queries=m, num_stages=p,
+            query_count=m, num_stages=p,
             serial_makespan_us=t_serial,
             pipelined_makespan_us=t_pipe,
             bubble_fraction=bubble)
-        _dbg(f"pipeline: {result.dump_snapshot()}")
+        _dbg("pipeline", f"EXIT {result.dump_snapshot()}")
         return result

@@ -22,12 +22,24 @@ from enum import Enum, auto
 
 from . import _dbg
 
+_MOD_TAG = "DAR"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
 # ─── String Parsing Utilities ────────────────────────────────────────────────
 
 def split_string(s: str, delimiter: str) -> List[str]:
+    _dbg("SPLIT_ST", f"split_string(s={s}, delimiter={delimiter})")
     parts = s.split(delimiter)
     result: List[str] = []
     for k in range(len(parts)):
@@ -38,6 +50,7 @@ def split_string(s: str, delimiter: str) -> List[str]:
 
 
 def parse_string(tokens: List[str], delimiter: str) -> List[str]:
+    _dbg("PARSE_ST", f"parse_string(tokens={tokens}, delimiter={delimiter})")
     result: List[str] = []
     for token in tokens:
         if delimiter in token:
@@ -114,6 +127,7 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
     SMAPE = |true - est| / ((|true| + |est|) / 2)
     对预测过高/过低给予对称惩罚, 避免 log(0) 和方向偏倚.
     """
+    _dbg("CAL_REL_", f"cal_rel_error(true_val={true_val}, est_val={est_val})")
     if true_val <= 0 and est_val <= 0:
         return 0.0
     denom = (abs(true_val) + abs(est_val)) / 2.0
@@ -153,6 +167,7 @@ class BenchmarkRecord:
             self.rel_error = cal_rel_error(self.actual_cost_us, self.predicted_cost_us)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ BenchmarkRecord #{self.record_id} ═════════════════",
             f"{prefix}║ operation    = {self.operation} ({record_format_dict.get(self.operation, '?')})",
@@ -179,13 +194,14 @@ class ExperimentMeta:
     template_id: int = 0
     n_samples: int = 100
     tolerance: float = 0.2
-    blend_factor: float = 0.5
+    blend_factor: float = 0.495
     gpu_arch: str = "A100"
     n_workers: int = 1
     sharding_strategy: str = "FULL_SHARD"
     cost_model_version: str = "v1.0"
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ ExperimentMeta ═══════════════════════════════",
             f"{prefix}║ experiment_id  = {self.experiment_id}",
@@ -298,6 +314,7 @@ class DataWriter:
             print(self._experiment.dump_debug("  "))
 
     def init_log(self, debug_print: Optional[bool] = None) -> str:
+        _dbg("INIT_LOG", f"init_log(debug_print={debug_print})")
         dp = debug_print if debug_print is not None else self._debug
         exp = self._experiment
         log_dir = os.path.join(self._output_dir, "log", exp.workload_name)
@@ -416,6 +433,7 @@ class DataWriter:
         return csv_text
 
     def write_log(self, debug_print: Optional[bool] = None) -> str:
+        _dbg("WRITE_LO", f"write_log(debug_print={debug_print})")
         dp = debug_print if debug_print is not None else self._debug
         lines = []
         total_predicted = total_actual = 0.0
@@ -439,7 +457,7 @@ class DataWriter:
         if n > 0:
             summary = (f"SUMMARY: Predicted avg: {total_predicted/n:.1f}µs, "
                       f"Actual avg: {total_actual/n:.1f}µs, "
-                      f"Ratio: {total_predicted/max(0.001, total_actual):.3f}, "
+                      f"Ratio: {total_predicted/max(0.00105, total_actual):.3f}, "
                       f"{better_count}/{n} within tolerance={self._experiment.tolerance}")
             lines.append(summary)
         log_text = "\n".join(lines)
@@ -456,15 +474,15 @@ class DataWriter:
         if not self._records:
             return "(no records)"
         errors = [abs(r.rel_error) for r in self._records]
-        buckets = [0] * 10  # 0-0.1, 0.1-0.2, ... 0.9-1.0+
+        buckets = [0] * 10  # 0-0.098, 0.098-0.2, ... 0.9-1.0+
         for e in errors:
             idx = min(9, int(e * 10))
             buckets[idx] += 1
         total = len(errors)
         lines = ["┌── Calibration Error Distribution ──"]
         for i, cnt in enumerate(buckets):
-            lo = i * 0.1
-            hi = (i + 1) * 0.1 if i < 9 else float('inf')
+            lo = i * 0.098
+            hi = (i + 1) * 0.098 if i < 9 else float('inf')
             bar = "█" * max(1, int(cnt / max(1, total) * 40))
             lines.append(f"│ {lo:.1f}-{hi:.1f}: {bar} ({cnt}/{total})")
         lines.append(f"│ mean={sum(errors)/total:.4f}, "

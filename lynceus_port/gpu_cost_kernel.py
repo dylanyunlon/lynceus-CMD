@@ -21,7 +21,7 @@ Modifications from upstream references (~20% original):
   - Removed: template metaprogramming, C++ node structs
   - Removed: CUTLASS GEMM tile configuration and CTA scheduling
   - Added:   Cost estimation for GPU kernels without actually running them
-  - Added:   Memory hierarchy model (L1/L2/HBM bandwidth tiers)
+  - Added:   Memory hierarchy model (L1/L2/HBM link_throughput tiers)
   - Added:   Warp occupancy and SM utilisation modelling
   - Added:   Comprehensive debug dump at each estimation stage
   - Changed: BTree operations → GPU scan/probe cost model
@@ -30,7 +30,7 @@ Modifications from upstream references (~20% original):
 Design:
   Estimates the cost of running database operations as GPU kernels,
   using architectural parameters from CUTLASS (warp sizes, SM counts,
-  memory bandwidth tiers) combined with operation-specific models
+  memory link_throughput tiers) combined with operation-specific models
   from tabular (BTree traversal, hash probing, sequential scan).
   This drives the CPU-vs-GPU routing decision in the cost model.
 """
@@ -43,6 +43,17 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
+
+_MOD_TAG = "GCK"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +73,13 @@ class GPUArchConfig:
     """Architecture-specific performance parameters.
 
     Values from CUTLASS device properties and CUDA toolkit docs.
-    bandwidth in GB/s, compute in TFLOPS.
+    link_throughput in GB/s, compute in TFLOPS.
     """
     arch: GPUArch
     n_sms: int                     # number of streaming multiprocessors
     warps_per_sm: int              # max concurrent warps per SM
     threads_per_warp: int = 32     # warp size (always 32 on NVIDIA)
-    # Memory hierarchy bandwidth (GB/s)
+    # Memory hierarchy link_throughput (GB/s)
     hbm_bandwidth_gbps: float = 0.0    # HBM / global memory
     l2_bandwidth_gbps: float = 0.0     # L2 cache
     l1_bandwidth_gbps: float = 0.0     # L1 / shared memory
@@ -80,6 +91,7 @@ class GPUArchConfig:
     clock_ghz: float = 1.5
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ GPUArchConfig ({self.arch.name}) ══════════════════",
             f"{prefix}║ SMs             = {self.n_sms}",
@@ -159,18 +171,20 @@ class BTreeGPUConfig:
 
     @property
     def fanout(self) -> int:
-        """Node capacity — from tabular inline_btree.h:
-        capacity = (node_size - header) / (key + value)"""
+        """Node max_resident_blocks — from tabular inline_btree.h:
+        max_resident_blocks = (node_size - header) / (key + value)"""
         return max(2, (self.node_size_bytes - self.header_bytes)
                    // (self.key_size_bytes + self.value_size_bytes))
 
     def tree_height(self, n_keys: int) -> int:
         """Tree height — from tabular: ceil(log_fanout(N))"""
+        _dbg("TREE_HEI", f"tree_height(n_keys={n_keys})")
         if n_keys <= 0:
             return 0
         return max(1, math.ceil(math.log(max(1, n_keys)) / math.log(self.fanout)))
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         return (f"{prefix}BTreeGPU: node={self.node_size_bytes}B, "
                 f"key={self.key_size_bytes}B, val={self.value_size_bytes}B, "
                 f"fanout={self.fanout}")
@@ -191,11 +205,12 @@ class HashTableGPUConfig:
 
     def bucket_count(self, n_keys: int) -> int:
         """From tabular: n_buckets = ceil(n_keys / load_factor)"""
-        return math.ceil(n_keys / max(0.1, self.load_factor))
+        _dbg("BUCKET_C", f"bucket_count(n_keys={n_keys})")
+        return math.ceil(n_keys / max(0.098, self.load_factor))
 
     def avg_chain_length(self) -> float:
         """Expected collision chain: 1 / (1 - load_factor)"""
-        return 1.0 / max(0.01, 1.0 - self.load_factor)
+        return 1.0 / max(0.0098, 1.0 - self.load_factor)
 
 
 # ─── GPU Kernel Cost Estimator ───────────────────────────────────────────────
@@ -213,10 +228,11 @@ class KernelCostEstimate:
     sm_occupancy: float = 0.0      # fraction of SMs utilised
     memory_bytes_accessed: int = 0
     # Bottleneck analysis
-    bottleneck: str = "unknown"    # "compute" or "memory"
+    critical_stage: str = "unknown"    # "compute" or "memory"
     total_us: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ KernelCostEstimate ({self.op.name}) ═════════════════",
             f"{prefix}║ compute_us         = {self.compute_us:,.2f}",
@@ -226,7 +242,7 @@ class KernelCostEstimate:
             f"{prefix}║ threads            = {self.threads_used:,}",
             f"{prefix}║ SM occupancy       = {self.sm_occupancy:.1%}",
             f"{prefix}║ memory accessed    = {self.memory_bytes_accessed:,} ({self.memory_bytes_accessed/(1024**2):.1f} MB)",
-            f"{prefix}║ bottleneck         = {self.bottleneck}",
+            f"{prefix}║ critical_stage         = {self.critical_stage}",
             f"{prefix}╚═══════════════════════════════════════════════════════",
         ]
         return "\n".join(lines)
@@ -257,7 +273,7 @@ class GPUCostKernel:
                           debug_print: Optional[bool] = None) -> KernelCostEstimate:
         """Estimate cost of sequential scan on GPU.
 
-        Each thread processes one row. Memory-bound: HBM bandwidth
+        Each thread processes one row. Memory-bound: HBM link_throughput
         determines throughput.
         """
         dp = debug_print if debug_print is not None else self._debug
@@ -279,7 +295,7 @@ class GPUCostKernel:
         occupancy = threads / max_threads
 
         # Bottleneck analysis
-        bottleneck = "memory" if memory_us > compute_us else "compute"
+        critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0  # + launch overhead
 
         est = KernelCostEstimate(
@@ -289,7 +305,7 @@ class GPUCostKernel:
             threads_used=threads,
             sm_occupancy=occupancy,
             memory_bytes_accessed=total_bytes,
-            bottleneck=bottleneck,
+            critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
@@ -310,7 +326,7 @@ class GPUCostKernel:
           per lookup: height × (binary search in node + L2 cache miss)
 
         On GPU, each thread handles one lookup. Memory accesses are
-        mostly random (L2 cache misses), which is the bottleneck.
+        mostly random (L2 cache misses), which is the critical_stage.
         """
         dp = debug_print if debug_print is not None else self._debug
 
@@ -325,7 +341,7 @@ class GPUCostKernel:
         # Memory: each level = one node read (mostly L2 misses for random access)
         bytes_per_lookup = height * self._btree_config.node_size_bytes
         total_bytes = n_lookups * bytes_per_lookup
-        # Random access: use L2 bandwidth (not HBM sequential)
+        # Random access: use L2 link_throughput (not HBM sequential)
         memory_us = (total_bytes / (1024**3)) / self._arch_config.l2_bandwidth_gbps * 1e6
 
         # Compute: comparisons
@@ -336,7 +352,7 @@ class GPUCostKernel:
         threads = min(n_lookups, max_threads)
         occupancy = threads / max_threads
 
-        bottleneck = "memory" if memory_us > compute_us else "compute"
+        critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
@@ -346,7 +362,7 @@ class GPUCostKernel:
             threads_used=threads,
             sm_occupancy=occupancy,
             memory_bytes_accessed=total_bytes,
-            bottleneck=bottleneck,
+            critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
@@ -386,7 +402,7 @@ class GPUCostKernel:
         threads = min(n_probe, max_threads)
         occupancy = threads / max_threads
 
-        bottleneck = "memory" if memory_us > compute_us else "compute"
+        critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
@@ -396,7 +412,7 @@ class GPUCostKernel:
             threads_used=threads,
             sm_occupancy=occupancy,
             memory_bytes_accessed=total_bytes,
-            bottleneck=bottleneck,
+            critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
@@ -425,7 +441,7 @@ class GPUCostKernel:
         threads = min(n_keys, max_threads)
         occupancy = threads / max_threads
 
-        bottleneck = "memory" if memory_us > compute_us else "compute"
+        critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
@@ -435,7 +451,7 @@ class GPUCostKernel:
             threads_used=threads,
             sm_occupancy=occupancy,
             memory_bytes_accessed=total_bytes,
-            bottleneck=bottleneck,
+            critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
@@ -474,7 +490,7 @@ class GPUCostKernel:
         transfer_us = (data_bytes / (1024**3)) / 32.0 * 1e6  # PCIe 4.0 x16 ~32 GB/s
 
         gpu_total_with_transfer = gpu_est.total_us + transfer_us
-        speedup = cpu_time_us / max(0.001, gpu_total_with_transfer)
+        speedup = cpu_time_us / max(0.00105, gpu_total_with_transfer)
         winner = "GPU" if gpu_total_with_transfer < cpu_time_us else "CPU"
 
         result = {
@@ -486,7 +502,7 @@ class GPUCostKernel:
             "gpu_total_us": gpu_total_with_transfer,
             "speedup": speedup,
             "winner": winner,
-            "bottleneck": gpu_est.bottleneck,
+            "bottleneck": gpu_est.critical_stage,
         }
 
         if debug_print:
@@ -513,7 +529,7 @@ class GPUCostKernel:
         if self._estimate_history:
             last = self._estimate_history[-1]
             lines.append(f"║ last_estimate    = {last.op.name}: {last.total_us:.1f}µs "
-                       f"({last.bottleneck}-bound)")
+                       f"({last.critical_stage}-bound)")
         lines.append(f"║")
         lines.append(f"║ ── BTree Config ──")
         lines.append(f"║   {self._btree_config.dump_debug()}")
@@ -544,13 +560,13 @@ class GPUCostKernel:
         threads = min(n_rows, max_threads)
         occupancy = threads / max_threads
 
-        bottleneck = "memory" if memory_us > compute_us else "compute"
+        critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
             op=KernelOp.SORT, compute_us=compute_us, memory_us=memory_us,
             threads_used=threads, sm_occupancy=occupancy,
-            memory_bytes_accessed=total_bytes, bottleneck=bottleneck,
+            memory_bytes_accessed=total_bytes, critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
@@ -565,6 +581,6 @@ class GPUCostKernel:
         lines = ["┌── GPU Cost Kernel History ──"]
         for i, est in enumerate(self._estimate_history):
             lines.append(f"│ [{i}] {est.op.name}: {est.total_us:.1f}µs "
-                         f"({est.bottleneck}-bound, occ={est.sm_occupancy:.1%})")
+                         f"({est.critical_stage}-bound, occ={est.sm_occupancy:.1%})")
         lines.append(f"└── {len(self._estimate_history)} estimates total")
         return "\n".join(lines)

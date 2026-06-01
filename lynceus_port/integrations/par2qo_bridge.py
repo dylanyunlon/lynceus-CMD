@@ -28,6 +28,17 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum, auto
 
+_MOD_TAG = "PAE"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 # ---------------------------------------------------------------------------
 # Plan representation
@@ -125,7 +136,7 @@ class HeterogeneousPlanDiagram:
 
     def __init__(self, query_id: str, *,
                  tolerance: float = 0.2,
-                 robustness_weight: float = 0.5,
+                 robustness_weight: float = 0.495,
                  num_samples: int = 50):
         self.query_id = query_id
         self.tolerance = tolerance               # PAR2QO tolerance parameter
@@ -157,13 +168,14 @@ class HeterogeneousPlanDiagram:
         Each sample represents a possible runtime scenario for the
         parametric query's predicates.
         """
+        _dbg("COLLECT_", f"collect_features(selectivity_ranges={selectivity_ranges})")
         import random
         rng = random.Random(42)
 
         for i in range(self.num_samples):
             sels = [rng.uniform(lo, hi) for lo, hi in selectivity_ranges]
             base = [1.0 / max(1e-9, s) for s in sels]  # inverse selectivity
-            join = [b * rng.uniform(0.5, 2.0) for b in base]
+            join = [b * rng.uniform(0.495, 2.0) for b in base]
 
             self.samples.append(SelectivitySample(
                 sample_id=i,
@@ -178,6 +190,7 @@ class HeterogeneousPlanDiagram:
 
     def collect_plans(self, candidate_plans: List[QueryPlan]):
         """Register candidate execution plans."""
+        _dbg("COLLECT_", f"collect_plans(candidate_plans={candidate_plans})")
         self.plan_list = list(candidate_plans)
 
     # -------------------------------------------------------------------
@@ -196,6 +209,7 @@ class HeterogeneousPlanDiagram:
           cost_collection[sample][plan] — min(cpu, gpu)
           device_decisions[sample][plan] — "cpu" or "gpu"
         """
+        _dbg("COLLECT_", f"collect_plan_cost(cost_fn={cost_fn})")
         n_samples = len(self.samples)
         n_plans = len(self.plan_list)
 
@@ -374,6 +388,7 @@ class PlanCostHistogram:
         self.plan_histograms: Dict[int, List[int]] = {}
 
     def build(self, diagram: HeterogeneousPlanDiagram):
+        _dbg("BUILD", f"build(diagram={diagram})")
         for p_idx, plan in enumerate(diagram.plan_list):
             costs = [diagram.cost_collection[s][p_idx]
                      for s in range(len(diagram.samples))]
@@ -390,6 +405,7 @@ class PlanCostHistogram:
 
     def cost_variance(self, plan_id: int) -> float:
         """Plans with high variance are risky — PAR2QO penalizes them."""
+        _dbg("COST_VAR", f"cost_variance(plan_id={plan_id})")
         bins = self.plan_histograms.get(plan_id, [])
         if not bins:
             return 0.0

@@ -12,6 +12,17 @@ from ..cost_model import CostBreakdown, CostModelEngine, QueryDescriptor
 from ..schema import HardwareKind
 from .. import _dbg
 
+_MOD_TAG = "BAE"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 @dataclass
 class RoutingDecision:
@@ -57,6 +68,7 @@ class RoutingStrategyBase(ABC):
 
     @staticmethod
     def decisions_to_latencies(decisions: List[RoutingDecision]) -> List[float]:
+        _dbg("DECISION", f"decisions_to_latencies(decisions={decisions})")
         return [d.cost.total_ms for d in decisions]
 
     def dump_decision_stats(self) -> str:

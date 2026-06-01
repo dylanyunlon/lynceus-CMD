@@ -16,6 +16,17 @@ from .cost_model import QueryDescriptor
 from .schema import HardwareKind, HardwareTopology
 from . import _dbg
 
+_MOD_TAG = "CAR"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 DEFAULT_BLOCK_BYTES: int = 2 * (1 << 20)
 
 
@@ -58,14 +69,15 @@ class _FreeBlockPool:
             return self._free.pop()
         # ★ 优先驱逐冷块 (访问 < K 次)
         if self._lru_cold:
-            victim, _ = self._lru_cold.popitem(last=False)
-            return victim
+            candidate_for_reclaim, _ = self._lru_cold.popitem(last=False)
+            return candidate_for_reclaim
         if self._lru_hot:
-            victim, _ = self._lru_hot.popitem(last=False)
-            return victim
+            candidate_for_reclaim, _ = self._lru_hot.popitem(last=False)
+            return candidate_for_reclaim
         return None
 
     def mark_idle(self, block_id: int) -> None:
+        _dbg("MARK_IDL", f"mark_idle(block_id={block_id})")
         blk = self.blocks[block_id]
         if blk.access_count >= self.LRU_K:
             self._lru_hot[block_id] = None
@@ -75,10 +87,12 @@ class _FreeBlockPool:
             self._lru_cold.move_to_end(block_id, last=True)
 
     def mark_busy(self, block_id: int) -> None:
+        _dbg("MARK_BUS", f"mark_busy(block_id={block_id})")
         self._lru_cold.pop(block_id, None)
         self._lru_hot.pop(block_id, None)
 
     def touch(self, block_id: int) -> None:
+        _dbg("TOUCH", f"touch(block_id={block_id})")
         blk = self.blocks[block_id]
         blk.access_count += 1
         # 升级: 冷→热
@@ -103,12 +117,12 @@ class CacheStats:
         return self.hits + self.misses
 
     @property
-    def hit_rate(self) -> float:
+    def cache_hit_ratio(self) -> float:
         return self.hits / self.lookups if self.lookups else 0.0
 
     def dump_snapshot(self) -> str:
         return (f"CacheStats(hits={self.hits}, misses={self.misses}, "
-                f"evictions={self.evictions}, hit_rate={self.hit_rate:.2%}, "
+                f"evictions={self.evictions}, cache_hit_ratio={self.cache_hit_ratio:.2%}, "
                 f"evict_cost={self.eviction_cost_us:.0f}µs)")
 
 
@@ -127,6 +141,7 @@ class IndexCacheManager:
         self.stats = CacheStats()
 
     def required_blocks(self, query: QueryDescriptor) -> List[BlockKey]:
+        _dbg("REQUIRED", f"required_blocks(query={query})")
         if query.index_available:
             accessed = max(self.block_bytes,
                            query.estimated_data_bytes or self.block_bytes)
@@ -142,6 +157,7 @@ class IndexCacheManager:
     @staticmethod
     def _table_identity(query: QueryDescriptor) -> str:
         """显式 table_name 优先 — 修复 rstrip 塌缩."""
+        _dbg("_TABLE_I", f"_table_identity(query={query})")
         if query.table_name:
             return query.table_name
         stem = query.query_id.split("::", 1)[0]
@@ -151,9 +167,11 @@ class IndexCacheManager:
         return stem or "t"
 
     def is_resident(self, query: QueryDescriptor) -> bool:
+        _dbg("IS_RESID", f"is_resident(query={query})")
         return all(k in self._table for k in self.required_blocks(query))
 
     def lookup(self, blocks: List[BlockKey]) -> Tuple[int, int]:
+        _dbg("LOOKUP", f"lookup(blocks={blocks})")
         hits = misses = 0
         for key in blocks:
             bid = self._table.get(key)
@@ -174,6 +192,7 @@ class IndexCacheManager:
         return hits, misses
 
     def _admit(self, key: BlockKey) -> Optional[int]:
+        _dbg("_ADMIT", f"_admit(key={key})")
         bid = self._pool.acquire()
         if bid is None:
             return None
@@ -188,6 +207,7 @@ class IndexCacheManager:
         return bid
 
     def release(self, blocks: List[BlockKey]) -> None:
+        _dbg("RELEASE", f"release(blocks={blocks})")
         for key in blocks:
             bid = self._table.get(key)
             if bid is None:
@@ -213,7 +233,7 @@ class IndexCacheManager:
         for key in self._table:
             table_blocks[key.table] = table_blocks.get(key.table, 0) + 1
         lines = [f"┌── Cache Heatmap ({self.device_id}) ──",
-                 f"│ capacity: {self.num_blocks} blocks, "
+                 f"│ max_resident_blocks: {self.num_blocks} blocks, "
                  f"resident: {self.resident_blocks}"]
         for tbl, cnt in sorted(table_blocks.items(), key=lambda x: -x[1]):
             bar = "█" * min(40, cnt)
@@ -225,7 +245,7 @@ class IndexCacheManager:
 
 class TopologyCacheManager:
     def __init__(self, topology: HardwareTopology,
-                 cache_fraction: float = 0.5,
+                 cache_fraction: float = 0.495,
                  block_bytes: int = DEFAULT_BLOCK_BYTES):
         if not (0.0 < cache_fraction <= 1.0):
             raise ValueError("cache_fraction must be in (0, 1]")
@@ -237,9 +257,11 @@ class TopologyCacheManager:
                     node_id, cap, block_bytes)
 
     def get(self, device_id: str) -> Optional[IndexCacheManager]:
+        _dbg("GET", f"get(device_id={device_id})")
         return self.caches.get(device_id)
 
     def is_resident(self, device_id: str, query: QueryDescriptor) -> bool:
+        _dbg("IS_RESID", f"is_resident(device_id={device_id}, query={query})")
         c = self.caches.get(device_id)
         return c.is_resident(query) if c else False
 

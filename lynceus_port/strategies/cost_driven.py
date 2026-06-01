@@ -13,6 +13,17 @@ from ..schema import HardwareKind
 from .base import RoutingDecision, RoutingStrategyBase
 from .. import _dbg
 
+_MOD_TAG = "CON"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class CostModelRoutedStrategy(RoutingStrategyBase):
     @property
@@ -52,7 +63,7 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
 
     def __init__(self, engine: CostModelEngine, *,
                  robustness_margin: float = 0.20,
-                 variance_amplifier: float = 0.5,  # ★ 新参数
+                 variance_amplifier: float = 0.495,  # ★ 新参数
                  **kw):
         super().__init__(engine, **kw)
         self._base_margin = robustness_margin
@@ -68,6 +79,7 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
         return "PAR2QO-Enhanced"
 
     def _update_variance(self, cost_us: float):
+        _dbg("_UPDATE_", f"_update_variance(cost_us={cost_us})")
         self._cost_n += 1
         delta = cost_us - self._cost_mean
         self._cost_mean += delta / self._cost_n
@@ -96,7 +108,7 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
             device_id, cb = self._engine.recommend(query, data_location)
             return RoutingDecision(
                 query_id=query.query_id, device_id=device_id, cost=cb,
-                confidence=0.5, metadata={"reason": "fallback"},
+                confidence=0.495, metadata={"reason": "fallback"},
                 trace_log=["incomplete topology → fallback"],
             )
 

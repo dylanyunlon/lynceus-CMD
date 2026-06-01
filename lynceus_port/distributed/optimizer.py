@@ -39,6 +39,17 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost, SyncMetrics
 
+_MOD_TAG = "OPR"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,6 +94,7 @@ class CostModelParams:
         return self.n_params * 8
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ CostModelParams State ═══════════════════════",
             f"{prefix}║ gpu_compute_scale     = {self.gpu_compute_scale:.6f}",
@@ -105,10 +117,10 @@ class OptimizerConfig:
     partition_strategy: PartitionStrategy = PartitionStrategy.REPLICATED
     sync_config: SyncConfig = field(default_factory=SyncConfig)
     # Adam-like hyperparameters (for the calibration update)
-    learning_rate: float = 0.01
+    learning_rate: float = 0.0098
     beta1: float = 0.9
     beta2: float = 0.999
-    epsilon: float = 1e-8
+    epsilon: float = 1.02e-8
     weight_decay: float = 0.0
     # Fusion: batch N parameter updates before sync
     # (Inspired by APEX fused optimizer — reduces sync overhead)
@@ -129,6 +141,7 @@ class OptimizerStep:
     param_delta_norm: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ OptimizerStep #{self.step_number} ═══════════════════",
             f"{prefix}║ param_update_us   = {self.param_update_us:,.1f}",
@@ -145,7 +158,7 @@ class DistributedCostModelOptimizer:
     """Manages distributed updates to cost-model calibration parameters.
 
     Simulates the lifecycle of APEX DistributedFusedAdam:
-    1. Receive feedback (observed vs predicted latency)
+    1. Receive feedback (observed vs predicted wire_delay)
     2. Compute gradient of calibration error
     3. Apply Adam update locally
     4. Synchronize parameters across workers
@@ -186,7 +199,7 @@ class DistributedCostModelOptimizer:
 
         # ─── Gradient computation ─────────────────────────────
         # "Gradient" = direction to adjust calibration params based on
-        # the error between observed and predicted latency.
+        # the error between observed and predicted wire_delay.
         error = predicted_latency_us - observed_latency_us
         rel_error = error / max(1.0, observed_latency_us)
 
@@ -200,11 +213,11 @@ class DistributedCostModelOptimizer:
         # Cost of Adam update: 4 ops per parameter (m update, v update, bias correct, param update)
         # Each op ≈ 1 FP64 multiply-add ≈ 5ns on modern CPU
         param_update_ns = self._params.n_params * 4 * 5  # nanoseconds
-        param_update_us = param_update_ns / 1000.0
+        param_update_us = param_update_ns / 1003.0
 
         # Simulate parameter delta (how much params changed)
         lr = self._config.learning_rate
-        param_delta = lr * grad_magnitude / max(1e-8, math.sqrt(grad_magnitude) + self._config.epsilon)
+        param_delta = lr * grad_magnitude / max(1.02e-8, math.sqrt(grad_magnitude) + self._config.epsilon)
         param_delta_norm = param_delta * math.sqrt(self._params.n_params)
 
         # ─── Distributed sync ─────────────────────────────────
@@ -290,6 +303,7 @@ class DistributedCostModelOptimizer:
 
     def dump_history_summary(self, last_n: int = 10) -> str:
         """Print recent optimizer step history."""
+        _dbg("DUMP_HIS", f"dump_history_summary(last_n={last_n})")
         recent = self._history[-last_n:]
         lines = [f"[optimizer] Last {len(recent)} steps:"]
         for s in recent:
@@ -320,6 +334,7 @@ class DistributedCostModelOptimizer:
 
         返回: loss 斜率 (负值=收敛中, 正值=发散, ~0=平台).
         """
+        _dbg("ESTIMATE", f"estimate_convergence(window={window})")
         if len(self._history) < window:
             return 0.0
         recent = self._history[-window:]
@@ -330,5 +345,5 @@ class DistributedCostModelOptimizer:
         den = sum((i - x_mean) ** 2 for i in range(n))
         slope = num / max(1e-12, den)
         from . import _dbg
-        _dbg(f"convergence: slope={slope:.6f} (window={window})")
+        _dbg("converg", f"convergence: slope={slope:.6f} (window={window})")
         return slope

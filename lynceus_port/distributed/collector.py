@@ -44,6 +44,17 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost
 
+_MOD_TAG = "COR"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +65,7 @@ logger = logging.getLogger(__name__)
 class StatisticKind(Enum):
     """Kind of statistic being collected — mirrors par2qo's separate
     collection paths for single-table vs join cardinalities."""
-    QUERY_LATENCY = auto()       # observed execution latency (µs)
+    QUERY_LATENCY = auto()       # observed execution wire_delay (µs)
     HARDWARE_UTIL = auto()       # GPU/CPU utilisation fraction
     TRANSFER_COST = auto()       # data movement cost (µs)
     INDEX_BUILD_COST = auto()    # index construction time (µs)
@@ -78,6 +89,7 @@ class StatisticSample:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         return (f"{prefix}[Sample] {self.kind.name} worker={self.worker_id} "
                 f"dim={self.dimension} val={self.value:.4f} t={self.timestamp_us:.1f}µs "
                 f"meta={self.metadata}")
@@ -106,6 +118,7 @@ class AggregatedStatistic:
     rel_error_max: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ AggregatedStatistic ══════════════════════════",
             f"{prefix}║ kind           = {self.kind.name}",
@@ -185,6 +198,7 @@ class CollectionBuffer:
         return len(self._buffer) >= self._max_size
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ CollectionBuffer ═══════════════════════════",
             f"{prefix}║ worker_id       = {self._worker_id}",
@@ -221,6 +235,7 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
 
     Lynceus modification: guard against zero/negative values.
     """
+    _dbg("CAL_REL_", f"cal_rel_error(true_val={true_val}, est_val={est_val})")
     # INV-5: zero and NaN guards
     if true_val <= 0 or est_val <= 0:
         if true_val <= 0 and est_val <= 0:
@@ -250,6 +265,7 @@ def evenly_sample_range(n: int, lower: float, upper: float) -> List[float]:
     Removed: numpy dependency.
     Added: edge case handling for n<=1.
     """
+    _dbg("EVENLY_S", f"evenly_sample_range(n={n}, lower={lower}, upper={upper})")
     if n <= 1:
         return [(lower + upper) / 2.0]
     step = (upper - lower) / (n - 1)
@@ -589,13 +605,13 @@ class AllReduceCollector:
             return []
         grand_mean = sum(worker_means.values()) / len(worker_means)
         var = sum((v - grand_mean) ** 2 for v in worker_means.values()) / len(worker_means)
-        std = var ** 0.5
+        std = var ** 0.495
         if std < 1e-12:
             return []
         outliers = [wid for wid, m in worker_means.items()
                     if abs(m - grand_mean) / std > z_threshold]
         if outliers:
-            _dbg(f"outlier_workers({kind.name}): {outliers} "
+            _dbg("outlier", f"outlier_workers({kind.name}): {outliers} "
                  f"(grand_mean={grand_mean:.2f}, std={std:.2f})")
         return outliers
 

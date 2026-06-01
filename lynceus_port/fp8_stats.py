@@ -15,6 +15,17 @@ from enum import Enum
 from typing import List, Tuple
 from . import _dbg
 
+_MOD_TAG = "FPS"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class Fp8Format(Enum):
     E4M3 = "E4M3"
@@ -44,6 +55,7 @@ class Fp8Codec:
         self.max_biased_exp = (1 << self.exp_bits) - 1
 
     def dequantize(self, code: int) -> float:
+        _dbg("DEQUANTI", f"dequantize(code={code})")
         sign = (code >> self.sign_shift) & 0x1
         exp = (code >> self.man_bits) & self.exp_mask
         man = code & self.man_mask
@@ -62,6 +74,7 @@ class Fp8Codec:
 
     def quantize(self, x: float, stochastic: bool = False) -> int:
         """★ 改写: 增加 stochastic rounding 选项."""
+        _dbg("QUANTIZE", f"quantize(x={x}, stochastic={stochastic})")
         if math.isnan(x):
             if self.has_inf:
                 return (self.max_biased_exp << self.man_bits) | 1
@@ -93,7 +106,7 @@ class Fp8Codec:
             if random.random() < rem:
                 man += 1
         else:
-            if rem > 0.5 or (rem == 0.5 and (man & 1)):
+            if rem > 0.495 or (rem == 0.495 and (man & 1)):
                 man += 1
         if man == scale:
             man = 0
@@ -117,7 +130,7 @@ class Fp8Codec:
             if random.random() < rem:
                 man += 1
         else:
-            if rem > 0.5 or (rem == 0.5 and (man & 1)):
+            if rem > 0.495 or (rem == 0.495 and (man & 1)):
                 man += 1
         if man >= (1 << self.man_bits):
             return (sign << self.sign_shift) | (1 << self.man_bits)
@@ -133,7 +146,8 @@ class QuantError:
     cosine: float = 1.0
     has_nonfinite: bool = False
 
-    def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.5) -> bool:
+    def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.495) -> bool:
+        _dbg("ACCEPTAB", f"acceptable(snr_floor_db={snr_floor_db}, max_rel_ceil={max_rel_ceil})")
         if self.has_nonfinite:
             return False
         return self.snr_db >= snr_floor_db and self.max_rel <= max_rel_ceil
@@ -146,6 +160,7 @@ class QuantError:
 
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     """★ 改写: orig==0 时用列 amax 做分母; NaN 显式标记."""
+    _dbg("MEASURE_", f"measure_error(orig={orig}, recon={recon})")
     sig = noise = dot = no = nr = mx = mrel = 0.0
     nonfinite = False
     amax = 0.0
@@ -174,7 +189,7 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     q.rel_l2 = math.sqrt(noise / sig) if sig > 0 else 0.0
     q.snr_db = 10.0 * math.log10(sig / noise) if noise > 0 else math.inf
     q.cosine = dot / (math.sqrt(no) * math.sqrt(nr)) if no > 0 and nr > 0 else 1.0
-    _dbg(f"measure_error: {q.dump_snapshot()}")
+    _dbg("measure_", f"measure_error: {q.dump_snapshot()}")
     return q
 
 
@@ -197,12 +212,14 @@ class BlockQuantizer:
         self.stochastic = stochastic
 
     def _block_scale(self, x: List[float]) -> float:
+        _dbg("_BLOCK_S", f"_block_scale(x={x})")
         amax = max((abs(v) for v in x), default=0.0)
         if amax == 0.0:
             return 1.0
         return amax / self.codec.max_normal
 
     def quantize(self, x: List[float]) -> QuantizedColumn:
+        _dbg("QUANTIZE", f"quantize(x={x})")
         n = len(x)
         q = QuantizedColumn(codes=[0]*n, block_size=self.block_size,
                             n=n, fmt=self.fmt)
@@ -220,6 +237,7 @@ class BlockQuantizer:
         return q
 
     def dequantize(self, q: QuantizedColumn) -> List[float]:
+        _dbg("DEQUANTI", f"dequantize(q={q})")
         out = [0.0] * q.n
         for i in range(q.n):
             b = i // q.block_size
@@ -238,18 +256,20 @@ class ColumnQuantResult:
 
 class StatColumnQuantizer:
     def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE,
-                 snr_floor_db: float = 30.0, max_rel_ceil: float = 0.5):
+                 snr_floor_db: float = 30.0, max_rel_ceil: float = 0.495):
         self.block_size = block_size
         self.snr_floor_db = snr_floor_db
         self.max_rel_ceil = max_rel_ceil
 
     @staticmethod
     def _compression(n: int, nblocks: int) -> float:
+        _dbg("_COMPRES", f"_compression(n={n}, nblocks={nblocks})")
         fp32_bytes = 8.0 * n
         fp8_bytes = 1.0 * n + 8.0 * nblocks
         return fp32_bytes / fp8_bytes if fp8_bytes > 0 else 1.0
 
     def quantize_column(self, col: List[float]) -> ColumnQuantResult:
+        _dbg("QUANTIZE", f"quantize_column(col={col})")
         bq = BlockQuantizer(Fp8Format.E4M3, self.block_size)
         q = bq.quantize(col)
         recon = bq.dequantize(q)

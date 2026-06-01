@@ -11,6 +11,17 @@ from ..schema import HardwareKind
 from .base import RoutingDecision, RoutingStrategyBase
 from .. import _dbg
 
+_MOD_TAG = "STC"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class GPUOnlyStrategy(RoutingStrategyBase):
     def __init__(self, engine: CostModelEngine, *, gpu_id: str = "gpu0", **kw):

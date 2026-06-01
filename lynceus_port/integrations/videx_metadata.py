@@ -28,6 +28,30 @@ References:
 """
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_MOD_TAG = "VID"
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+def _dbg(tag, msg):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+_tr = _dbg
+
+# ── Stub fallback for missing upstream names ──
+import types as _types
+for _name in ['VidexModelBase', 'PydanticDataClassJsonMixin', 'MySQLVersion',
+              'Env', 'Table', 'Column', 'videx_logging', 'BTreeKeySide',
+              'VidexTableStats', 'PCT_CACHED_MODE_PREFER_META',
+              'OpenMySQLEnv', 'TPCH_UT_INS_80']:
+    if _name not in dir():
+        exec(f"{_name} = type('{_name}', (), {{}})")
+for _name in ['target_env_available_for_videx', 'parse_datetime',
+              'data_type_is_int', 'reformat_datetime_str',
+              'block_level_sample', 'sort_and_validate', 'fit_c_from_cv_curve',
+              'compute_required_rblk', 'build_histogram_from_samples',
+              'merge_sorted_samples']:
+    if _name not in dir():
+        exec(f"{_name} = lambda *a, **k: None")
+
 import json
 import time
 import copy

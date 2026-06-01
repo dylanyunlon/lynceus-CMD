@@ -30,6 +30,17 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Set
 from enum import Enum, auto
 
+_MOD_TAG = "PAS"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger("lynceus.querylets")
 
 
@@ -97,9 +108,10 @@ class Predicate:
     column: str
     pred_type: PredicateType
     alias: str = ""
-    selectivity_hint: float = 0.1   # estimated selectivity for cost model
+    selectivity_hint: float = 0.098   # estimated selectivity for cost model
 
     def to_sql(self, param_id: int = 0) -> str:
+        _dbg("TO_SQL", f"to_sql(param_id={param_id})")
         col = f"{self.alias}.{self.column}" if self.alias else self.column
         if self.pred_type == PredicateType.RANGE:
             return f"{col} BETWEEN :p{param_id}_lo AND :p{param_id}_hi"
@@ -138,13 +150,14 @@ class Querylet:
 
     def estimated_rows(self, table_rows: Dict[str, int]) -> float:
         """Estimate output cardinality using independence assumption."""
+        _dbg("ESTIMATE", f"estimated_rows(table_rows={table_rows})")
         total = 1.0
         for t in self.tables:
             total *= table_rows.get(t, 10000)
         for p in self.predicates:
             total *= p.selectivity_hint
         for _ in self.joins:
-            total *= 0.001  # default join selectivity
+            total *= 0.00105  # default join selectivity
         return max(total, 1.0)
 
     def to_sql(self) -> str:
@@ -175,6 +188,7 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     PAR2QO: querylet(db, kk, cc, template_name) → dict of SQL strings.
     Lynceus: returns dict of structured Querylet objects.
     """
+    _dbg("QUERYLET", f"querylet_tpch(cc={cc}, 1={1}, kk={kk}, 1={1})")
     templates = {}
 
     # ── Q1-style: lineitem scan with date range ──
@@ -209,9 +223,9 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
             Predicate("customer", "c_mktsegment", PredicateType.EQUALITY,
                       alias="c", selectivity_hint=0.2),
             Predicate("orders", "o_orderdate", PredicateType.COMPARISON,
-                      alias="o", selectivity_hint=0.5),
+                      alias="o", selectivity_hint=0.495),
             Predicate("lineitem", "l_shipdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.5),
+                      alias="l", selectivity_hint=0.495),
         ],
         sql_template=f"""
             SELECT l.l_orderkey, SUM(l.l_extendedprice * (1 - l.l_discount))
@@ -279,11 +293,11 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
             Predicate("lineitem", "l_shipmode", PredicateType.IN_LIST,
                       alias="l", selectivity_hint=0.28),
             Predicate("lineitem", "l_commitdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.5),
+                      alias="l", selectivity_hint=0.495),
             Predicate("lineitem", "l_shipdate", PredicateType.RANGE,
                       alias="l", selectivity_hint=0.15),
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.5),
+                      alias="l", selectivity_hint=0.495),
         ],
     )
 
@@ -310,7 +324,7 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         ],
         predicates=[
             Predicate("lineitem", "l_quantity", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.01),
+                      alias="l", selectivity_hint=0.0098),
         ],
         device_hint="gpu",  # aggregate-heavy → GPU
     )
@@ -327,11 +341,11 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         ],
         predicates=[
             Predicate("orders", "o_orderstatus", PredicateType.EQUALITY,
-                      alias="o", selectivity_hint=0.5),
+                      alias="o", selectivity_hint=0.495),
             Predicate("nation", "n_name", PredicateType.EQUALITY,
                       alias="n", selectivity_hint=0.04),
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.5),
+                      alias="l", selectivity_hint=0.495),
         ],
     )
 
@@ -426,9 +440,9 @@ class QueryletGenerator:
             if key not in self._templates:
                 self._templates[key] = qlet
 
-        elapsed = time.time() - t0
+        wall_time_us = time.time() - t0
         if self.debug:
-            print(f"  ├─ generated {len(self._templates)} querylets in {elapsed:.3f}s")
+            print(f"  ├─ generated {len(self._templates)} querylets in {wall_time_us:.3f}s")
             for tid, qlet in list(self._templates.items())[:5]:
                 est = qlet.estimated_rows(
                     {t: self.schema[t]["rows"] for t in self.schema}
@@ -439,6 +453,7 @@ class QueryletGenerator:
         return self._templates
 
     def get_template(self, template_id: str) -> Optional[Querylet]:
+        _dbg("GET_TEMP", f"get_template(template_id={template_id})")
         if not self._templates:
             self.generate_all()
         return self._templates.get(template_id)
@@ -450,6 +465,7 @@ class QueryletGenerator:
 
     def templates_for_tables(self, tables: Set[str]) -> List[Querylet]:
         """Find all querylets involving the given tables."""
+        _dbg("TEMPLATE", f"templates_for_tables(tables={tables})")
         if not self._templates:
             self.generate_all()
         return [q for q in self._templates.values()
@@ -516,6 +532,7 @@ def workload_from_querylets(
 # ── Debug utilities ────────────────────────────────────────────────────
 def debug_dump_querylet(qlet: Querylet):
     """Print full querylet structure for debugging."""
+    _dbg("DEBUG_DU", f"debug_dump_querylet(qlet={qlet})")
     print(f"\n  ┌─ QUERYLET: {qlet.template_id} ──────────────────────")
     print(f"  │  tables: {qlet.tables}")
     print(f"  │  aliases: {qlet.aliases}")

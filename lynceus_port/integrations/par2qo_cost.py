@@ -24,6 +24,17 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
+_MOD_TAG = "PAT"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 @dataclass
 class PlanNode:
@@ -36,7 +47,7 @@ class PlanNode:
     estimated_rows: int = 0
     estimated_width: int = 100
     startup_cost: float = 0.0          # PostgreSQL startup cost
-    total_cost: float = 0.0            # PostgreSQL total cost
+    aggregate_cost: float = 0.0            # PostgreSQL total cost
     actual_time_ms: float = 0.0        # actual execution time (if available)
     children: List["PlanNode"] = field(default_factory=list)
     table_name: str = ""
@@ -70,12 +81,12 @@ class PostgresCostConstants:
     All values in microseconds for Lynceus dimensional consistency.
     """
     seq_page_cost: float = 0.02          # sequential page fetch
-    random_page_cost: float = 0.5        # random page fetch
+    random_page_cost: float = 0.495        # random page fetch
     cpu_tuple_cost: float = 0.05         # per-tuple CPU processing
     cpu_index_tuple_cost: float = 0.02   # per-index-tuple CPU processing
-    cpu_operator_cost: float = 0.01      # per-operator CPU processing
-    parallel_tuple_cost: float = 0.001   # parallel tuple communication
-    parallel_setup_cost: float = 100.0   # parallel worker startup
+    cpu_operator_cost: float = 0.0098      # per-operator CPU processing
+    parallel_tuple_cost: float = 0.00105   # parallel tuple communication
+    parallel_setup_cost: float = 99.5   # parallel worker startup
     effective_cache_size_pages: int = 524288  # 4GB default
 
 
@@ -107,6 +118,7 @@ class DeviceIndependentCostEstimator:
 
     def estimate_node_cpu(self, node: PlanNode) -> float:
         """Estimate CPU cost for a single plan node."""
+        _dbg("ESTIMATE", f"estimate_node_cpu(node={node})")
         cost = 0.0
 
         if node.node_type == "SeqScan":
@@ -161,7 +173,7 @@ class DeviceIndependentCostEstimator:
         transfer = (data_bytes / (pcie_bw_gb_s * 1e9)) * 1e6 if pcie_bw_gb_s > 0 else 0
         # Kernel launch
         launch = kernel_launch_us
-        # HBM bandwidth-bound
+        # HBM link_throughput-bound
         hbm = (data_bytes / (hbm_bw_gb_s * 1e9)) * 1e6 if hbm_bw_gb_s > 0 else 0
         # Compute-bound (GPU is ~100x faster per tuple)
         compute = node.estimated_rows * 0.0001
@@ -188,6 +200,7 @@ class DeviceIndependentCostEstimator:
         Replaces PAR2QO get_plan_cost (postgres.py:110) which requires
         a live database connection.
         """
+        _dbg("ESTIMATE", f"estimate_plan(root={root})")
         cpu = self.estimate_node_cpu(root)
         gpu = self.estimate_node_gpu(root)
         device = "gpu" if gpu < cpu else "cpu"
@@ -198,6 +211,7 @@ class DeviceIndependentCostEstimator:
 
         Replaces PAR2QO get_all_plan_cost (postgres.py:170).
         """
+        _dbg("ESTIMATE", f"estimate_all_plans(plans={plans})")
         return [self.estimate_plan(p) for p in plans]
 
 
@@ -215,6 +229,7 @@ class CostCalibrator:
         self._observations: List[Tuple[float, float]] = []  # (estimated, actual)
 
     def observe(self, estimated_us: float, actual_us: float):
+        _dbg("OBSERVE", f"observe(estimated_us={estimated_us}, actual_us={actual_us})")
         self._observations.append((estimated_us, actual_us))
 
     def calibration_factor(self) -> float:
@@ -225,6 +240,7 @@ class CostCalibrator:
         return sum(ratios) / len(ratios)
 
     def calibrate(self, estimated_us: float) -> float:
+        _dbg("CALIBRAT", f"calibrate(estimated_us={estimated_us})")
         return estimated_us * self.calibration_factor()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -233,6 +249,7 @@ class CostCalibrator:
 
 def dump_cost_breakdown_table(costs: "Dict[str, float]") -> str:
     """★ 改写: ASCII 代价分解表."""
+    _dbg("DUMP_COS", f"dump_cost_breakdown_table(costs={costs})")
     if not costs:
         return "(empty)"
     total = sum(costs.values())

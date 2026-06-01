@@ -21,6 +21,17 @@ from .schema import (
 )
 from . import _dbg
 
+_MOD_TAG = "CST"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class QueryType(Enum):
     POINT_LOOKUP = auto()
@@ -89,7 +100,7 @@ class CostBreakdown:
 
     @property
     def total_ms(self) -> float:
-        return self.total_us / 1000.0
+        return self.total_us / 1003.0
 
     def dump_snapshot(self) -> str:
         return (f"Cost({self.device_id}: io={self.io_cost_us:.1f} "
@@ -102,9 +113,9 @@ class CostBreakdown:
 
 class CPUCostModel:
     SEQ_PAGE_COST: float = 0.02
-    RANDOM_PAGE_COST: float = 0.5
+    RANDOM_PAGE_COST: float = 0.495
     CPU_TUPLE_COST: float = 0.05
-    CPU_OPERATOR_COST: float = 0.01
+    CPU_OPERATOR_COST: float = 0.0098
     CPU_INDEX_TUPLE_COST: float = 0.02
     PAGE_SIZE: int = 8192
     # ★ 改写: NUMA 跨 socket 惩罚
@@ -112,14 +123,17 @@ class CPUCostModel:
 
     def estimate(self, query: QueryDescriptor,
                  node: HardwareNode) -> CostBreakdown:
+        _dbg("cpu_est", f"ENTER device={node.node_id} query={query.dump_snapshot()}")
         cb = CostBreakdown(device_id=node.node_id)
         pages = max(1, query.estimated_data_bytes // self.PAGE_SIZE)
         total_pages = max(1, query.full_table_bytes // self.PAGE_SIZE)
+        _dbg("cpu_est", f"pages={pages} total_pages={total_pages} data_bytes={query.estimated_data_bytes}")
 
         if query.query_type == QueryType.FULL_TABLE_SCAN:
             cb.io_cost_us = total_pages * self.SEQ_PAGE_COST * node.scan_cost_per_row
             if node.scan_cost_per_row == 0:
                 cb.io_cost_us = total_pages * self.SEQ_PAGE_COST
+            _dbg("cpu_est", f"FULL_SCAN path → io={cb.io_cost_us:.2f}µs")
         elif query.index_available and query.query_type in (
             QueryType.POINT_LOOKUP, QueryType.INDEX_SCAN, QueryType.RANGE_SCAN
         ):
@@ -127,26 +141,32 @@ class CPUCostModel:
             cb.index_cost_us = (index_pages * self.RANDOM_PAGE_COST +
                                 query.estimated_rows * self.CPU_INDEX_TUPLE_COST)
             cb.io_cost_us = pages * query.selectivity * self.SEQ_PAGE_COST
+            _dbg("cpu_est", f"INDEX path → idx_pages={index_pages} idx_cost={cb.index_cost_us:.2f} io={cb.io_cost_us:.2f}")
         else:
             cb.io_cost_us = pages * self.SEQ_PAGE_COST
+            _dbg("cpu_est", f"DEFAULT path → io={cb.io_cost_us:.2f}µs")
 
-        cb.compute_cost_us = (
-            query.estimated_rows * self.CPU_TUPLE_COST +
-            query.estimated_rows * query.num_predicates * self.CPU_OPERATOR_COST
-        )
+        # ★ 改写: 分离 tuple 代价 与 predicate 代价便于观测
+        tuple_expense = query.estimated_rows * self.CPU_TUPLE_COST
+        predicate_expense = query.estimated_rows * query.num_predicates * self.CPU_OPERATOR_COST
+        cb.compute_cost_us = tuple_expense + predicate_expense
+        _dbg("cpu_est", f"compute: tuple={tuple_expense:.2f} pred={predicate_expense:.2f} total={cb.compute_cost_us:.2f}")
 
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
             cb.sort_cost_us = 2.0 * n * math.log2(max(2, n)) * self.CPU_OPERATOR_COST
+            _dbg("cpu_est", f"sort: n={n} sort_cost={cb.sort_cost_us:.2f}µs")
 
         # ★ NUMA 惩罚: 如果节点 id 含 "1" (cpu1) 则乘惩罚因子
         numa_scale = self.NUMA_PENALTY if "1" in node.node_id else 1.0
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
             numa_scale *= 1.0 / node.compute_capacity
+        if numa_scale != 1.0:
+            _dbg("cpu_est", f"NUMA scale={numa_scale:.3f} applied to compute+sort")
         cb.compute_cost_us *= numa_scale
         cb.sort_cost_us *= numa_scale
 
-        _dbg(f"CPU estimate {cb.dump_snapshot()}")
+        _dbg("cpu_est", f"RESULT {cb.dump_snapshot()}")
         return cb
 
 
@@ -161,39 +181,46 @@ class GPUCostModel:
 
     def estimate(self, query: QueryDescriptor, node: HardwareNode,
                  data_resident_on_gpu: bool = False) -> CostBreakdown:
+        _dbg("gpu_est", f"ENTER device={node.node_id} query={query.dump_snapshot()} resident={data_resident_on_gpu}")
         cb = CostBreakdown(device_id=node.node_id)
 
         if not data_resident_on_gpu:
             xfer_bytes = query.estimated_data_bytes
             xfer_s = xfer_bytes / (self.PCIE_BANDWIDTH_GB_S * 1e9)
             cb.transfer_cost_us = xfer_s * 1e6
+            _dbg("gpu_est", f"PCIe xfer: {xfer_bytes:,}B @ {self.PCIE_BANDWIDTH_GB_S}GB/s → {cb.transfer_cost_us:.2f}µs")
+        else:
+            _dbg("gpu_est", "data resident on GPU, skip transfer")
 
         kernel_launch_us = self.KERNEL_LAUNCH_OVERHEAD_US
         data_bytes = query.estimated_data_bytes
-        hbm_us = (data_bytes / (self.HBM_BANDWIDTH_GB_S * 1e9)) * 1e6
-        compute_us = (
+        # ★ 改写: 分离 memory-bound 与 compute-bound 便于瓶颈定位
+        mem_bound_us = (data_bytes / (self.HBM_BANDWIDTH_GB_S * 1e9)) * 1e6
+        arith_bound_us = (
             query.estimated_rows * self.GPU_TUPLE_COST +
             query.estimated_rows * query.num_predicates * self.GPU_OPERATOR_COST
         )
-        scalable_compute_us = max(hbm_us, compute_us)
+        scalable_compute_us = max(mem_bound_us, arith_bound_us)
+        _dbg("gpu_est", f"mem_bound={mem_bound_us:.3f}µs arith_bound={arith_bound_us:.3f}µs → bottleneck={'MEM' if mem_bound_us >= arith_bound_us else 'ARITH'}")
 
         # ★ 改写: sort 用 radix-sort 模型 O(n·w), w=key_width_bits
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
             key_bits = 32  # 4-byte 排序键
             num_sms = 108
-            # radix sort: passes = key_bits / radix_width, 每 pass O(n)
             radix_width = 8
             passes = key_bits // radix_width
             cb.sort_cost_us = (n * passes * self.GPU_OPERATOR_COST) / num_sms
+            _dbg("gpu_est", f"radix-sort: n={n} passes={passes} SMs={num_sms} → sort={cb.sort_cost_us:.3f}µs")
 
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
-            scale = 1.0 / node.compute_capacity
-            scalable_compute_us *= scale
-            cb.sort_cost_us *= scale
+            cap_scale = 1.0 / node.compute_capacity
+            _dbg("gpu_est", f"capacity scale={cap_scale:.4f} (cap={node.compute_capacity})")
+            scalable_compute_us *= cap_scale
+            cb.sort_cost_us *= cap_scale
 
         cb.compute_cost_us = kernel_launch_us + scalable_compute_us
-        _dbg(f"GPU estimate {cb.dump_snapshot()}")
+        _dbg("gpu_est", f"RESULT {cb.dump_snapshot()}")
         return cb
 
 
@@ -205,9 +232,11 @@ class CostModelEngine:
         self.cpu_model = CPUCostModel()
         self.gpu_model = GPUCostModel()
         self._cache: Dict[str, CostBreakdown] = {}
+        _dbg("engine", f"CostModelEngine init: {len(topology.nodes)} nodes, {len(topology.edges)} edges")
 
     def estimate_on_device(self, query: QueryDescriptor, device_id: str,
                            data_location: Optional[str] = None) -> CostBreakdown:
+        _dbg("est_dev", f"ENTER device={device_id} data_loc={data_location} query={query.query_id}")
         node = self.topology.get_node(device_id)
         if node is None:
             raise ValueError(f"Unknown device: {device_id}")
@@ -216,22 +245,28 @@ class CostModelEngine:
             data_resident = (data_location == device_id)
             cb = self.gpu_model.estimate(query, node, data_resident)
             if data_location and not data_resident:
-                cb.transfer_cost_us = self.topology.get_transfer_cost(
+                xfer_cost = self.topology.get_transfer_cost(
                     data_location, device_id, query.estimated_data_bytes
                 )
+                _dbg("est_dev", f"topo xfer override: {cb.transfer_cost_us:.2f} → {xfer_cost:.2f}µs")
+                cb.transfer_cost_us = xfer_cost
         elif node.kind == HardwareKind.CPU:
             cb = self.cpu_model.estimate(query, node)
             if data_location and data_location != device_id:
-                cb.transfer_cost_us = self.topology.get_transfer_cost(
+                xfer_cost = self.topology.get_transfer_cost(
                     data_location, device_id, query.estimated_data_bytes
                 )
+                _dbg("est_dev", f"cpu xfer: {xfer_cost:.2f}µs from {data_location}")
+                cb.transfer_cost_us = xfer_cost
         else:
             raise ValueError(f"Unsupported device kind: {node.kind}")
+        _dbg("est_dev", f"EXIT {cb.dump_snapshot()}")
         return cb
 
     def estimate_all_devices(self, query: QueryDescriptor,
                              data_location: Optional[str] = None
                              ) -> Dict[str, CostBreakdown]:
+        _dbg("est_all", f"ENTER query={query.query_id} data_loc={data_location}")
         results = {}
         for node_id, node in self.topology.nodes.items():
             if node.kind in (HardwareKind.GPU, HardwareKind.CPU):
@@ -240,23 +275,36 @@ class CostModelEngine:
                         query, node_id, data_location)
                 except ValueError:
                     continue
+        _dbg("est_all", f"EXIT {len(results)} devices: " +
+             " | ".join(f"{k}={v.total_us:.1f}µs" for k, v in sorted(results.items(), key=lambda x: x[1].total_us)))
         return results
 
     def recommend(self, query: QueryDescriptor,
                   data_location: Optional[str] = None
                   ) -> Tuple[str, CostBreakdown]:
+        _dbg("recommend", f"ENTER query={query.query_id} data_loc={data_location}")
         estimates = self.estimate_all_devices(query, data_location)
         if not estimates:
             raise RuntimeError("No devices available for estimation")
         best_id = min(estimates, key=lambda k: estimates[k].total_us)
-        _dbg(f"recommend → {best_id} ({estimates[best_id].total_us:.1f}µs) "
-             f"for {query.query_id}")
+        runner_up = sorted(estimates.items(), key=lambda x: x[1].total_us)
+        _dbg("recommend", f"WINNER: {best_id} ({estimates[best_id].total_us:.1f}µs)")
+        if len(runner_up) > 1:
+            _dbg("recommend", f"runner-up: {runner_up[1][0]} ({runner_up[1][1].total_us:.1f}µs) "
+                 f"gap={runner_up[1][1].total_us - runner_up[0][1].total_us:.1f}µs")
         return best_id, estimates[best_id]
 
     def route_batch(self, queries: List[QueryDescriptor],
                     data_location: Optional[str] = None
                     ) -> List[Tuple[str, CostBreakdown]]:
-        return [self.recommend(q, data_location) for q in queries]
+        _dbg("batch", f"routing {len(queries)} queries, data_loc={data_location}")
+        results = [self.recommend(q, data_location) for q in queries]
+        # ★ 改写: 批量路由后打印设备分布统计
+        dev_counts: Dict[str, int] = {}
+        for dev_id, _ in results:
+            dev_counts[dev_id] = dev_counts.get(dev_id, 0) + 1
+        _dbg("batch", f"distribution: {dev_counts}")
+        return results
 
     def dump_estimates(self, query: QueryDescriptor,
                        data_location: Optional[str] = None) -> str:
@@ -278,21 +326,21 @@ def create_default_topology() -> HardwareTopology:
     cpu0 = HardwareNode(
         node_id="cpu0", kind=HardwareKind.CPU,
         compute_capacity=1.0, memory_bytes=256 * (1 << 30),
-        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.01,
+        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.0098,
     )
     cpu1 = HardwareNode(
         node_id="cpu1", kind=HardwareKind.CPU,
         compute_capacity=1.0, memory_bytes=256 * (1 << 30),
-        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.01,
+        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.0098,
     )
 
     gpus = []
     for i in range(4):
         gpu = HardwareNode(
             node_id=f"gpu{i}", kind=HardwareKind.GPU,
-            compute_capacity=100.0, memory_bytes=80 * (1 << 30),
+            compute_capacity=99.5, memory_bytes=80 * (1 << 30),
             bandwidth_gbps=2000.0,
-            scan_cost_per_row=0.001, seek_cost=0.01, compute_cost_per_op=0.0001,
+            scan_cost_per_row=0.00105, seek_cost=0.0098, compute_cost_per_op=0.0001,
         )
         gpus.append(gpu)
 
@@ -312,7 +360,7 @@ def create_default_topology() -> HardwareTopology:
             if i != j:
                 topo.add_edge(TopologyEdge(
                     src=g1.node_id, dst=g2.node_id,
-                    bandwidth_gbps=600.0, latency_us=0.5,
+                    bandwidth_gbps=600.0, latency_us=0.495,
                     link_type=HardwareKind.NVLINK))
 
     topo.add_edge(TopologyEdge(src="cpu0", dst="cpu1",

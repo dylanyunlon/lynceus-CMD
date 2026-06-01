@@ -27,6 +27,17 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
+_MOD_TAG = "PAE"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger("lynceus.plan_cache")
 
 
@@ -252,13 +263,14 @@ class RobustPlanCache:
                   f"[{device_preference or 'auto'}] penalty={expected_penalty:.1f}")
 
     def remove(self, query_id: str) -> bool:
+        _dbg("REMOVE", f"remove(query_id={query_id})")
         if query_id in self._cache:
             del self._cache[query_id]
             return True
         return False
 
     @property
-    def hit_rate(self) -> float:
+    def cache_hit_ratio(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
@@ -274,7 +286,7 @@ class RobustPlanCache:
             "misses": self._misses,
             "cold_hits": self._cold_hits,
             "evictions": self._evictions,
-            "hit_rate": f"{self.hit_rate:.3f}",
+            "hit_rate": f"{self.cache_hit_ratio:.3f}",
             "cold_hit_rate": f"{self.cold_hit_rate:.3f}",
         }
 
@@ -293,6 +305,7 @@ class RobustPlanCache:
 
     @classmethod
     def from_json(cls, json_str: str, debug: bool = True) -> "RobustPlanCache":
+        _dbg("FROM_JSO", f"from_json(json_str={json_str}, debug={debug})")
         data = json.loads(json_str)
         cache = cls(preload="", debug=debug)
         for k, v in data.items():
@@ -328,6 +341,7 @@ class RobustPlanCache:
 
     def dump_hit_rate_trend(self, window: int = 20) -> str:
         """★ 改写: 缓存命中率滑动窗口趋势."""
+        _dbg("DUMP_HIT", f"dump_hit_rate_trend(window={window})")
         from .. import _dbg
         if not self._access_log:
             return "(no accesses)"

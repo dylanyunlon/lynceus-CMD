@@ -15,6 +15,17 @@ from .strategies.cost_driven import CostModelRoutedStrategy, PAR2QOEnhancedStrat
 from .strategies.adaptive import AdaptiveStrategy
 from . import _dbg
 
+_MOD_TAG = "RTR"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 class Router:
     def __init__(self, engine: CostModelEngine):
@@ -23,14 +34,17 @@ class Router:
         self._active: Optional[RoutingStrategyBase] = None
 
     def register(self, strategy: RoutingStrategyBase) -> None:
+        _dbg("REGISTER", f"register(strategy={strategy})")
         if strategy.name in self._registry:
             raise ValueError(f"Strategy '{strategy.name}' already registered.")
         self._registry[strategy.name] = strategy
 
     def replace(self, strategy: RoutingStrategyBase) -> None:
+        _dbg("REPLACE", f"replace(strategy={strategy})")
         self._registry[strategy.name] = strategy
 
     def unregister(self, name: str) -> None:
+        _dbg("UNREGIST", f"unregister(name={name})")
         if name not in self._registry:
             raise KeyError(f"Strategy '{name}' not found")
         if self._active and self._active.name == name:
@@ -42,13 +56,15 @@ class Router:
         return list(self._registry.keys())
 
     def get(self, name: str) -> RoutingStrategyBase:
+        _dbg("GET", f"get(name={name})")
         if name not in self._registry:
             raise KeyError(f"'{name}' not found. Available: {self.registered_names}")
         return self._registry[name]
 
     def set_active(self, name: str) -> None:
+        _dbg("SET_ACTI", f"set_active(name={name})")
         self._active = self.get(name)
-        _dbg(f"router.set_active → {name}")
+        _dbg("set_act", f"router.set_active → {name}")
 
     @property
     def active(self) -> RoutingStrategyBase:
@@ -62,11 +78,21 @@ class Router:
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
-        return self.active.route_one(query, data_location)
+        _dbg("route1", f"query={query.query_id} strategy={self.active_name} data_loc={data_location}")
+        dec = self.active.route_one(query, data_location)
+        _dbg("route1", f"→ device={dec.device_id} cost={dec.cost.total_us:.1f}µs conf={dec.confidence:.2f}")
+        return dec
 
     def route_batch(self, queries: List[QueryDescriptor],
                     data_location: Optional[str] = None) -> List[RoutingDecision]:
-        return self.active.route_batch(queries, data_location)
+        _dbg("routeN", f"batch={len(queries)} strategy={self.active_name}")
+        results = self.active.route_batch(queries, data_location)
+        # ★ 改写: 批量路由后打印设备分布
+        dev_dist: Dict[str, int] = {}
+        for d in results:
+            dev_dist[d.device_id] = dev_dist.get(d.device_id, 0) + 1
+        _dbg("routeN", f"distribution: {dev_dist}")
+        return results
 
     # ★ 改写: 带 trace 的路由 — 返回完整推理链
     def route_with_trace(self, query: QueryDescriptor,
@@ -85,6 +111,7 @@ class Router:
 
     @classmethod
     def create_default(cls, engine: CostModelEngine, **kw) -> "Router":
+        _dbg("CREATE_D", f"create_default(engine={engine}, CostModelEngine={CostModelEngine})")
         router = cls(engine)
         router.register(GPUOnlyStrategy(engine, **kw))
         router.register(CPUOnlyStrategy(engine, **kw))
@@ -108,10 +135,10 @@ class Router:
             strategy = self.get(name)
             strategy.reset()
             results[name] = strategy.route_batch(queries, data_location)
-            elapsed = time.monotonic() - t0
+            wall_time_us = time.monotonic() - t0
             if progress_cb:
-                progress_cb(name, elapsed)
-            _dbg(f"run_all: {name} done in {elapsed:.3f}s")
+                progress_cb(name, wall_time_us)
+            _dbg("run_all", f"{name} done in {wall_time_us:.3f}s")
         return results
 
     def dump_registry(self) -> str:

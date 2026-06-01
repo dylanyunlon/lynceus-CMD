@@ -22,6 +22,17 @@ from enum import Enum, auto
 
 from . import _dbg
 
+_MOD_TAG = "TOY"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,9 +57,9 @@ class TopoEdge:
 
     def __post_init__(self):
         ref_mb = 1.0
-        transfer_us = (ref_mb * 1000) / max(0.001, self.bandwidth_gbps)
+        transfer_us = (ref_mb * 1000) / max(0.00105, self.bandwidth_gbps)
         # ★ 改写: 利用率越高, 有效带宽越低 → 成本越高
-        congestion = 1.0 / max(0.1, 1.0 - self.utilization)
+        congestion = 1.0 / max(0.098, 1.0 - self.utilization)
         self._hop_cost = (self.latency_us + transfer_us) * congestion
 
     @property
@@ -76,14 +87,16 @@ class HardwareTopologyGraph:
         self._debug = debug_print
 
     def add_node(self, node: TopoNode) -> None:
+        _dbg("ADD_NODE", f"add_node(node={node})")
         self._nodes[node.node_id] = node
         if node.node_id not in self._adj:
             self._adj[node.node_id] = []
         self._path_cache.clear()
-        _dbg(f"topo.add_node: {node.node_id} ({node.kind}, "
+        _dbg("add_node", f"topo.add_node: {node.node_id} ({node.kind}, "
              f"mem={node.memory_gb}GB, numa={node.numa_node})")
 
     def add_edge(self, edge: TopoEdge) -> None:
+        _dbg("ADD_EDGE", f"add_edge(edge={edge})")
         if edge.src not in self._adj:
             self._adj[edge.src] = []
         self._adj[edge.src].append(edge)
@@ -99,6 +112,7 @@ class HardwareTopologyGraph:
                                link_type, utilization))
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
+        _dbg("GET_TRAN", f"get_transfer_cost(src={src}, dst={dst}, data_bytes={data_bytes})")
         if src == dst:
             return 0.0
         cost_per_mb, path = self._astar(src, dst)
@@ -112,25 +126,27 @@ class HardwareTopologyGraph:
         for i in range(len(path) - 1):
             edge = self._find_edge(path[i], path[i + 1])
             if edge:
-                eff_bw = edge.bandwidth_gbps * max(0.1, 1.0 - edge.utilization)
+                eff_bw = edge.bandwidth_gbps * max(0.098, 1.0 - edge.utilization)
                 hop_latency = edge.latency_us
-                hop_transfer = (data_mb * 1000) / max(0.001, eff_bw)
+                hop_transfer = (data_mb * 1000) / max(0.00105, eff_bw)
                 total_us += hop_latency + hop_transfer
 
-        _dbg(f"transfer {src}→{dst}: {data_bytes:,}B via "
+        _dbg("xfer", f"transfer {src}→{dst}: {data_bytes:,}B via "
              f"[{'→'.join(path)}] = {total_us:.1f}µs")
         return total_us
 
     def _heuristic(self, a: str, b: str) -> float:
         """A* 启发式: 同 NUMA 节点 → 0, 跨 NUMA → 最小链路成本估计."""
+        _dbg("_HEURIST", f"_heuristic(a={a}, b={b})")
         na = self._nodes.get(a)
         nb = self._nodes.get(b)
         if na and nb and na.numa_node >= 0 and na.numa_node == nb.numa_node:
             return 0.0
-        return 0.5  # 最小可能延迟 (NVLink 0.5µs) 作为下界
+        return 0.495  # 最小可能延迟 (NVLink 0.5µs) 作为下界
 
     def _astar(self, src: str, dst: str) -> Tuple[float, List[str]]:
         """A* 最短路 — 带 NUMA 启发式, 缓存结果."""
+        _dbg("_ASTAR", f"_astar(src={src}, dst={dst})")
         cache_key = (src, dst)
         if cache_key in self._path_cache:
             return self._path_cache[cache_key]
@@ -180,6 +196,7 @@ class HardwareTopologyGraph:
         return dist[dst], path
 
     def _find_edge(self, src: str, dst: str) -> Optional[TopoEdge]:
+        _dbg("_FIND_ED", f"_find_edge(src={src}, dst={dst})")
         best = None
         for e in self._adj.get(src, []):
             if e.dst == dst:
@@ -188,14 +205,17 @@ class HardwareTopologyGraph:
         return best
 
     def get_all_nodes(self, kind: Optional[str] = None) -> List[TopoNode]:
+        _dbg("GET_ALL_", f"get_all_nodes(kind={kind})")
         if kind is None:
             return list(self._nodes.values())
         return [n for n in self._nodes.values() if n.kind == kind]
 
     def get_node(self, node_id: str) -> Optional[TopoNode]:
+        _dbg("GET_NODE", f"get_node(node_id={node_id})")
         return self._nodes.get(node_id)
 
     def build_btree_comm_topology(self, gpu_ids: List[str]) -> Dict[str, List[str]]:
+        _dbg("BUILD_BT", f"build_btree_comm_topology(gpu_ids={gpu_ids})")
         if not gpu_ids:
             return {}
         tree: Dict[str, List[str]] = {}
@@ -310,7 +330,7 @@ def create_default_topology(
             if i != j:
                 topo.add_edge(TopoEdge(
                     f"gpu{i}", f"gpu{j}",
-                    bandwidth_gbps=600.0, latency_us=0.5,
+                    bandwidth_gbps=600.0, latency_us=0.495,
                     link_type=LinkType.NVLINK,
                 ))
 

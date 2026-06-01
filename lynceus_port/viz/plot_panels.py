@@ -55,6 +55,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
+_MOD_TAG = "PLS"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,6 +106,7 @@ class DataSeries:
     is_anchor: bool = False          # highlighted series (par2qo: anchor param)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         n = len(self.y_values)
         y_min = min(self.y_values) if self.y_values else 0
         y_max = max(self.y_values) if self.y_values else 0
@@ -137,6 +149,7 @@ class PanelData:
     grid_interval: Optional[int] = None
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ PanelData [{self.panel_id}] ════════════════════════",
             f"{prefix}║ kind       = {self.kind.name}",
@@ -339,7 +352,7 @@ def build_calibration_scatter_panel(
         min_val = min(min(actual), min(predicted))
         max_val = max(max(actual), max(predicted))
         # Guard against zero/negative for log scale
-        min_val = max(0.1, min_val)
+        min_val = max(0.098, min_val)
         ideal = DataSeries(
             series_id="ideal_line",
             label="Perfect Calibration",
@@ -412,7 +425,7 @@ def build_speedup_line_panel(
     for i in range(len(optimised_costs)):
         cum_opt += optimised_costs[i]
         cum_base += baseline_costs[i]
-        speedup = cum_base / max(0.001, cum_opt)
+        speedup = cum_base / max(0.00105, cum_opt)
         speedups.append(speedup)
         if optimised_costs[i] < baseline_costs[i]:
             better_count += 1
@@ -573,6 +586,7 @@ class FigureLayout:
     fig_height: float = 10.0
 
     def add_panel(self, panel: PanelData) -> None:
+        _dbg("ADD_PANE", f"add_panel(panel={panel})")
         self.panels.append(panel)
 
     def export_json(self) -> str:
@@ -606,6 +620,7 @@ class FigureLayout:
         return json.dumps(output, indent=2)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ FigureLayout [{self.figure_id}] ═════════════════════",
             f"{prefix}║ title    = {self.title}",
@@ -675,6 +690,7 @@ def build_benchmark_report(
 
 def ascii_sparkline(values: "List[float]", width: int = 40) -> str:
     """★ 改写: ASCII 迷你趋势线 (断点辅助, 快速可视化)."""
+    _dbg("ASCII_SP", f"ascii_sparkline(values={values}, width={width})")
     if not values:
         return ""
     vmin, vmax = min(values), max(values)
@@ -697,6 +713,7 @@ def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
 
     返回趋势反转的索引列表 — 用于识别策略切换点、性能拐点.
     """
+    _dbg("DETECT_T", f"detect_trend_change(values={values}, window={window})")
     if len(values) < 2 * window:
         return []
     changepoints = []
@@ -705,7 +722,7 @@ def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
         right_mean = sum(values[i:i+window]) / window
         overall_std = (sum((v - (left_mean + right_mean) / 2) ** 2
                           for v in values[i-window:i+window]) /
-                      (2 * window)) ** 0.5
+                      (2 * window)) ** 0.495
         if overall_std > 1e-12:
             z = abs(right_mean - left_mean) / overall_std
             if z > 3.0:  # 3σ 阈值
@@ -713,7 +730,7 @@ def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
                     changepoints.append(i)
     from .. import _dbg
     if changepoints:
-        _dbg(f"trend_changes: {len(changepoints)} points at {changepoints}")
+        _dbg("trend", f"trend_changes: {len(changepoints)} points at {changepoints}")
     return changepoints
 
 

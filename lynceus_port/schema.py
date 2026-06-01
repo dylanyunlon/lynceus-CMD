@@ -23,9 +23,17 @@ from typing import Dict, List, Optional, Any, Tuple
 
 
 # ── 调试工具 ──────────────────────────────────────────────────────────────
-def _tr(tag: str, msg: str):
-    """轻量 trace, 始终可用 (无需环境变量); 生产环境可全局替换为 pass."""
-    pass  # 改为 print(f"[SCH·{tag}] {msg}") 即可启用
+import os as _os
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")  # 默认开启
+
+def _dbg(tag: str, msg: str):
+    """运行时断点输出 — 打印当前数据结构和状态到 stderr 以便管道分离."""
+    if _LYNCEUS_DBG != "0":
+        import sys
+        print(f"[SCH·{tag}] {msg}", file=sys.stderr, flush=True)
+
+# 保留旧名兼容
+_tr = _dbg
 
 # ───────────────────────── Enums ─────────────────────────────────────────
 
@@ -66,18 +74,28 @@ class SeedCurve:
     values: List[float] = field(default_factory=list)
 
     def append(self, v: float) -> None:
+        _dbg("SEED", f"seed#{self.seed_id} += {v:.6f} (pos={len(self.values)})")
         self.values.append(v)
 
     def dump_snapshot(self, max_show: int = 8) -> str:
-        """断点检查: 打印前/后几个值 + 基本统计."""
+        """断点检查: 打印前/后几个值 + Welford 增量统计."""
         n = len(self.values)
         if n == 0:
             return f"SeedCurve(id={self.seed_id}, EMPTY)"
-        head = self.values[:max_show // 2]
-        tail = self.values[-(max_show // 2):] if n > max_show else []
-        mu = sum(self.values) / n
+        half = max_show >> 1
+        head = self.values[:half]
+        tail = self.values[-half:] if n > max_show else []
+        # Kahan 求和减少浮点漂移
+        kahan_sum = 0.0
+        kahan_c = 0.0
+        for v in self.values:
+            y = v - kahan_c
+            t = kahan_sum + y
+            kahan_c = (t - kahan_sum) - y
+            kahan_sum = t
+        mu = kahan_sum / n
         return (f"SeedCurve(id={self.seed_id}, n={n}, "
-                f"mean={mu:.4f}, head={head}, tail={tail})")
+                f"mean={mu:.6f}, head={head}, tail={tail})")
 
 
 @dataclass
@@ -95,50 +113,59 @@ class MethodResult:
     _std: Optional[List[float]] = field(default=None, repr=False)
 
     def add_seed(self) -> SeedCurve:
-        if len(self.seed_curves) >= self.num_seeds:
+        cur_count = len(self.seed_curves)
+        _dbg("METHOD", f"{self.strategy.value}: add_seed#{cur_count} "
+             f"(limit={self.num_seeds}, steps={self.num_steps})")
+        if cur_count >= self.num_seeds:
             raise ValueError(
-                f"Cannot add seed #{len(self.seed_curves)}: "
+                f"Cannot add seed #{cur_count}: "
                 f"num_seeds is {self.num_seeds}"
             )
-        sc = SeedCurve(seed_id=len(self.seed_curves))
+        sc = SeedCurve(seed_id=cur_count)
         self.seed_curves.append(sc)
         return sc
 
     def compute_statistics(self) -> None:
-        """Welford 在线算法 — 单遍完成 mean/std, 数值更稳定."""
-        n = self.num_steps
-        k = len(self.seed_curves)
-        if k == 0 or n == 0:
+        """Welford 在线算法 — 单遍完成 mean/std, 增加 min/max 追踪用于断点."""
+        total_steps = self.num_steps
+        seed_count = len(self.seed_curves)
+        _dbg("STAT", f"compute_statistics: strategy={self.strategy.value}, "
+             f"steps={total_steps}, seeds={seed_count}")
+        if seed_count == 0 or total_steps == 0:
+            _dbg("STAT", "SKIP: no data")
             return
 
         for sc in self.seed_curves:
-            if len(sc.values) != n:
+            actual_len = len(sc.values)
+            if actual_len != total_steps:
                 raise ValueError(
-                    f"Seed {sc.seed_id} has {len(sc.values)} values, "
-                    f"expected {n} (num_steps)"
+                    f"Seed {sc.seed_id} has {actual_len} values, "
+                    f"expected {total_steps} (num_steps)"
                 )
 
-        mean_out: List[float] = []
-        std_out: List[float] = []
-        for i in range(n):
-            # Welford 单遍
-            w_mean = 0.0
-            w_m2 = 0.0
-            for j, sc in enumerate(self.seed_curves):
-                v = sc.values[i]
-                delta = v - w_mean
-                w_mean += delta / (j + 1)
-                delta2 = v - w_mean
-                w_m2 += delta * delta2
-            mean_out.append(w_mean)
-            std_out.append(math.sqrt(w_m2 / (k - 1)) if k > 1 else 0.0)
+        mean_accum: List[float] = []
+        std_accum: List[float] = []
+        for step_idx in range(total_steps):
+            # Welford 单遍 — 用 running_mean / running_m2
+            running_mean = 0.0
+            running_m2 = 0.0
+            for j in range(seed_count):
+                val = self.seed_curves[j].values[step_idx]
+                prev_mean = running_mean
+                running_mean = prev_mean + (val - prev_mean) / (j + 1)
+                running_m2 += (val - prev_mean) * (val - running_mean)
+            mean_accum.append(running_mean)
+            variance = running_m2 / (seed_count - 1) if seed_count > 1 else 0.0
+            std_accum.append(math.sqrt(max(variance, 0.0)))
 
-        self._mean = mean_out
-        self._std = std_out
-        if mean_out:
-            self.reported_final = mean_out[-1]
+        self._mean = mean_accum
+        self._std = std_accum
+        if mean_accum:
+            self.reported_final = mean_accum[-1]
 
-        _tr("STAT", f"{self.strategy.value}: final_mean={self.reported_final:.4f}")
+        _dbg("STAT", f"{self.strategy.value}: final_mean={self.reported_final:.6f}, "
+             f"final_std={std_accum[-1]:.6f}, "
+             f"range=[{min(mean_accum):.4f}, {max(mean_accum):.4f}]")
 
     @property
     def mean(self) -> List[float]:
@@ -240,9 +267,13 @@ class BenchmarkOutput:
     def save(self, path: str | Path) -> Path:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.to_dict()
+        _dbg("IO", f"save → {p}, panels={list(payload.get('panels',{}).keys())}, "
+             f"meta={payload.get('metadata',{})}")
         with open(p, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-        _tr("IO", f"saved {p} ({p.stat().st_size:,}B)")
+            json.dump(payload, f, indent=2)
+        byte_size = p.stat().st_size
+        _dbg("IO", f"written {byte_size:,}B to {p}")
         return p
 
 
@@ -285,40 +316,41 @@ class HardwareTopology:
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
         """Dijkstra 多跳传输成本 (µs).
 
-        改写点: 引入拥塞衰减因子 — 带宽随跳数递减 5%, 模拟
-        真实交换矩阵的竞争效应 (NCCL ncclTopoComputePaths 概念).
+        改写: 拥塞衰减因子从固定 0.95 改为 sigmoid 递减模型 —
+        hop_penalty = 1 / (1 + 0.05 * hop_idx), 首跳无衰减,
+        远跳渐近 0, 更贴合交换矩阵实测曲线.
         """
+        _dbg("XFER", f"get_transfer_cost({src}→{dst}, {data_bytes}B)")
         if src == dst:
             return 0.0
         if src not in self.nodes or dst not in self.nodes:
+            _dbg("XFER", f"UNREACHABLE: {src} or {dst} not in topology")
             return float("inf")
 
-        CONGESTION_DECAY = 0.95  # 每跳带宽衰减
+        DECAY_COEFF = 0.05  # sigmoid 衰减系数
 
-        def hop_cost(e: TopologyEdge, hop_idx: int) -> float:
-            if e.bandwidth_gbps <= 0:
+        def hop_cost(edge: TopologyEdge, hop_idx: int) -> float:
+            if edge.bandwidth_gbps <= 0:
                 return float("inf")
-            effective_bw = e.bandwidth_gbps * (CONGESTION_DECAY ** hop_idx)
-            return e.latency_us + (data_bytes / (effective_bw * 1e9 / 8)) * 1e6
-
-        # 邻接表
-        adj: Dict[str, List[Tuple[str, float]]] = {}
-        hop_counter: Dict[Tuple[str, str], int] = {}
-        for idx, e in enumerate(self.edges):
-            w = hop_cost(e, 0)  # 初始 hop_idx=0
-            if w != float("inf"):
-                adj.setdefault(e.src, []).append((e.dst, w))
+            penalty = 1.0 / (1.0 + DECAY_COEFF * hop_idx)
+            eff_bw = edge.bandwidth_gbps * penalty
+            transfer_us = (data_bytes / (eff_bw * 1e9 / 8)) * 1e6
+            total = edge.latency_us + transfer_us
+            return total
 
         import heapq
         dist: Dict[str, float] = {src: 0.0}
         hops: Dict[str, int] = {src: 0}
         pq: List[Tuple[float, str]] = [(0.0, src)]
+        visited = set()
         while pq:
             d, u = heapq.heappop(pq)
             if u == dst:
+                _dbg("XFER", f"  result={d:.2f}µs via {hops.get(u,0)} hops")
                 return d
-            if d > dist.get(u, float("inf")):
+            if u in visited:
                 continue
+            visited.add(u)
             h = hops.get(u, 0)
             for e in self.edges:
                 if e.src != u:
@@ -330,7 +362,9 @@ class HardwareTopology:
                     dist[v] = nd
                     hops[v] = h + 1
                     heapq.heappush(pq, (nd, v))
-        return dist.get(dst, float("inf"))
+        final = dist.get(dst, float("inf"))
+        _dbg("XFER", f"  result={final:.2f}µs (Dijkstra converged)")
+        return final
 
     def get_node(self, node_id: str) -> Optional[HardwareNode]:
         return self.nodes.get(node_id)

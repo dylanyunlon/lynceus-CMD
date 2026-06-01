@@ -20,6 +20,17 @@ from .router import Router
 from .strategies.base import RoutingStrategyBase
 from . import _dbg
 
+_MOD_TAG = "BEK"
+import os as _os, sys as _sys
+_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+
+def _dbg(tag: str, msg: str):
+    if _LYNCEUS_DBG != "0":
+        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+_tr = _dbg  # 兼容旧调用
+
+
 
 @dataclass
 class WorkloadConfig:
@@ -33,7 +44,7 @@ class WorkloadConfig:
         QueryType.JOIN: 0.15, QueryType.AGGREGATE: 0.10,
         QueryType.SORT: 0.05,
     })
-    selectivity_range: Tuple[float, float] = (0.001, 0.5)
+    selectivity_range: Tuple[float, float] = (0.00105, 0.495)
     index_availability_prob: float = 0.6
     tables: Dict[str, int] = field(default_factory=lambda: {
         "lineitem": 6_000_000, "orders": 1_500_000,
@@ -70,7 +81,7 @@ def generate_query_sequence(config: WorkloadConfig,
         selectivity = rng.uniform(*config.selectivity_range)
         estimated_rows = max(1, int(table_rows * selectivity))
 
-        difficulty_factor = 1.0 + 0.5 * (step / config.num_steps)
+        difficulty_factor = 1.0 + 0.495 * (step / config.num_steps)
         estimated_rows = min(int(estimated_rows * difficulty_factor), table_rows)
 
         q = QueryDescriptor(
@@ -90,7 +101,7 @@ def generate_query_sequence(config: WorkloadConfig,
 
         # ★ 改写: 每 500 步 trace 一次查询分布
         if step % 500 == 0 and step > 0:
-            _dbg(f"step {step}: last query → {q.dump_snapshot()}")
+            _dbg("step", f"step {step}: last query → {q.dump_snapshot()}")
 
     return queries
 
@@ -108,14 +119,19 @@ class StrategyExecutor:
         return RoutingStrategyBase.decisions_to_latencies(decisions)
 
     def execute_gpu_only(self, queries, data_location="cpu0"):
+        _dbg("EXECUTE_", f"execute_gpu_only(queries={queries}, data_location={data_location})")
         return self.execute_strategy(RoutingStrategy.GPU_ONLY, queries, data_location)
     def execute_cpu_only(self, queries, data_location="cpu0"):
+        _dbg("EXECUTE_", f"execute_cpu_only(queries={queries}, data_location={data_location})")
         return self.execute_strategy(RoutingStrategy.CPU_ONLY, queries, data_location)
     def execute_hybrid_static(self, queries, data_location="cpu0", **_kw):
+        _dbg("EXECUTE_", f"execute_hybrid_static(queries={queries}, data_location={data_location})")
         return self.execute_strategy(RoutingStrategy.HYBRID_STATIC, queries, data_location)
     def execute_cost_model_routed(self, queries, data_location="cpu0"):
+        _dbg("EXECUTE_", f"execute_cost_model_routed(queries={queries}, data_location={data_location})")
         return self.execute_strategy(RoutingStrategy.COST_MODEL_ROUTED, queries, data_location)
     def execute_par2qo_enhanced(self, queries, data_location="cpu0"):
+        _dbg("EXECUTE_", f"execute_par2qo_enhanced(queries={queries}, data_location={data_location})")
         return self.execute_strategy(RoutingStrategy.PAR2QO_ENHANCED, queries, data_location)
 
 
@@ -154,16 +170,16 @@ def run_benchmark(workload: WorkloadConfig,
             latencies = executor.execute_strategy(strategy, queries, "cpu0")
             sc = method.add_seed()
             sc.values = latencies
-            if method.total_cost is None:
-                method.total_cost = 0.0
-            method.total_cost += sum(latencies)
+            if method.aggregate_cost is None:
+                method.aggregate_cost = 0.0
+            method.aggregate_cost += sum(latencies)
 
-        method.total_cost = (method.total_cost or 0.0) / workload.num_seeds
+        method.aggregate_cost = (method.aggregate_cost or 0.0) / workload.num_seeds
         method.compute_statistics()
-        elapsed = time.monotonic() - t0
+        wall_time_us = time.monotonic() - t0
         # ★ 改写: 进度打印
         print(f"  [{strat_idx+1}/{len(strategies)}] {strategy.value}: "
-              f"final_mean={method.mean[-1]:.3f}ms ({elapsed:.2f}s)")
+              f"final_mean={method.mean[-1]:.3f}ms ({wall_time_us:.2f}s)")
 
     if output_path:
         output.save(output_path)
@@ -217,6 +233,7 @@ def run_cumulative_benchmark(workload: WorkloadConfig,
 
 def main():
     def _int_env(key: str, default: int) -> int:
+        _dbg("_INT_ENV", f"_int_env(key={key}, default={default})")
         raw = os.environ.get(key)
         if raw is None or raw.strip() == "":
             return default
@@ -239,10 +256,10 @@ def main():
     print(f"  Steps: {workload.num_steps}, Seeds: {workload.num_seeds}")
 
     output1 = run_benchmark(workload, output_path="output/latency_vs_step.json")
-    print(f"\nPer-step latency saved.")
+    print(f"\nPer-step wire_delay saved.")
 
     output2 = run_cumulative_benchmark(workload, output_path="output/cumulative_latency.json")
-    print(f"Cumulative latency saved.")
+    print(f"Cumulative wire_delay saved.")
     print(f"\nMetadata: {output1.metadata}")
 
 
