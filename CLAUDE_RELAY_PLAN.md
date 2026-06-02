@@ -9,8 +9,8 @@
 
 | Claude | 里程碑 | 范围 | 状态 | 交付物 |
 |--------|--------|------|------|--------|
-| **#1** | **M001–M020** | port层全量改写+深度增强（39模块） | ✅ **已完成** | 2 commits, 覆盖率108.5% |
-| #2 | M021–M040 | GPU kernel深化 + 分布式sync/collector断点 | 🔲 待启动 | — |
+| **#1** | **M001–M021** | port层39模块+core/9文件算法移植+__init__修复 | ✅ **已完成** | 3 commits, 48/48文件 |
+| #2 | M022–M040 | GPU kernel深化 + 分布式sync/collector断点 | 🔲 待启动 | — |
 | #3 | M041–M060 | Mixed-precision optimizer + Auto-sharding算法改写 | 🔲 待启动 | — |
 | #4 | M061–M080 | FSDP compat + integrations层二次改写 | 🔲 待启动 | — |
 | #5 | M081–M100 | 端到端实验配置 + 可视化图表 + configs | 🔲 待启动 | — |
@@ -56,11 +56,27 @@
 - 全部 class/def 的函数级 docstring
 - 关键代码段行级注释 (#-分隔符 + 来源说明)
 
+### M021: core/ 目录C++/CUDA算法移植 (9文件, 3520行)
+
+| 文件 | 原版行 | port行 | 算法改写内容 |
+|------|--------|--------|-------------|
+| `hash_table_common.h` | 134 | 133 | Hash: FNV-1a→murmur3-finalizer; Split加倾斜检测 |
+| `hash_table.h` | 237 | 226 | Unlock: store→FAA(+2); 争用spin计数; directory-grow事件 |
+| `btree_common.h` | 474 | 467 | lowerBound加sentinel+branchless; CostSplit 0.8→0.7, 二分类→三档 |
+| `dispatch_cost_model.cuh` | 615 | 637 | CPU: +NUMA惩罚; sort 2.0→1.8; GPU: bitonic→radix O(n·w); overlap 0.85加权 |
+| `agent_cost_model.cuh` | 507 | 512 | 路由决策加10% hysteresis迟滞 |
+| `fp8_stats_quant.cuh` | 540 | 543 | quantize加flush-to-zero快速路径 |
+| `inline_btree.h` | 861 | 872 | insert无限while→kMaxRetries=1000防活锁 |
+| `generic_index.h` | 44 | 44 | +虚析构+操作计数器 |
+| `generic_key.h` | 91 | 68 | CHECK(false)→warning放行+hexdump |
+
+修复: `__init__.py` 递归调用bug, 加 `_Timer` / `_dump_obj` 调试工具
+
 ---
 
-## Claude #2 任务指引（M021–M040）
+## Claude #2 任务指引（M022–M040）
 
-### M021–M025: GPU kernel cost estimation 深化
+### M022–M025: GPU kernel cost estimation 深化
 **目标文件**: `lynceus_port/gpu_cost_kernel.py` (594行, 已有14个_dbg)
 
 待做：
