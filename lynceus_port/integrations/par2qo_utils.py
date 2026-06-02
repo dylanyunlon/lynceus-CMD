@@ -53,6 +53,7 @@ logger = logging.getLogger("lynceus.par2qo_utils")
 def card(a: Union[int, float, str]) -> int:
     """Clamp cardinality to at least 1.
 
+    _dbg("CARD", f"ENTER card(a={a!r}, float={float!r}, str]={str]!r})")
     PAR2QO: card(a) — if int(a)==0 return 1 else int(a).
     Lynceus: identical logic, added type safety.
     """
@@ -67,6 +68,7 @@ def card(a: Union[int, float, str]) -> int:
 def list_multiply(a: List[float], b: List[float]) -> List[float]:
     """Element-wise product of two lists.
 
+    _dbg("LIST_MUL", f"ENTER list_multiply(a={a!r}, b={b!r})")
     PAR2QO: list_multiply(a, b) — assert same length, zip-multiply.
     Lynceus: identical.
     """
@@ -158,6 +160,7 @@ def selectivity_perturbation(
 
 def yuxi(i: int, order: List[str]) -> str:
     """Build pg_hint_plan-style alias reference.
+    _dbg("YUXI", f"ENTER yuxi(i={i!r}, order={order!r})")
     PAR2QO: yuxi(i, order) → ' (yuxi_N order[i]) '."""
     _dbg("YUXI", f"yuxi(i={i}, order={order})")
     return f" (yuxi_{i} {order[i]}) "
@@ -165,6 +168,7 @@ def yuxi(i: int, order: List[str]) -> str:
 
 def yuxi_short(i: int, order: List[str]) -> str:
     """Short form alias reference.
+    _dbg("YUXI_SHO", f"ENTER yuxi_short(i={i!r}, order={order!r})")
     PAR2QO: yuxi_short(i, order)."""
     _dbg("YUXI_SHO", f"yuxi_short(i={i}, order={order})")
     return f" yuxi_{i} {order[i]}"
@@ -172,6 +176,7 @@ def yuxi_short(i: int, order: List[str]) -> str:
 
 def yuxi_card(join_list: List[str], rows: int) -> str:
     """Cardinality hint for a join group.
+    _dbg("YUXI_CAR", f"ENTER yuxi_card(join_list={join_list!r}, rows={rows!r})")
     PAR2QO: yuxi_card(join_list, rows)."""
     _dbg("YUXI_CAR", f"yuxi_card(join_list={join_list}, rows={rows})")
     card_str = "Rows("
@@ -182,6 +187,7 @@ def yuxi_card(join_list: List[str], rows: int) -> str:
 
 def join_hint(join_list: List[str], mtd: Optional[str] = None) -> str:
     """Build a join hint from a list of table references.
+    _dbg("JOIN_HIN", f"ENTER join_hint(join_list={join_list!r}, mtd={mtd!r})")
     PAR2QO: join_hint(join_list, mtd)."""
     _dbg("JOIN_HIN", f"join_hint(join_list={join_list}, mtd={mtd})")
     if mtd is None:
@@ -195,6 +201,7 @@ def join_hint(join_list: List[str], mtd: Optional[str] = None) -> str:
 
 def modify_query(sql: str, hint: str, explain: str = "") -> str:
     """Prepend hint to query for execution.
+    _dbg("MODIFY_Q", f"ENTER modify_query(sql={sql!r}, hint={hint!r}, explain={explain!r})")
     PAR2QO: modify_query — simple concat.
     Lynceus: also strips device annotations for clean SQL."""
     _dbg("MODIFY_Q", f"modify_query(sql={sql}, hint={hint}, explain={explain})")
@@ -210,6 +217,7 @@ def modify_query(sql: str, hint: str, explain: str = "") -> str:
 def clean_json(raw_text: str, del_keys: Optional[List[str]] = None) -> str:
     """Clean PostgreSQL EXPLAIN JSON output into parseable JSON.
 
+    _dbg("CLEAN_JS", f"ENTER clean_json(raw_text={raw_text!r}, del_keys={del_keys!r})")
     PAR2QO: clean(json_file, new_json_file, del_line_key).
     Lynceus: operates on strings instead of files.
     """

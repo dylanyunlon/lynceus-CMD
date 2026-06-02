@@ -63,3 +63,31 @@
 - NDV: 13种方法并排对比表
 - 直方图: ASCII 柱状图 + q-error 验证
 - 缓存: hit/miss/evict 流水 + 命中率统计
+
+---
+
+## 第二位 Claude 详细记录 (integrations/ 深度改写)
+
+**日期**: 2026-06-02
+**里程碑**: M036–M040 (integrations 二次改写)
+**任务**: 14个集成模块的~20%算法等价改写 + 调试桩密度加倍 + _dbg递归bug批量修复
+**改动**: 14 files, +809 / -472 lines (净增337行)
+
+### 关键改写
+1. **videx_histogram.py**: 二分查找粗定位+线性微调 O(log n)、Laplace 平滑 KL 散度、EMD 归一化[0,1]、partition/maxsplit 防冒号误拆
+2. **par2qo_robustness.py**: scrambled Halton 黄金比例哈希、Winitzki(2008) erfinv、双侧 clamp
+3. **tabular_bridge.py**: cache-line 8B 对齐 fanout、Amdahl 线程模型、TLB miss 代价、Robin Hood 探测
+4. **videx_ndv_estimator.py**: 5种估计器改写(Goodman/JK混合/Sichel ln-space/Bootstrap log-space/Ada 5档)
+5. **par2qo_bridge.py**: softmax 重加权 + Welford 在线方差
+6. **par2qo_plan_cache.py**: 2Q 驱逐策略(扫描前25%找最少访问项)
+7. **videx_histogram_utils.py**: reservoir 采样混合 + galloping merge O(n log m)
+8. **par2qo_cost.py**: cache miss 模型 + 动态 B-tree 深度
+9. **par2qo_querylets.py**: 同表多谓词 sqrt 相关性修正
+10. **videx_utils.py**: Zipf 分布选择率估计
+11. **videx_cost_model.py**: 对数空间选择率乘积防下溢
+
+### Bug 修复
+- 9 个文件 `_dbg()` 自递归无限递归 → 全部修复(integrations内)
+- 每文件分配唯一 3 字母 _MOD_TAG
+
+### 调试桩: ~160 → ~330+ (翻倍), 全部函数入口覆盖

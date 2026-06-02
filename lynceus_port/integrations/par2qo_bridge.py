@@ -74,14 +74,17 @@ class QueryPlan:
 
     @property
     def min_cost(self) -> float:
+        _dbg("MIN_COST", "ENTER min_cost()")
         return min(self.cpu_cost_us, self.gpu_cost_us)
 
     @property
     def best_device(self) -> str:
+        _dbg("BEST_DEV", "ENTER best_device()")
         return "gpu" if self.gpu_cost_us < self.cpu_cost_us else "cpu"
 
     @property
     def gpu_speedup(self) -> float:
+        _dbg("GPU_SPEE", "ENTER gpu_speedup()")
         return self.cpu_cost_us / max(1e-9, self.gpu_cost_us)
 
 
@@ -109,6 +112,7 @@ class SelectivitySample:
 
     @property
     def num_predicates(self) -> int:
+        _dbg("NUM_PRED", "ENTER num_predicates()")
         return len(self.selectivities)
 
 
@@ -164,6 +168,7 @@ class HeterogeneousPlanDiagram:
     def collect_features(self, selectivity_ranges: List[Tuple[float, float]]):
         """Sample the selectivity space.
 
+        _dbg("COLLECT_", f"ENTER collect_features(selectivity_ranges={selectivity_ranges!r}, float]]={float]]!r})")
         PAR2QO samples N points from the joint selectivity distribution.
         Each sample represents a possible runtime scenario for the
         parametric query's predicates.
@@ -203,6 +208,7 @@ class HeterogeneousPlanDiagram:
     def collect_plan_cost(self, cost_fn=None):
         """Evaluate CPU and GPU cost for each plan at each sample.
 
+        _dbg("COLLECT_", f"ENTER collect_plan_cost(cost_fn={cost_fn!r})")
         For each (sample, plan) pair, computes:
           cpu_cost_matrix[sample][plan] — CPU execution cost
           gpu_cost_matrix[sample][plan] — GPU execution cost
@@ -250,6 +256,7 @@ class HeterogeneousPlanDiagram:
     def collect_opt_cost_and_penalty(self):
         """Compute optimal costs and per-plan penalties.
 
+        _dbg("COLLECT_", "ENTER collect_opt_cost_and_penalty()")
         PAR2QO penalty model:
           penalty[s][p] = (cost[s][p] - opt_cost[s]) / opt_cost[s]
         where opt_cost[s] = min over all plans of cost[s][p].
@@ -280,25 +287,32 @@ class HeterogeneousPlanDiagram:
     # -------------------------------------------------------------------
 
     def cal_reweight_probability(self):
-        """Compute reweighted probabilities for each sample.
-
-        PAR2QO's Bayesian reweighting (simplified):
-          P(sample) ∝ 1 / (1 + max_penalty_at_sample)
-
-        Samples where all plans are near-optimal get higher weight;
-        samples in "danger zones" (high penalty) get lower weight.
-        """
+        """计算贝叶斯重加权概率.
+        改写: 用 softmax(−penalty) 替代 1/(1+penalty) — 更平滑的概率分布,
+        对高 penalty 样本惩罚更强."""
         n_samples = len(self.samples)
         if n_samples == 0:
             return
 
-        raw_weights = []
+        _dbg("REWEIGHT", f"computing reweight for {n_samples} samples")
+        # 改写: softmax 方案 — score_s = -max_penalty_s, P(s) = exp(score_s) / Z
+        scores = []
         for s_idx in range(n_samples):
             max_penalty = max(self.penalty_collection[s_idx]) if self.penalty_collection[s_idx] else 0
-            raw_weights.append(1.0 / (1.0 + max_penalty))
+            scores.append(-max_penalty)
 
-        total = sum(raw_weights)
-        self.joint_probabilities = [w / total for w in raw_weights] if total > 0 else [1.0 / n_samples] * n_samples
+        # 数值稳定的 softmax: 减去最大值
+        max_score = max(scores) if scores else 0.0
+        exp_scores = [math.exp(s - max_score) for s in scores]
+        total = sum(exp_scores)
+        if total > 0:
+            self.joint_probabilities = [e / total for e in exp_scores]
+        else:
+            self.joint_probabilities = [1.0 / n_samples] * n_samples
+
+        _dbg("REWEIGHT", f"prob range: [{min(self.joint_probabilities):.4f}, "
+             f"{max(self.joint_probabilities):.4f}], "
+             f"entropy={-sum(p * math.log(max(p, 1e-15)) for p in self.joint_probabilities):.3f}")
 
     # -------------------------------------------------------------------
     # select_robust_plan — the final PAR2QO selection algorithm
@@ -310,12 +324,10 @@ class HeterogeneousPlanDiagram:
     # -------------------------------------------------------------------
 
     def select_robust_plan(self) -> Tuple[Optional[QueryPlan], str, float]:
-        """Select the most robust plan with device recommendation.
-
-        Returns:
-            (plan, device, expected_cost) — the penalty-aware optimal choice.
-        """
+        """选择最鲁棒的计划.
+        改写: 加 Welford 在线方差计算——除了期望代价,还输出每个计划的代价方差."""
         if not self.plan_list or not self.samples:
+            _dbg("SELECT", "no plans/samples, returning default")
             return None, "cpu", 0.0
 
         n_samples = len(self.samples)
@@ -328,22 +340,34 @@ class HeterogeneousPlanDiagram:
         best_score = float('inf')
 
         for p_idx in range(n_plans):
-            score = 0.0
+            # 改写: Welford 在线计算加权均值和方差
+            w_sum = 0.0
+            mean = 0.0
+            m2 = 0.0
             for s_idx in range(n_samples):
                 prob = self.joint_probabilities[s_idx]
                 cost = self.cost_collection[s_idx][p_idx]
                 penalty = self.penalty_collection[s_idx][p_idx]
-                score += prob * (cost + self.robustness_weight * penalty * cost)
+                val = cost + self.robustness_weight * penalty * cost
+                w_sum += prob
+                old_mean = mean
+                mean += (prob / max(w_sum, 1e-15)) * (val - old_mean)
+                m2 += prob * (val - old_mean) * (val - mean)
+            score = mean  # 等价于原始加权和
+            variance = m2 / max(w_sum, 1e-15)
+            _dbg("SELECT", f"plan[{p_idx}]: score={score:.2f}, var={variance:.2f}")
             if score < best_score:
                 best_score = score
                 best_plan_idx = p_idx
 
-        # Determine device recommendation
+        # 设备投票
         gpu_votes = sum(
             1 for s_idx in range(n_samples)
             if self.device_decisions[s_idx][best_plan_idx] == "gpu"
         )
         device = "gpu" if gpu_votes > n_samples / 2 else "cpu"
+        _dbg("SELECT", f"best=plan[{best_plan_idx}], device={device}, "
+             f"score={best_score:.2f}, gpu_votes={gpu_votes}/{n_samples}")
 
         return self.plan_list[best_plan_idx], device, best_score
 
@@ -422,6 +446,7 @@ class PlanCostHistogram:
 
     def dump_routing_audit(self) -> str:
         """★ 改写: 路由决策审计日志 — 每个查询的决策理由链."""
+        _dbg("DUMP_ROU", "ENTER dump_routing_audit()")
         from .. import _dbg
         lines = ["┌── PAR2QO Bridge Routing Audit ──"]
         for i, decision in enumerate(self._decisions[-20:]):

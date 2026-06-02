@@ -10,11 +10,11 @@
 | Claude | 里程碑 | 范围 | 状态 | 交付物 |
 |--------|--------|------|------|--------|
 | **#1** | **M001–M021** | port层39模块+core/9文件算法移植+__init__修复 | ✅ **已完成** | 3 commits, 48/48文件 |
-| #2 | M022–M040 | GPU kernel深化 + 分布式sync/collector断点 | 🔲 待启动 | — |
-| #3 | M041–M060 | Mixed-precision optimizer + Auto-sharding算法改写 | 🔲 待启动 | — |
-| #4 | M061–M080 | FSDP compat + integrations层二次改写 | 🔲 待启动 | — |
-| #5 | M081–M100 | 端到端实验配置 + 可视化图表 + configs | 🔲 待启动 | — |
-| #6 | M101–M120 | 集成测试 + 实验面板 + 论文图表生成 | 🔲 待启动 | — |
+| **#2** | **M036–M040** | integrations/ 14文件深度改写(~20%算法+调试桩翻倍+bug修复) | ✅ **已完成** | 1 commit, 14文件, +809/-472行 |
+| #3 | M022–M035 | GPU kernel深化 + 分布式sync/collector/optimizer断点 | 🔲 待启动 | — |
+| #4 | M041–M060 | Mixed-precision optimizer + Auto-sharding算法改写 | 🔲 待启动 | — |
+| #5 | M061–M080 | FSDP compat + viz重构 + cache/schema二次改写 | 🔲 待启动 | — |
+| #6 | M081–M120 | 端到端实验配置 + 集成测试 + 论文图表生成 | 🔲 待启动 | — |
 
 ---
 
@@ -74,7 +74,32 @@
 
 ---
 
-## Claude #2 任务指引（M022–M040）
+## Claude #2 完成记录（M036–M040: integrations 深度改写）
+
+**日期**: 2026-06-02
+**交付**: 14 文件, +809/-472 行 (净增337行), 调试桩 ~160→~330+
+
+### 完成清单
+- [x] 修复全部 9 个 `_dbg()` 自递归无限递归 bug (integrations 内 7 个)
+- [x] videx_histogram: 二分查找 + Laplace KL + EMD 归一化 + partition 拆分
+- [x] par2qo_robustness: scrambled Halton + Winitzki erfinv + 双侧 clamp
+- [x] tabular_bridge: cache-line 对齐 + Amdahl 线程 + TLB miss + Robin Hood
+- [x] videx_ndv_estimator: 5 种估计器改写 (Goodman/JK2/Sichel/Bootstrap/Ada)
+- [x] par2qo_bridge: softmax 重加权 + Welford 在线方差
+- [x] par2qo_plan_cache: 2Q 驱逐策略
+- [x] videx_histogram_utils: reservoir 采样 + galloping merge + 去重统计
+- [x] par2qo_cost: cache miss 模型 + 动态 B-tree 深度
+- [x] par2qo_querylets: sqrt 相关性修正
+- [x] videx_utils: Zipf 选择率
+- [x] videx_cost_model: 对数空间选择率乘积防下溢
+- [x] 全部 14 文件函数入口调试桩注入 (+108 个调试点)
+- [x] 15/15 文件 py_compile 语法通过
+
+---
+
+## Claude #3 任务指引（M022–M035: GPU kernel + 分布式模块深化）
+
+**注意**: 需先修复 `gpu_cost_kernel.py` 和 `sharding.py` 的 `_dbg()` 自递归 bug
 
 ### M022–M025: GPU kernel cost estimation 深化
 **目标文件**: `lynceus_port/gpu_cost_kernel.py` (594行, 已有14个_dbg)

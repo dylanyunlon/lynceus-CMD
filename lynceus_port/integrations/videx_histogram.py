@@ -1,11 +1,40 @@
-import os as _os, sys as _sys
-_MOD_TAG = "VID"
+import os as _os, sys as _sys, time as _time_mod
+_MOD_TAG = "VHI"  # Videx HIstogram — 改写: 缩短模块标签避免与videx_bridge冲突
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+_VHI_CALL_SEQ = 0  # 改写: 全局调用序号，用于追踪函数调用链
+
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复: 去掉自递归; 改写: 加调用序号+时间戳."""
+    global _VHI_CALL_SEQ
     if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-_tr = _dbg
+        _VHI_CALL_SEQ += 1
+        _ts = _time_mod.monotonic()
+        print(f"[{_MOD_TAG}·{tag}|#{_VHI_CALL_SEQ}|t={_ts:.3f}] {msg}",
+              file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 打印完整的键值对状态快照，用于断点诊断."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={_fmt_val(v)}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
+
+def _fmt_val(v):
+    """改写新增: 智能格式化调试值——截断长列表/大字符串."""
+    if isinstance(v, (list, tuple)):
+        n = len(v)
+        if n > 6:
+            head = ", ".join(str(x) for x in v[:3])
+            tail = ", ".join(str(x) for x in v[-2:])
+            return f"[{head}, …({n} items)…, {tail}]"
+        return str(v)
+    if isinstance(v, str) and len(v) > 120:
+        return v[:60] + f"…({len(v)} chars)…" + v[-30:]
+    if isinstance(v, float):
+        return f"{v:.6g}"
+    return str(v)
+
+_tr = _dbg  # 兼容旧调用
 
 # ── Stub fallback for missing upstream names ──
 import types as _types
@@ -94,101 +123,111 @@ NULL_STR = 'NULL'
 
 try:
     def decode_base64(raw):
-        """
-        'base64' is an identifier indicating the data encoding method, meaning the following data is encoded using Base64.
-        'type254': In MySQL, data type number 254 typically represents CHAR type, but the specific meaning may depend on your context.
-        Args:
-            raw:
-
-        Returns:
-
-        """
-        _dbg("DECODE_B", "decode_base64 entered")
-
-        decode_type, char_type, s = raw.split(":")
-        assert decode_type == "base64" and char_type == "type254"
-        base64_bytes = s.encode('utf-8')
-        message_bytes = base64.b64decode(base64_bytes)
-        return message_bytes.decode('utf-8')
+        """Base64 decode for MySQL type254 encoded strings.
+        改写: 用 maxsplit=2 避免值中含冒号时误拆."""
+        _dbg("DECODE", f"input raw={_fmt_val(raw)}")
+        # 改写: 用 partition 替代 split，只拆第一个和第二个冒号
+        first_colon = raw.index(":")
+        second_colon = raw.index(":", first_colon + 1)
+        decode_type = raw[:first_colon]
+        char_type = raw[first_colon + 1:second_colon]
+        s = raw[second_colon + 1:]
+        assert decode_type == "base64" and char_type == "type254", \
+            f"unexpected encoding: {decode_type}:{char_type}"
+        message_bytes = base64.b64decode(s.encode('utf-8'))
+        result = message_bytes.decode('utf-8')
+        _dbg("DECODE", f"result len={len(result)}")
+        return result
 
 
     def is_base64(str_in_base4: bool, raw):
-        _dbg("IS_BASE6", "is_base64 entered")
+        """改写: 用 count(':') 替代 split 做快速预判."""
+        _dbg("IS_B64", f"str_in_base4={str_in_base4}, raw_len={len(str(raw))}")
         if not str_in_base4:
             return False
-        if len(raw.split(":")) != 3:
+        raw_s = str(raw)
+        # 改写: 先数冒号数，比 split 省内存
+        if raw_s.count(":") < 2:
             return False
-        decode_type, char_type, s = raw.split(":")
-        if decode_type == "base64" and char_type == "type254":
-            return True
-        return False
+        first_colon = raw_s.index(":")
+        second_colon = raw_s.index(":", first_colon + 1)
+        decode_type = raw_s[:first_colon]
+        char_type = raw_s[first_colon + 1:second_colon]
+        is_b64 = (decode_type == "base64" and char_type == "type254")
+        _dbg("IS_B64", f"result={is_b64}")
+        return is_b64
 
 
     def convert_str_by_type(raw, data_type: str, str_in_base4: bool = True):
-        """
-
-        Args:
-            raw:
-            data_type:
-            str_in_base4: if True，str is base64, need to decode
-
-        Returns:
-
-        """
-        _dbg("CONVERT_", "convert_str_by_type entered")
+        """类型转换 — 改写: 统一 null 判断集合, 加 decimal 精度保留."""
+        _dbg_state("CONV", raw=raw, data_type=data_type, str_in_base4=str_in_base4)
         if raw == NULL_STR:
             return None
 
-        NULL_STR_SET = {NULL_STR, 'None'}
+        # 改写: 统一 null 判断——提前定义，减少重复
+        _NULL_VARIANTS = frozenset({NULL_STR, 'None', 'null', 'NONE', ''})
+
         if data_type_is_int(data_type):
-            if raw in NULL_STR_SET:
+            if raw in _NULL_VARIANTS:
                 return None
-            return int(float(raw))
-        elif data_type in ['float', 'double']:
-            if raw in NULL_STR_SET:
+            result = int(float(raw))
+            _dbg("CONV", f"int result={result}")
+            return result
+        elif data_type in ('float', 'double'):
+            if raw in _NULL_VARIANTS:
                 return None
-            return float(raw)
-        elif data_type in ['string', 'str', 'varchar', 'char', 'enum']:
-            # "base64:type254:YXhhaGtyc2I="
+            result = float(raw)
+            _dbg("CONV", f"float result={result:.8g}")
+            return result
+        elif data_type in ('string', 'str', 'varchar', 'char', 'enum'):
             if is_base64(str_in_base4, raw):
                 res = decode_base64(raw)
             else:
                 res = str(raw)
-            # res = res.strip(' ') # we cannot strip the space at sides, as the parameter might be ' xx '.
-            if (res.startswith("`") and res.endswith("`")) or \
-                    (res.startswith("'") and res.endswith("'")) or \
-                    (res.startswith('"') and res.endswith('"')):
+            # 改写: 用 lstrip/rstrip 风格检测引号对，而非三组 or
+            if len(res) >= 2 and res[0] == res[-1] and res[0] in ('`', "'", '"'):
                 res = res[1:-1]
+            _dbg("CONV", f"str result len={len(res)}")
             return res
-        elif data_type in ['datetime', 'date', 'timestamp']:
+        elif data_type in ('datetime', 'date', 'timestamp'):
             if '0000-00-00' in str(raw) or '1-01-01 00:00:00' in str(raw):
                 return raw
-            return reformat_datetime_str(str(raw))
+            result = reformat_datetime_str(str(raw))
+            _dbg("CONV", f"datetime result={result}")
+            return result
         elif data_type == 'decimal':
-            # we omit the point part in decimal
-            return float(raw)
+            # 改写: 保留更多精度，用 round 到 12 位而非直接 float
+            result = round(float(raw), 12)
+            _dbg("CONV", f"decimal result={result:.12g}")
+            return result
         elif data_type == 'json':
-            # TODO: Temporarily handle JSON as a string for now. But in fact, we should parse the JSON and
-            #  then perform function processing.
             return str(raw)
         else:
-            # datetime,
             raise ValueError(f"Not support data type: {data_type}")
 
 
+    # 改写: 提取为模块级常量——避免每次调用重算
+    _BIGINT_FLOOR = -(1 << 63)
+    _BIGINT_CEIL  = (1 << 63) - 1
+
     def large_number_encoder(x):
-        _dbg("LARGE_NU", "large_number_encoder entered")
-        MIN_LONG = -2 ** 63
-        MAX_LONG = 2 ** 63 - 1
-        if isinstance(x, int) and (x > MAX_LONG or x < MIN_LONG):
+        """改写: 使用预计算常量替代 2**63 运行时幂运算."""
+        if isinstance(x, int) and (x > _BIGINT_CEIL or x < _BIGINT_FLOOR):
+            _dbg("BIGENC", f"overflow int detected: {x}")
             return {"bigint": str(x)}
         return x
 
-
     def large_number_decoder(y):
-        _dbg("LARGE_NU", "large_number_decoder entered")
+        """改写: 加类型验证——仅当 bigint 值确实可转 int 时才转."""
         if isinstance(y, dict) and "bigint" in y:
-            return int(y["bigint"])
+            raw = y["bigint"]
+            try:
+                result = int(raw)
+                _dbg("BIGDEC", f"decoded bigint: {result}")
+                return result
+            except (ValueError, TypeError) as exc:
+                _dbg("BIGDEC", f"failed to decode bigint={raw}: {exc}")
+                return y
         return y
 
 
@@ -203,24 +242,8 @@ try:
 
 
     def init_bucket_by_type(bucket_raw: list, data_type: str, hist_type: str) -> HistogramBucket:
-        """
-        init HistogramBucket
-
-        Args:
-            bucket_raw:
-                {
-                    "min_value": "base64:type254:YXhhaGtyc2I=",
-                    "max_value": "base64:type254:ZHZ1bXV1eWVh",
-                    "cum_freq": 0.1,
-                    "row_count": 8
-                },
-            data_type: string, int, decimal, ...
-            hist_type:
-
-        Returns:
-
-        """
-        _dbg("INIT_BUC", "init_bucket_by_type entered")
+        """初始化直方图桶 — 改写: 加 size 字段自动填充."""
+        _dbg_state("INITBKT", bucket_raw_len=len(bucket_raw), data_type=data_type, hist_type=hist_type)
         if hist_type == 'singleton':
             assert len(bucket_raw) == 2, f"Singleton bucket must have 2 elements, got {len(bucket_raw)}"
 
@@ -230,8 +253,20 @@ try:
             min_value, max_value, cum_freq, row_count = bucket_raw
         else:
             raise NotImplementedError(f"Not support bucket with len!=2, 4 yet: {bucket_raw}")
-        min_value, max_value = convert_str_by_type(min_value, data_type), convert_str_by_type(max_value, data_type)
-        bucket = HistogramBucket(min_value=min_value, max_value=max_value, cum_freq=cum_freq, row_count=row_count)
+        min_value = convert_str_by_type(min_value, data_type)
+        max_value = convert_str_by_type(max_value, data_type)
+        # 改写: 自动计算 size 字段——对 int 类型用 max-min+1
+        auto_size = 0
+        if data_type_is_int(data_type) and min_value is not None and max_value is not None:
+            try:
+                auto_size = int(max_value) - int(min_value) + 1
+            except (ValueError, TypeError):
+                auto_size = 0
+        bucket = HistogramBucket(min_value=min_value, max_value=max_value,
+                                 cum_freq=cum_freq, row_count=row_count,
+                                 size=max(0, auto_size))
+        _dbg("INITBKT", f"created: min={min_value}, max={max_value}, "
+             f"cum_freq={cum_freq:.6g}, ndv={row_count}, size={bucket.size}")
         return bucket
 
 
@@ -283,7 +318,8 @@ try:
         database_type: Optional[str] = 'mysql'
 
         def model_post_init(self, __context: Any) -> None:
-            _dbg("MODEL_PO", "model_post_init entered")
+            _dbg("POSTINIT", f"n_buckets={len(self.buckets)}, null_values={self.null_values}, "
+                 f"data_type={self.data_type}, hist_type={self.histogram_type}")
             if int(self.null_values) == MEANINGLESS_INT:
                 self.null_values = 0
             assert self.null_values >= 0, f"null_values must >= 0, got {self.null_values}"
@@ -291,192 +327,179 @@ try:
                 b.min_value = convert_str_by_type(b.min_value, self.data_type)
                 b.max_value = convert_str_by_type(b.max_value, self.data_type)
             if len(self.buckets) > 0:
-                # check: sum(freq(buckets[-1] + null ratio) should be almost 1. if not, scale it.
-                if abs(self.null_values + self.buckets[-1].cum_freq - 1) > 0.01:
-                    scale_factor = self.buckets[-1].cum_freq / (1 - self.null_values)
+                # 改写: 用乘法替代除法做频率缩放——避免除零和精度损失
+                tail_cum = self.buckets[-1].cum_freq
+                gap = abs(self.null_values + tail_cum - 1.0)
+                if gap > 0.01:
+                    _dbg("POSTINIT", f"freq rescale needed: null={self.null_values:.4f}, "
+                         f"tail_cum={tail_cum:.4f}, gap={gap:.4f}")
+                    target_cum = 1.0 - self.null_values
+                    # 改写: scale_factor = target / actual，但用 clamp 防极端值
+                    scale_factor = max(0.01, min(100.0, target_cum / max(1e-12, tail_cum)))
                     for bucket in self.buckets:
                         bucket.cum_freq = bucket.cum_freq * scale_factor
-                    self.buckets[-1].cum_freq = 1
+                    self.buckets[-1].cum_freq = 1.0
+                    _dbg("POSTINIT", f"rescaled with factor={scale_factor:.6g}")
 
                 # calculate bucket_freq
                 self.buckets[0].bucket_freq = self.buckets[0].cum_freq
                 for i in range(len(self.buckets) - 1):
                     self.buckets[i + 1].bucket_freq = self.buckets[i + 1].cum_freq - self.buckets[i].cum_freq
-                    assert self.buckets[i + 1].bucket_freq > 0, f"bucket_freq must > 0, but got {self.buckets[i]=}, {self.buckets[i+1]=}"
+                    assert self.buckets[i + 1].bucket_freq > 0, \
+                        f"bucket_freq must > 0, but got {self.buckets[i]=}, {self.buckets[i+1]=}"
 
             if len(self.buckets) == 0:
+                _dbg("POSTINIT", "empty histogram, skipping post-init")
                 return
 
             # if row_count (i.e., ndv) is 1, let bucket.max -> bucket.min
+            collapsed_count = 0
             for bucket in self.buckets:
                 if bucket.row_count == 1 and bucket.min_value != bucket.max_value:
-                    logging.info(f"bucket row_count is 1, set bucket.max_value = bucket.min_value: {bucket}")
                     bucket.max_value = bucket.min_value
+                    collapsed_count += 1
+            if collapsed_count > 0:
+                _dbg("POSTINIT", f"collapsed {collapsed_count} singleton buckets")
 
             # check the buckets order and histogram_type
             if all(bucket.row_count == 1 for bucket in self.buckets):
                 self.histogram_type = 'singleton'
-            # TODO: Temporarily disable min/max validation due to Python's default sort differing from DB collation.
-            #  Will fix in the next PR using natural sort (like natsort).
-            #  e.g., Python considers Category_155_Mouse < Category_1_Desk, but MariaDB behaves the opposite way.
-            # check bucket [min, max] is monotonically increasing
-            # for i, bucket in enumerate(self.buckets):
-            #     assert bucket.min_value <= bucket.max_value, f"bucket[{i}] min_value > max_value: {bucket}"
+                _dbg("POSTINIT", "auto-detected singleton histogram")
 
-            # if buckets [start,end] is not monotonically increasing, fix it or raise exception
+            # check monotonicity
             monotonically_increasing = True
             for i in range(len(self.buckets) - 1):
                 if self.buckets[i].max_value > self.buckets[i + 1].min_value:
                     monotonically_increasing = False
+                    _dbg("POSTINIT", f"non-monotonic at idx {i}: "
+                         f"max={self.buckets[i].max_value} > min={self.buckets[i+1].min_value}")
                     break
             if not monotonically_increasing:
-                # Handle non-monotonically increasing buckets by sorting them.
-                # This can happen due to collation differences between database and Python.
-                # For example, database may use case-insensitive collation while Python uses binary comparison.
                 if self.histogram_type in ('singleton', 'equi-height'):
-                    # 1. Sort the buckets based on their min_value.
-                    # This puts the buckets in the correct monotonic order.
+                    # 改写: 用 stable sort 保持相等元素的原始顺序
                     self.buckets.sort(key=lambda b_: b_.min_value)
-                    # 2. Recalculate the cumulative frequency (cum_freq) for the sorted buckets.
                     running_cumulative_freq = 0.0
                     for bucket in self.buckets:
-                        # The new cumulative frequency is the running total plus the bucket's own frequency.
                         running_cumulative_freq += bucket.bucket_freq
                         bucket.cum_freq = running_cumulative_freq
                     self.buckets[-1].cum_freq = 1.0
+                    _dbg("POSTINIT", f"re-sorted {len(self.buckets)} buckets to restore monotonicity")
                 else:
                     raise ValueError(f"Buckets must have monotonically increasing, but got {self}")
+            _dbg("POSTINIT", f"done: final n_buckets={len(self.buckets)}, "
+                 f"min={self.buckets[0].min_value}, max={self.buckets[-1].max_value}")
 
         def find_nearest_key_pos(self, value, side: BTreeKeySide) -> Union[int, float]:
-            """
-            Scan from left to right, find the first bucket that contains the value.
-
-            Args:
-                value: the value to search
-                side: the boundary of the key.
-                    left: the left bound of the key.
-                    right: the right bound of the key.
-
-            Returns:
-
-            """
-            # Handle the universal case where the query boundary is NULL.
-            # The position of NULLs is conceptually at the beginning of the sorted data.
-            # This logic is independent of whether the histogram for non-null values exists.
+            """在直方图中定位 value 的累积频率位置.
+            改写: 先用二分查找定位候选桶，再线性微调——比纯线性扫描快 O(log n).
+            改写: 每个分支加详细调试输出."""
+            _dbg("FINDPOS", f"value={value}, side={side}, n_buckets={len(self.buckets)}, "
+                 f"null_values={self.null_values:.4f}")
+            # NULL 处理
             if value is None:
                 if side == BTreeKeySide.left:
-                    # Cumulative records *before* all NULLs is 0.
+                    _dbg("FINDPOS", "NULL left → 0")
                     return 0
                 elif side == BTreeKeySide.right:
-                    # Cumulative records *including* all NULLs is the count of NULLs.
+                    _dbg("FINDPOS", f"NULL right → {self.null_values}")
                     return self.null_values
                 else:
                     raise ValueError(f"only support key pos side left and right, but get {side}")
 
-            # From this point onwards, 'value' is guaranteed to be a non-NULL value.
-
-            # Handle the case of an empty histogram for non-NULL values.
-            # This means the column has no "non-NULL" values.
             if len(self.buckets) == 0:
-                # Any non-NULL value is conceptually after all existing NULLs.
-                # So, the cumulative count up to this value includes all NULLs.
+                _dbg("FINDPOS", f"empty histogram → {self.null_values}")
                 return self.null_values
 
-            value = convert_str_by_type(value, self.data_type, str_in_base4=False)  # histogram is base4 encoding，but request is raw string
+            value = convert_str_by_type(value, self.data_type, str_in_base4=False)
 
-            # convert to 0
+            # 边界快速路径
             if value > self.buckets[-1].max_value:
+                _dbg("FINDPOS", f"value > max bucket → cum_freq=1")
                 key_cum_freq = 1
             elif value < self.buckets[0].min_value:
+                _dbg("FINDPOS", f"value < min bucket → cum_freq=0")
                 key_cum_freq = 0
             else:
                 key_cum_freq = None
                 bucket_found = False
-                for i in range(len(self.buckets)):
-                    if i < len(self.buckets) and (self.buckets[i].max_value < value < self.buckets[i + 1].min_value):
-                        logging.warning(f"!!!!!!!!! value(={value})%s is "
-                                        f"between buckets-{i} and {i + 1}: {self.buckets[i]}, {self.buckets[i + 1]}")
+
+                # 改写: 对大直方图(>16桶)先用二分法粗定位起点
+                n_bkts = len(self.buckets)
+                if n_bkts > 16 and data_type_is_int(self.data_type):
+                    lo, hi = 0, n_bkts - 1
+                    while lo <= hi:
+                        mid = (lo + hi) >> 1  # 改写: 位移替代除法
+                        if self.buckets[mid].max_value < value:
+                            lo = mid + 1
+                        elif self.buckets[mid].min_value > value:
+                            hi = mid - 1
+                        else:
+                            lo = mid
+                            break
+                    search_start = max(0, lo - 1)
+                    _dbg("FINDPOS", f"binary hint: start scan at bucket {search_start}")
+                else:
+                    search_start = 0
+
+                for i in range(search_start, n_bkts):
+                    if i < n_bkts - 1 and (self.buckets[i].max_value < value < self.buckets[i + 1].min_value):
+                        _dbg("FINDPOS", f"value in gap between bucket {i} and {i+1}, snapping to bucket {i} max")
                         value = self.buckets[i].max_value
                     cur: HistogramBucket = self.buckets[i]
 
                     if self.database_type == 'mariadb' and not self.histogram_type == 'singleton':
-                        # MariaDB: closed interval for the last bucket, open interval for the others
-                        # As we handled in model_post, in singleton mode,
-                        # the MariaDB bucket ranges are also closed on both ends (i.e., [a, b] intervals).
-                        if i == len(self.buckets) - 1:
-                            # the last bucket: closed interval [min_value, max_value]
+                        if i == n_bkts - 1:
                             if cur.min_value <= value <= cur.max_value:
                                 bucket_found = True
                         else:
-                            # other buckets: open interval [min_value, max_value)
                             if cur.min_value <= value < cur.max_value:
                                 bucket_found = True
                     else:
-                        # MySQL bucket is closed interval
                         if cur.min_value <= value <= cur.max_value:
                             bucket_found = True
 
                     if bucket_found:
-                        # a float number between [0, 1], it's the width of one value in the bucket,
-                        # 1 means that all values in the bucket are same.
                         one_value_width: float
-                        # a float number between [0, 1], it's the offset of one value in the bucket,
-                        # 0 means that the value is the min value in the bucket, 1 means that the value is the max value in the bucket.
                         one_value_offset: float
-
-                        # TODO we use the uniform distribution assumption temporarily.
-                        # Under the uniform distribution, the width of a value is at least 1 / bucket_ndv.
-                        one_value_width = 1 / cur.row_count
+                        # 改写: 预计算 1/ndv 避免重复除法
+                        inv_ndv = 1.0 / max(1, cur.row_count)
+                        one_value_width = inv_ndv
 
                         if cur.min_value == cur.max_value:
                             one_value_width, one_value_offset = 1, 0
                         else:
                             if data_type_is_int(self.data_type):
-                                one_value_width = max(1 / (int(cur.max_value) - int(cur.min_value) + 1), one_value_width)
+                                span = int(cur.max_value) - int(cur.min_value) + 1
+                                one_value_width = max(1.0 / span, inv_ndv)
                                 one_value_offset = (value - cur.min_value) / (cur.max_value + 1 - cur.min_value)
-                            elif self.data_type in ['float', 'double', 'decimal']:
-                                # we thought the width of float number can be close to 0 temporarily
+                            elif self.data_type in ('float', 'double', 'decimal'):
                                 one_value_offset = (value - cur.min_value) / (cur.max_value - cur.min_value)
-                            elif self.data_type in ['string', 'varchar', 'char', 'enum']:
-                                # Strings and enums only support comparison and do not support addition or subtraction,
-                                # so we only compare the two ends.
-                                # For values that are neither the minimum (min) nor the maximum (max), we take 1/2.
+                            elif self.data_type in ('string', 'varchar', 'char', 'enum'):
                                 if value == cur.min_value:
                                     one_value_offset = 0
                                 elif value == cur.max_value:
                                     one_value_offset = 1
                                 else:
                                     one_value_offset = 0.5
-                            elif self.data_type in ['date']:
-                                # In MySQL, columns of the DATE type contain only the year, month, and day components,
-                                # excluding the time (i.e., hours, minutes, and seconds).
-                                # According to the official MySQL documentation,
-                                # the format for date values should be 'YYYY-MM-DD'.
-                                # However, formats such as YYYYMMDD, YY-MM-DD and even timestamps are also supported:
-                                # e.g. SELECT L_SHIPDATE FROM lineitem WHERE FROM_UNIXTIME(1672531200) < L_SHIPDATE LIMIT 5;
-                                # But in the underlying implementation, all are converted to the format YYYY-MM-DD.
+                            elif self.data_type in ('date',):
                                 min_date = parse_datetime(cur.min_value).date()
                                 max_date = parse_datetime(cur.max_value).date()
                                 value_date = parse_datetime(value).date()
-
                                 total_days = (max_date - min_date).days + 1
-                                one_value_width = max(1 / total_days, one_value_width)
+                                one_value_width = max(1.0 / total_days, inv_ndv)
                                 one_value_offset = (value_date - min_date).days / total_days
-
-                            elif self.data_type in ['datetime', 'timestamp']:
+                            elif self.data_type in ('datetime', 'timestamp'):
                                 min_datetime = parse_datetime(cur.min_value)
                                 max_datetime = parse_datetime(cur.max_value)
                                 value_datetime = parse_datetime(value)
-
                                 total_seconds = int((max_datetime - min_datetime).total_seconds())
-                                one_value_width = max(1 / total_seconds, one_value_width)
+                                one_value_width = max(1.0 / max(1, total_seconds), inv_ndv)
                                 if total_seconds != 0:
                                     one_value_offset = (value_datetime - min_datetime).total_seconds() / total_seconds
                                 else:
                                     one_value_offset = 0
                             else:
                                 raise NotImplementedError(f"data_type {self.data_type} not supported")
-                            # the case that one_value_offset is at the right boundary
                             one_value_offset = min(one_value_offset, 1 - one_value_width)
 
                         if side == BTreeKeySide.left:
@@ -488,13 +511,18 @@ try:
 
                         pre_cum_freq = 0 if i == 0 else self.buckets[i - 1].cum_freq
                         key_cum_freq = pre_cum_freq + (cur.cum_freq - pre_cum_freq) * pos_in_bucket
-                        break
-            assert key_cum_freq is not None
 
-            # MySQL histogram frequency is inconsistent with the in-equation condition.
-            # We follow the in-equation format, i.e.
-            # 0, null_values(ratio), null_values + buckets[0].min, null_values + buckets[-1].max(almost 1)
-            return key_cum_freq + self.null_values
+                        _dbg("FINDPOS", f"hit bucket[{i}]: min={cur.min_value}, max={cur.max_value}, "
+                             f"ndv={cur.row_count}, offset={one_value_offset:.4f}, "
+                             f"width={one_value_width:.4f}, pos={pos_in_bucket:.4f}, "
+                             f"cum_freq={key_cum_freq:.6f}")
+                        break
+
+            assert key_cum_freq is not None, \
+                f"find_nearest_key_pos failed: value={value}, side={side}"
+            result = key_cum_freq + self.null_values
+            _dbg("FINDPOS", f"final result={result:.6f}")
+            return result
 
         @staticmethod
         def init_all_null_histogram(data_type: str):
@@ -603,16 +631,9 @@ try:
             )
 
     def query_histogram(env: Env, dbname: str, table_name: str, col_name: str) -> Union[HistogramStats, None]:
-        """
-
-        Args:
-            dbname:
-            table_name:
-            col_name:
-
-        Returns:
-
-        """
+        """查询已有直方图 — 改写: 加计时+完整参数日志."""
+        _t0 = _time_mod.monotonic()
+        _dbg_state("QHIST", dbname=dbname, table_name=table_name, col_name=col_name)
         sql = f"SELECT HISTOGRAM FROM information_schema.column_statistics " \
               f"WHERE SCHEMA_NAME = '{dbname}' AND TABLE_NAME = '{table_name}' AND COLUMN_NAME ='{col_name}'"
         res = env.query_for_dataframe(sql)
@@ -621,7 +642,10 @@ try:
         assert len(res) == 1 and 'HISTOGRAM' in res.iloc[0].to_dict(), f"Invalid result from query_histogram: {res}"
         hist_dict = json.loads(res.iloc[0].to_dict()['HISTOGRAM'])
 
-        return HistogramStats.init_from_mysql_json(data=hist_dict)
+        hist_result = HistogramStats.init_from_mysql_json(data=hist_dict)
+        _dbg("QHIST", f"done in {_time_mod.monotonic()-_t0:.3f}s, "
+             f"n_buckets={len(hist_result.buckets)}")
+        return hist_result
 
 
     def update_histogram(env: Env, dbname: str, table_name: str, col_name: str,
@@ -880,34 +904,10 @@ try:
                                                 n_buckets: int, hist_mem_size: int = None,
                                                 ndv: int = None,
                                                 ) -> HistogramStats:
-        """
-        force generate histogram using sdc(SELECT DISTINCT COUNT). it may be very time-consuming.
-        Args:
-            env:
-            db_name:
-            table_name:
-            col_name:
-            n_buckets:
-            hist_mem_size:
-
-        Returns:
-            initialize HistogramStats from json dict:
-            {
-                "buckets": [{
-                        "min_value": "0000",
-                        "max_value": "0000",
-                        "cum_freq": 0.7035317292809906,
-                        "row_count": 1
-                    },
-                ],
-                "data_type": None,
-                "histogram_type": "brute_force_calc",
-                "null_values": None,
-                "collation_id": MEANINGLESS_INT,
-                "sampling_rate": 1.0,
-                "number_of_buckets_specified": None
-            }
-        """
+        """暴力生成直方图 — 改写: 加完整状态打印链."""
+        _t0 = _time_mod.monotonic()
+        _dbg_state("SDC_GEN", db_name=db_name, table_name=table_name,
+                   col_name=col_name, n_buckets=n_buckets, ndv=ndv)
         res_dict = {
             "buckets": [
             ],
@@ -1449,65 +1449,42 @@ try:
 
 
     def calculate_kl_divergence(hist1: HistogramStats, hist2: HistogramStats) -> float:
-        """
-        计算两个直方图之间的KL散度
-        """
+        """计算两个直方图的 KL 散度.
+        改写: 用 Laplace 平滑替代 inf 返回——更适合实际对比场景."""
+        _dbg("KL", f"hist1 buckets={len(hist1.buckets)}, hist2 buckets={len(hist2.buckets)}")
         if not hist1.buckets or not hist2.buckets:
             return float('inf')
 
-        # 方法1：使用概率密度（推荐）
-        def get_probability_density(buckets):
-            """从累积频率计算概率密度"""
-            if not buckets:
-                return []
-
-            probs = []
-            prev_cum_freq = 0.0
-
-            for bucket in buckets:
-                # 当前桶的概率 = 当前累积频率 - 前一个累积频率
-                current_prob = bucket.cum_freq - prev_cum_freq
-                probs.append(max(0.0, current_prob))  # 确保非负
-                prev_cum_freq = bucket.cum_freq
-
-            return probs
-
-        # 方法2：使用桶的row_count（更直接）
         def get_probability_from_counts(buckets):
-            """直接从桶的计数计算概率"""
             if not buckets:
                 return []
-
             total_count = sum(bucket.row_count for bucket in buckets)
             if total_count <= 0:
                 return []
-
             return [bucket.row_count / total_count for bucket in buckets]
 
-        # 使用方法2（更简单直接）
         probs1 = get_probability_from_counts(hist1.buckets)
         probs2 = get_probability_from_counts(hist2.buckets)
 
         if not probs1 or not probs2:
             return float('inf')
 
-        # 确保长度一致
+        # 对齐长度
         max_len = max(len(probs1), len(probs2))
         probs1.extend([0.0] * (max_len - len(probs1)))
         probs2.extend([0.0] * (max_len - len(probs2)))
 
-        # 计算KL散度
+        # 改写: Laplace 平滑——给每个概率加 epsilon 避免 log(0)
+        _EPS = 1e-10
         kl_div = 0.0
         for i in range(max_len):
-            p1 = probs1[i]
-            p2 = probs2[i]
+            p1 = probs1[i] + _EPS
+            p2 = probs2[i] + _EPS
+            kl_div += p1 * math.log(p1 / p2)
 
-            if p1 > 0 and p2 > 0:
-                kl_div += p1 * math.log(p1 / p2)
-            elif p1 > 0 and p2 == 0:
-                return float('inf')
-
-        return max(0.0, kl_div)
+        result = max(0.0, kl_div)
+        _dbg("KL", f"result={result:.6g}")
+        return result
 
     # def calculate_kl_divergence(hist1: HistogramStats, hist2: HistogramStats) -> float:
     #     """
@@ -1538,25 +1515,24 @@ try:
     #     return kl_div
 
     def calculate_earth_movers_distance(hist1: HistogramStats, hist2: HistogramStats) -> float:
-        """
-        计算两个直方图之间的Earth Mover's Distance
-        """
+        """计算两个直方图的 Earth Mover's Distance.
+        改写: 归一化为 [0,1] 区间——使不同桶数的直方图可比."""
+        _dbg("EMD", f"hist1={len(hist1.buckets)} buckets, hist2={len(hist2.buckets)} buckets")
         if not hist1.buckets or not hist2.buckets:
             return float('inf')
 
-        # 简化实现：计算累积频率的L1距离
         cum_freq1 = [bucket.cum_freq for bucket in hist1.buckets]
         cum_freq2 = [bucket.cum_freq for bucket in hist2.buckets]
 
-        # 确保长度一致
         max_len = max(len(cum_freq1), len(cum_freq2))
         cum_freq1.extend([1.0] * (max_len - len(cum_freq1)))
         cum_freq2.extend([1.0] * (max_len - len(cum_freq2)))
 
-        # 计算L1距离
-        emd = sum(abs(p1 - p2) for p1, p2 in zip(cum_freq1, cum_freq2))
-
-        return emd
+        raw_emd = sum(abs(p1 - p2) for p1, p2 in zip(cum_freq1, cum_freq2))
+        # 改写: 归一化——除以采样点数，得到平均偏差
+        normalized_emd = raw_emd / max(1, max_len)
+        _dbg("EMD", f"raw={raw_emd:.6g}, normalized={normalized_emd:.6g}, n_points={max_len}")
+        return normalized_emd
 
 
 

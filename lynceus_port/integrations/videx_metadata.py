@@ -29,12 +29,19 @@ References:
 from __future__ import annotations
 
 import os as _os, sys as _sys
-_MOD_TAG = "VID"
+_MOD_TAG = "VMD"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 _tr = _dbg
 
 # ── Stub fallback for missing upstream names ──
@@ -210,6 +217,7 @@ class TableStatisticsInfo:
 
     def get_col_hist(self, col: str) -> Optional[HistogramStats]:
         """Get histogram for a column.
+        _dbg("GET_COL_", f"ENTER get_col_hist(col={col!r})")
         Upstream: VidexTableStats.get_col_hist(col)."""
         _dbg("GET_COL_", "get_col_hist entered")
         return self.col_hists.get(col.lower())
@@ -295,6 +303,7 @@ class VidexDBTaskStats:
 
     def get_meta_info_keys(self) -> Dict[str, List[str]]:
         """Upstream: VidexDBTaskStats.get_meta_info_keys."""
+        _dbg("GET_META", "ENTER get_meta_info_keys()")
         return {
             db: sorted(tables.keys())
             for db, tables in self.meta_dict.items()
@@ -303,10 +312,12 @@ class VidexDBTaskStats:
     @property
     def key(self) -> str:
         """Upstream: VidexDBTaskStats.key property."""
+        _dbg("KEY", "ENTER key()")
         return self.to_key(self.task_id)
 
     @staticmethod
     def to_key(task_id: str) -> str:
+        _dbg("TO_KEY", f"ENTER to_key(task_id={task_id!r})")
         return f"{task_id}"
 
     def merge_with(
@@ -362,11 +373,13 @@ class DeviceTableProfile:
 
     @property
     def gpu_speedup(self) -> float:
+        _dbg("GPU_SPEE", "ENTER gpu_speedup()")
         if self.gpu_scan_cost_per_row > 0:
             return self.cpu_scan_cost_per_row / self.gpu_scan_cost_per_row
         return 1.0
 
     def scan_cost(self, n_rows: int, device: str = "auto") -> float:
+        _dbg("SCAN_COS", f"ENTER scan_cost(n_rows={n_rows!r}, device={device!r})")
         if device == "gpu" or (device == "auto" and self.is_gpu_resident):
             return n_rows * self.gpu_scan_cost_per_row
         return n_rows * self.cpu_scan_cost_per_row
@@ -390,6 +403,7 @@ class TableMetadataRegistry:
 
     def register_task(self, task: VidexDBTaskStats):
         """Register a DB task stats object."""
+        _dbg("REGISTER", f"ENTER register_task(task={task!r})")
         self._tasks[task.key] = task
         if self.debug:
             stats_keys = task.get_stats_info_keys()
@@ -399,6 +413,7 @@ class TableMetadataRegistry:
 
     def get_meta_by_task_id(self, task_id: str) -> Optional[VidexDBTaskStats]:
         """Upstream: VidexMetaGetter.get_meta_by_task_id."""
+        _dbg("GET_META", f"ENTER get_meta_by_task_id(task_id={task_id!r})")
         key = VidexDBTaskStats.to_key(task_id)
         return self._tasks.get(key)
 
@@ -421,9 +436,11 @@ class TableMetadataRegistry:
         return None
 
     def set_device_profile(self, table_name: str, profile: DeviceTableProfile):
+        _dbg("SET_DEVI", f"ENTER set_device_profile(table_name={table_name!r}, profile={profile!r})")
         self._device_profiles[table_name.lower()] = profile
 
     def get_device_profile(self, table_name: str) -> Optional[DeviceTableProfile]:
+        _dbg("GET_DEVI", f"ENTER get_device_profile(table_name={table_name!r})")
         return self._device_profiles.get(table_name.lower())
 
     # ── Factory: build from TPC-H catalog ──────────────────────────────
@@ -493,6 +510,7 @@ class TableMetadataRegistry:
     # ── Debug dump ─────────────────────────────────────────────────────
     def debug_dump(self):
         """Print full registry state for debugging."""
+        _dbg("DEBUG_DU", "ENTER debug_dump()")
         print(f"\n  ┌─ METADATA REGISTRY STATE DUMP ─────────────────────")
         print(f"  │  tasks: {len(self._tasks)}")
         for tid, task in self._tasks.items():
@@ -517,6 +535,7 @@ class TableMetadataRegistry:
 # ── Helper: case normalizer (from upstream to_lower_db_tb at line 964) ─
 def to_lower_db_tb(d: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize all keys in a nested db→table dict to lowercase.
+    _dbg("TO_LOWER", f"ENTER to_lower_db_tb(d={d!r}, Any]={Any]!r})")
     Upstream: VidexTableStats.to_lower_db_tb."""
     return {
         k.lower(): (
@@ -531,6 +550,7 @@ def to_lower_db_tb(d: Dict[str, Any]) -> Dict[str, Any]:
 
     def check_metadata_integrity(self) -> str:
         """★ 改写: 元数据完整性验证."""
+        _dbg("CHECK_ME", "ENTER check_metadata_integrity()")
         from .. import _dbg
         issues = []
         for col_name, meta in self._columns.items():

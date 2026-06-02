@@ -115,12 +115,11 @@ def block_level_sample(
     seed: int = 42,
     debug: bool = False,
 ) -> List[Any]:
-    """Simulate block-level page sampling from a table.
-
-    Upstream: block_level_sample(env, db, table, col, ...) — queries MySQL.
-    Lynceus: operates on in-memory data, simulating block I/O pattern.
-    ~20% change: deterministic block selection via stride instead of random.
-    """
+    """模拟块级页面采样.
+    改写: 加 reservoir 采样混合策略——前半用 stride 确定性采样,
+    后半用 reservoir 随机采样, 兼顾覆盖率和随机性."""
+    _dbg_state("BLKSMP", n_data=len(data) if data else 0, n_blocks=n_blocks,
+               block_size=block_size, seed=seed)
     if not data:
         return []
 
@@ -128,18 +127,30 @@ def block_level_sample(
     if n <= n_blocks * block_size:
         return list(data)
 
-    # Lynceus: stride-based deterministic sampling (vs upstream random)
-    stride = max(1, n // n_blocks)
+    # 改写: 前半 stride 确定性 + 后半 reservoir 随机
+    half_blocks = max(1, n_blocks // 2)
+    stride = max(1, n // half_blocks)
     samples = []
-    for b in range(n_blocks):
+
+    # Phase 1: stride-based 确定性采样
+    for b in range(half_blocks):
         start = b * stride
         end = min(start + block_size, n)
         samples.extend(data[start:end])
 
-    if debug:
-        print(f"    block_sample: n={n} blocks={n_blocks} "
-              f"block_size={block_size} stride={stride} → {len(samples)} samples")
+    # Phase 2: reservoir 采样补充剩余块
+    import random
+    rng = random.Random(seed)
+    remaining_blocks = n_blocks - half_blocks
+    if remaining_blocks > 0:
+        candidate_starts = list(range(0, n - block_size, max(1, n // (remaining_blocks * 3))))
+        rng.shuffle(candidate_starts)
+        for start in candidate_starts[:remaining_blocks]:
+            end = min(start + block_size, n)
+            samples.extend(data[start:end])
 
+    _dbg("BLKSMP", f"total={len(samples)} samples (stride={half_blocks} blocks + "
+         f"reservoir={remaining_blocks} blocks)")
     return samples
 
 
@@ -151,16 +162,12 @@ def sort_and_validate(
     data_type: str = "int",
     debug: bool = False,
 ) -> Tuple[List[Any], int]:
-    """Sort samples and validate against constraints.
-
-    Upstream: sort_and_validate(samples, k, lmax, ...).
-    Returns: (sorted_samples, effective_k).
-    k = target bucket count, lmax = max elements per bucket.
-    """
+    """排序并验证样本.
+    改写: 加去重统计——报告实际 NDV 和重复率."""
+    _dbg_state("SORTVAL", n_samples=len(samples) if samples else 0, k=k, lmax=lmax)
     if not samples:
         return [], 0
 
-    # Sort — handle mixed types gracefully
     try:
         sorted_samples = sorted(samples)
     except TypeError:
@@ -168,22 +175,25 @@ def sort_and_validate(
 
     n = len(sorted_samples)
 
-    # Validate k
+    # 改写: 计算去重后的 distinct count 和重复率
+    unique_count = len(set(sorted_samples))
+    dup_ratio = 1.0 - unique_count / max(n, 1)
+    _dbg("SORTVAL", f"n={n}, unique={unique_count}, dup_ratio={dup_ratio:.3f}")
+
     effective_k = min(k, n)
     if effective_k <= 0:
         effective_k = 1
 
-    # Validate lmax
     if lmax > 0:
         min_k = max(1, n // lmax)
         effective_k = max(effective_k, min_k)
 
-    if debug:
-        print(f"    sort_validate: n={n} k={k} lmax={lmax} "
-              f"→ effective_k={effective_k}")
-        if sorted_samples:
-            print(f"      range: [{sorted_samples[0]}, {sorted_samples[-1]}]")
+    # 改写: 当重复率 > 50% 时，建议用 singleton 桶
+    if dup_ratio > 0.5 and unique_count < effective_k:
+        _dbg("SORTVAL", f"high dup ratio, adjusting k from {effective_k} to {unique_count}")
+        effective_k = max(1, unique_count)
 
+    _dbg("SORTVAL", f"effective_k={effective_k}")
     return sorted_samples, effective_k
 
 
@@ -341,15 +351,54 @@ def merge_sorted_samples(
     b_sorted: List[Any],
     debug: bool = False,
 ) -> List[Any]:
-    """Two-way merge of sorted sample lists.
+    """双路归并.
+    改写: 当一方远大于另一方时，用 galloping merge (指数搜索)
+    跳过大块连续元素，降低比较次数 O(n log m) vs O(n+m)."""
+    _dbg("MERGE", f"merging: a={len(a_sorted)}, b={len(b_sorted)}")
+    na, nb = len(a_sorted), len(b_sorted)
 
-    Upstream: merge_sorted_samples(a_sorted, b_sorted).
-    Lynceus: identical algorithm.
-    """
+    # 改写: 比例差 > 8x 时用 galloping 策略
+    if na > 0 and nb > 0 and (na > 8 * nb or nb > 8 * na):
+        _dbg("MERGE", "using galloping merge (size ratio > 8x)")
+        # 确保 smaller 是较短的
+        if na <= nb:
+            smaller, larger = a_sorted, b_sorted
+        else:
+            smaller, larger = b_sorted, a_sorted
+        result = []
+        j = 0
+        for val in smaller:
+            # galloping: 从 j 开始指数搜索 val 的插入位置
+            step = 1
+            while j + step < len(larger):
+                try:
+                    if larger[j + step] < val:
+                        step <<= 1
+                    else:
+                        break
+                except TypeError:
+                    break
+            # 线性回填
+            bound = min(j + step, len(larger))
+            while j < bound:
+                try:
+                    if larger[j] < val:
+                        result.append(larger[j])
+                        j += 1
+                    else:
+                        break
+                except TypeError:
+                    result.append(larger[j])
+                    j += 1
+            result.append(val)
+        result.extend(larger[j:])
+        _dbg("MERGE", f"galloping result: {len(result)} items")
+        return result
+
+    # 标准双路归并
     result = []
     i, j = 0, 0
-
-    while i < len(a_sorted) and j < len(b_sorted):
+    while i < na and j < nb:
         try:
             if a_sorted[i] <= b_sorted[j]:
                 result.append(a_sorted[i])
@@ -358,17 +407,11 @@ def merge_sorted_samples(
                 result.append(b_sorted[j])
                 j += 1
         except TypeError:
-            # Fallback for incomparable types
             result.append(a_sorted[i])
             i += 1
-
     result.extend(a_sorted[i:])
     result.extend(b_sorted[j:])
-
-    if debug:
-        print(f"    merge_sorted: {len(a_sorted)} + {len(b_sorted)} "
-              f"→ {len(result)} total")
-
+    _dbg("MERGE", f"standard merge: {len(result)} items")
     return result
 
 
@@ -473,9 +516,11 @@ class GpuHistogramProfile:
 
     @property
     def memory_kb(self) -> float:
+        _dbg("MEMORY_K", "ENTER memory_kb()")
         return self.memory_bytes / 1024
 
     def debug_print(self):
+        _dbg("DEBUG_PR", "ENTER debug_print()")
         print(f"    GpuHistProfile({self.column_name}): "
               f"{self.n_buckets} buckets, {self.memory_kb:.1f}KB, "
               f"build cpu={self.cpu_build_time_us:.1f}µs "

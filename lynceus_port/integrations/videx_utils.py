@@ -30,12 +30,19 @@ References:
 from __future__ import annotations
 
 import os as _os, sys as _sys
-_MOD_TAG = "VID"
+_MOD_TAG = "VUT"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 _tr = _dbg
 
 # ── Stub fallback for missing upstream names ──
@@ -81,6 +88,7 @@ class BTreeKeyOp(Enum):
     @staticmethod
     def init(value: str) -> "BTreeKeyOp":
         """Parse a string into a BTreeKeyOp.
+        _dbg("INIT", f"ENTER init(value={value!r})")
         Upstream: BTreeKeyOp.init(value)."""
         _dbg("INIT", "init entered")
         for member in BTreeKeyOp:
@@ -112,6 +120,7 @@ class BTreeKeySide(Enum):
     @staticmethod
     def from_op(op: Union[str, BTreeKeyOp]) -> "BTreeKeySide":
         """Determine side from operation.
+        _dbg("FROM_OP", f"ENTER from_op(op={op!r}, BTreeKeyOp]={BTreeKeyOp]!r})")
         Upstream: BTreeKeySide.from_op."""
         _dbg("FROM_OP", "from_op entered")
         if isinstance(op, str):
@@ -144,6 +153,7 @@ class RangeCond:
     @staticmethod
     def _check_op_and_side(op: str, is_min: bool):
         """Validate op/side consistency.
+        _dbg("_CHECK_O", f"ENTER _check_op_and_side(op={op!r}, is_min={is_min!r})")
         Upstream: RangeCond._check_op_and_side."""
         _dbg("_CHECK_O", "_check_op_and_side entered")
         parsed = BTreeKeyOp.init(op)
@@ -181,15 +191,18 @@ class RangeCond:
 
     @property
     def has_min(self) -> bool:
+        _dbg("HAS_MIN", "ENTER has_min()")
         return self.min_value is not None
 
     @property
     def has_max(self) -> bool:
+        _dbg("HAS_MAX", "ENTER has_max()")
         return self.max_value is not None
 
     @property
     def is_singlepoint(self) -> bool:
         """Check if this is an equality condition.
+        _dbg("IS_SINGL", "ENTER is_singlepoint()")
         Upstream: RangeCond.is_singlepoint."""
         if self.min_value is not None and self.max_value is not None:
             if self.min_value == self.max_value:
@@ -204,28 +217,31 @@ class RangeCond:
         ndv: int,
         debug: bool = False,
     ) -> float:
-        """Estimate selectivity for this range condition.
-
-        Upstream: not present (done in videx_histogram).
-        Lynceus: integrated here. ~20% algorithm addition.
-        """
+        """估计范围条件的选择率.
+        改写: 用 Zipf 分布假设替代均匀假设——真实数据通常倾斜."""
         if self.estimated_selectivity >= 0:
             return self.estimated_selectivity
 
         if ndv <= 0:
             return 1.0
 
+        _dbg("SEL", f"col={self.col}, ndv={ndv}, singlepoint={self.is_singlepoint}")
+
         if self.is_singlepoint:
-            sel = 1.0 / ndv
+            # 改写: Zipf 修正——热值的选择率更高，假设排名中位
+            # 均匀假设: 1/ndv; Zipf(s=1): 1/(H_ndv * rank)
+            # 平均情况下取几何平均: sqrt(1/ndv * 2/ndv) ≈ sqrt(2)/ndv
+            sel = min(1.0, 1.414 / max(ndv, 1))
         elif self.has_min and self.has_max:
-            # Range: estimate fraction
-            sel = min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))
+            # 改写: 用 ndv 的倒数的平方根——比 1/sqrt(ndv) 更保守
+            sel = min(1.0, max(0.001, 1.0 / max(1, math.isqrt(ndv))))
         elif self.has_min or self.has_max:
-            # One-sided: ~50% heuristic scaled by NDV
-            sel = min(0.5, max(0.01, 1.0 / math.log2(max(ndv, 2))))
+            # 改写: log2(ndv) 分母，加下界保护
+            sel = min(0.5, max(0.005, 1.0 / max(1.0, math.log2(max(ndv, 2)))))
         else:
             sel = 1.0
 
+        _dbg("SEL", f"result={sel:.6f}")
         if debug:
             print(f"    range_sel({self.col}): "
                   f"min={self.min_value} max={self.max_value} "
@@ -236,6 +252,7 @@ class RangeCond:
 
     def all_possible_strs(self) -> List[str]:
         """Generate all possible string representations.
+        _dbg("ALL_POSS", "ENTER all_possible_strs()")
         Upstream: RangeCond.all_possible_strs."""
         results = []
         if self.is_singlepoint:
@@ -260,6 +277,7 @@ class RangeCond:
     @staticmethod
     def construct_eq(col: str, data_type: str, value: str) -> "RangeCond":
         """Construct an equality condition.
+        _dbg("CONSTRUC", f"ENTER construct_eq(col={col!r}, data_type={data_type!r}, value={value!r})")
         Upstream: RangeCond.construct_eq."""
         return RangeCond(
             col=col, data_type=data_type,
@@ -284,16 +302,19 @@ class IndexRangeCond:
     gpu_cost_multiplier: float = 1.0
 
     def ranges_to_str(self) -> str:
+        _dbg("RANGES_T", "ENTER ranges_to_str()")
         return " AND ".join(str(r) for r in self.ranges)
 
     def __repr__(self) -> str:
         return f"IdxRange({self.index_name}: {self.ranges_to_str()})"
 
     def to_print_full(self) -> str:
+        _dbg("TO_PRINT", "ENTER to_print_full()")
         return f"IndexRangeCond(idx={self.index_name}, ranges={[r.__repr__() for r in self.ranges]})"
 
     def get_valid_ranges(self, ignore_range_after_neq: bool) -> List[RangeCond]:
         """Get usable range conditions.
+        _dbg("GET_VALI", f"ENTER get_valid_ranges(ignore_range_after_neq={ignore_range_after_neq!r})")
         Upstream: IndexRangeCond.get_valid_ranges."""
         valid = []
         for r in self.ranges:
@@ -430,19 +451,23 @@ class GpuIndexCostAnnotation:
 
     @property
     def cpu_total(self) -> float:
+        _dbg("CPU_TOTA", "ENTER cpu_total()")
         return self.cpu_io_cost + self.cpu_compute_cost
 
     @property
     def gpu_total(self) -> float:
+        _dbg("GPU_TOTA", "ENTER gpu_total()")
         return self.gpu_io_cost + self.gpu_compute_cost + self.transfer_cost
 
     @property
     def best_device(self) -> str:
+        _dbg("BEST_DEV", "ENTER best_device()")
         if self.recommended_device != "auto":
             return self.recommended_device
         return "gpu" if self.gpu_total < self.cpu_total else "cpu"
 
     def debug_print(self):
+        _dbg("DEBUG_PR", "ENTER debug_print()")
         print(f"    GpuIndexCost({self.index_name}): "
               f"cpu={self.cpu_total:.1f} gpu={self.gpu_total:.1f} "
               f"→ {self.best_device}")
@@ -451,6 +476,7 @@ class GpuIndexCostAnnotation:
 # ── Data type helpers (from upstream line 798+) ────────────────────────
 def data_type_is_int(data_type: str) -> bool:
     """Upstream: data_type_is_int."""
+    _dbg("DATA_TYP", f"ENTER data_type_is_int(data_type={data_type!r})")
     return data_type.lower() in (
         "int", "integer", "bigint", "smallint", "tinyint",
         "mediumint", "int unsigned", "bigint unsigned",
@@ -471,6 +497,7 @@ def reformat_datetime_str(
 
 def parse_datetime(datetime_input: Union[str, int]) -> datetime:
     """Parse a datetime from string or timestamp.
+    _dbg("PARSE_DA", f"ENTER parse_datetime(datetime_input={datetime_input!r}, int]={int]!r})")
     Upstream: parse_datetime."""
     if isinstance(datetime_input, (int, float)):
         return datetime.fromtimestamp(datetime_input)
@@ -488,12 +515,14 @@ def parse_datetime(datetime_input: Union[str, int]) -> datetime:
 
 def str_lower_eq(a: str, b: str) -> bool:
     """Case-insensitive string equality.
+    _dbg("STR_LOWE", f"ENTER str_lower_eq(a={a!r}, b={b!r})")
     Upstream: str_lower_eq."""
     return a.lower() == b.lower()
 
 
 def safe_tolist(data: Any) -> list:
     """Safely convert to list.
+    _dbg("SAFE_TOL", f"ENTER safe_tolist(data={data!r})")
     Upstream: safe_tolist(series)."""
     if isinstance(data, list):
         return data
@@ -504,6 +533,7 @@ def safe_tolist(data: Any) -> list:
 
 def get_column_data_type(column_type: str) -> str:
     """Map MySQL column type string to simplified type.
+    _dbg("GET_COLU", f"ENTER get_column_data_type(column_type={column_type!r})")
     Upstream: get_column_data_type."""
     ct = column_type.lower().strip()
     if any(t in ct for t in ("int", "serial")):
@@ -522,12 +552,14 @@ _PERF_LOG: "Dict[str, List[float]]" = {}
 
 def track_perf(func_name: str, elapsed_us: float) -> None:
     """★ 改写: 工具函数性能追踪."""
+    _dbg("TRACK_PE", f"ENTER track_perf(func_name={func_name!r}, elapsed_us={elapsed_us!r})")
     if func_name not in _PERF_LOG:
         _PERF_LOG[func_name] = []
     _PERF_LOG[func_name].append(elapsed_us)
 
 def dump_perf_summary() -> str:
     """★ 改写: 性能追踪摘要."""
+    _dbg("DUMP_PER", "ENTER dump_perf_summary()")
     lines = ["┌── Videx Utils Perf Summary ──"]
     for name, times in sorted(_PERF_LOG.items()):
         avg = sum(times) / len(times)

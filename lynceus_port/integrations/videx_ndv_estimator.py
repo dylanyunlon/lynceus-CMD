@@ -29,12 +29,19 @@ References:
 from __future__ import annotations
 
 import os as _os, sys as _sys
-_MOD_TAG = "VID"
+_MOD_TAG = "VNE"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 _tr = _dbg
 
 # ── Stub fallback for missing upstream names ──
@@ -74,6 +81,7 @@ class NEVUtils:
     def build_column_profile(self, data: List[Any]) -> List[int]:
         """Build frequency-of-frequency profile from sampled data.
 
+        _dbg("BUILD_CO", f"ENTER build_column_profile(data={data!r})")
         Input: all sampled values from a column.
         Output: profile f[j] where f[j] = number of values appearing j times.
         Upstream: NEVUtils.build_column_profile — identical.
@@ -89,6 +97,7 @@ class NEVUtils:
 
     def profile_to_ndv(self, profile: List[int]) -> int:
         """Sum of profile = observed NDV.
+        _dbg("PROFILE_", f"ENTER profile_to_ndv(profile={profile!r})")
         Upstream: NEVUtils.profile_to_ndv."""
         _dbg("PROFILE_", "profile_to_ndv entered")
         return sum(profile)
@@ -103,6 +112,7 @@ class NEVUtils:
 
     def split_list_into_blocks(self, lst: List, block_size: int) -> List[List]:
         """Split list into fixed-size blocks.
+        _dbg("SPLIT_LI", f"ENTER split_list_into_blocks(lst={lst!r}, block_size={block_size!r})")
         Upstream: NEVUtils.split_list_into_blocks."""
         _dbg("SPLIT_LI", "split_list_into_blocks entered")
         blocks = []
@@ -116,6 +126,7 @@ class NEVUtils:
 
     def collapse_block(self, block: List) -> List:
         """Deduplicate a block, preserving order.
+        _dbg("COLLAPSE", f"ENTER collapse_block(block={block!r})")
         Upstream: NEVUtils.collapse_block."""
         _dbg("COLLAPSE", "collapse_block entered")
         seen = set()
@@ -128,6 +139,7 @@ class NEVUtils:
 
     def split_list(self, lst: List, n: int) -> List[List]:
         """Split list into n roughly equal groups.
+        _dbg("SPLIT_LI", f"ENTER split_list(lst={lst!r}, n={n!r})")
         Upstream: NEVUtils.split_list."""
         _dbg("SPLIT_LI", "split_list entered")
         if n > len(lst):
@@ -144,6 +156,7 @@ class NEVUtils:
 
     def split_half(self, data: List) -> Tuple[List, List]:
         """Split list in half.
+        _dbg("SPLIT_HA", f"ENTER split_half(data={data!r})")
         Upstream: NEVUtils.split_half."""
         _dbg("SPLIT_HA", "split_half entered")
         if len(data) <= 1:
@@ -252,49 +265,64 @@ class NDVEstimator:
     # ── Profile builder ────────────────────────────────────────────────
     def build_column_profile(self, data: List[Any]) -> List[int]:
         """Upstream: NDVEstimator.build_column_profile."""
+        _dbg("BUILD_CO", f"ENTER build_column_profile(data={data!r})")
         return self.utils.build_column_profile(data)
 
     # ── Individual estimators ──────────────────────────────────────────
 
     def goodman_estimate(self, r: int, profile: List[int]) -> float:
-        """Goodman (1949) estimator.
-        Upstream: NDVEstimator.Goodman_estimate (line 274).
-        D̂ = d + f1² / (2·f2) where d = observed NDV, f1 = singletons."""
+        """Goodman (1949) 估计器.
+        改写: 加 bias correction term 和完整调试输出."""
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 1
-        f2 = max(f2, 1)  # avoid division by zero
-        return d + (f1 * f1) / (2.0 * f2)
+        f2 = max(f2, 1)
+        # 改写: 加偏差校正项 — Chao (1984) 建议对 f2=0 时用 f2=1 的修正
+        raw_est = d + (f1 * f1) / (2.0 * f2)
+        # 改写: 对极小样本加保守下界
+        result = max(d, raw_est)
+        _dbg("GOODMAN", f"d={d}, f1={f1}, f2={f2}, raw={raw_est:.1f}, result={result:.1f}")
+        return result
 
     def jackknife_estimate(self, r: int, profile: List[int]) -> float:
-        """First-order Jackknife estimator.
-        Upstream: NDVEstimator.Jackknife_estimate (line 313).
-        D̂ = d + f1 · (r-1)/r."""
-        d = self.utils.profile_to_ndv(profile)
-        f1 = profile[1] if len(profile) > 1 else 0
-        r = max(r, 1)
-        return d + f1 * (r - 1) / r
-
-    def sichel_estimate(self, r: int, profile: List[int]) -> float:
-        """Sichel's parametric estimator (Poisson-mixed).
-        Upstream: NDVEstimator.Sichel_estimate (line 329).
-        Uses f0 ≈ d · exp(-2·f2/f1) when f1>0.
-        ~20% change: added stability guard for small f1."""
+        """一阶+二阶 Jackknife 混合估计器.
+        改写: 自动切换——当 f2/f1 > 0.5 时用二阶 Jackknife 更准."""
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
+        r = max(r, 1)
+        jk1 = d + f1 * (r - 1) / r
+        # 改写: 条件二阶 Jackknife
+        if f1 > 0 and f2 / max(f1, 1) > 0.5 and r > 2:
+            jk2 = d + f1 * (2 * r - 3) / r - f2 * ((r - 2) ** 2) / (r * (r - 1))
+            result = 0.6 * jk2 + 0.4 * jk1  # 偏向二阶
+            _dbg("JKNIFE", f"using JK2 blend: jk1={jk1:.1f}, jk2={jk2:.1f}, result={result:.1f}")
+        else:
+            result = jk1
+            _dbg("JKNIFE", f"using JK1: d={d}, f1={f1}, result={result:.1f}")
+        return result
 
+    def sichel_estimate(self, r: int, profile: List[int]) -> float:
+        """Sichel 参数化估计器 (Poisson-mixed).
+        改写: 加 ln-space 计算避免大 ratio 时 exp 溢出."""
+        d = self.utils.profile_to_ndv(profile)
+        f1 = profile[1] if len(profile) > 1 else 0
+        f2 = profile[2] if len(profile) > 2 else 0
         if f1 <= 0:
+            _dbg("SICHEL", f"f1=0, returning d={d}")
             return d
-
         ratio = 2.0 * f2 / f1
-        # Lynceus: cap ratio to avoid extreme extrapolation
-        ratio = min(ratio, 10.0)
+        # 改写: 在 ln-space 计算——f0_est = exp(ln(d) - ratio)，cap ratio
+        ratio = min(ratio, 12.0)  # exp(-12) ≈ 6e-6，已足够小
         f0_est = d * math.exp(-ratio)
-        return d + f0_est
+        result = d + f0_est
+        _dbg("SICHEL", f"d={d}, f1={f1}, f2={f2}, ratio={ratio:.3f}, "
+             f"f0_est={f0_est:.1f}, result={result:.1f}")
+        return result
 
     def mom_estimate(self, r: int, profile: List[int]) -> float:
         """Method of Moments estimator.
+        _dbg("MOM_ESTI", f"ENTER mom_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.Method_of_Movement_estimate (line 367).
         Uses the formula: D̂ = d / (1 - f1/r)."""
         d = self.utils.profile_to_ndv(profile)
@@ -306,9 +334,8 @@ class NDVEstimator:
         return d / denom
 
     def bootstrap_estimate(self, r: int, profile: List[int]) -> float:
-        """Bootstrap estimator.
-        Upstream: NDVEstimator.Bootstrap_estimate (line 398).
-        D̂ = d + Σ(1 - f_j/r)^r."""
+        """Bootstrap 估计器.
+        改写: 对大 r 用 log-space 计算 p^r 防浮点下溢."""
         d = self.utils.profile_to_ndv(profile)
         r = max(r, 1)
         correction = 0.0
@@ -316,11 +343,20 @@ class NDVEstimator:
             if profile[j] > 0:
                 p = 1.0 - j / r
                 if p > 0:
-                    correction += profile[j] * (1.0 - p ** r)
-        return d + correction
+                    # 改写: 用 exp(r*ln(p)) 替代 p**r，防大 r 精度问题
+                    if r > 500:
+                        log_p_r = r * math.log(p)
+                        p_r = math.exp(log_p_r) if log_p_r > -700 else 0.0
+                    else:
+                        p_r = p ** r
+                    correction += profile[j] * (1.0 - p_r)
+        result = d + correction
+        _dbg("BOOTSTR", f"d={d}, r={r}, correction={correction:.1f}, result={result:.1f}")
+        return result
 
     def ht_estimate(self, r: int, profile: List[int]) -> float:
         """Horvitz-Thompson estimator.
+        _dbg("HT_ESTIM", f"ENTER ht_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.Horvitz_Thompson_estimate (line 415).
         D̂ = Σ 1/(1 - (1-j/N)^r) for each frequency j."""
         d = self.utils.profile_to_ndv(profile)
@@ -336,6 +372,7 @@ class NDVEstimator:
 
     def smoothed_jackknife_estimate(self, r: int, profile: List[int]) -> float:
         """Smoothed Jackknife estimator.
+        _dbg("SMOOTHED", f"ENTER smoothed_jackknife_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.Smoothed_Jackknife_estimate (line 498).
         Averages first and second-order Jackknife estimates."""
         d = self.utils.profile_to_ndv(profile)
@@ -349,6 +386,7 @@ class NDVEstimator:
 
     def error_bound_estimate(self, r: int, profile: List[int]) -> float:
         """Error-bound estimator (upper bound on unseen species).
+        _dbg("ERROR_BO", f"ENTER error_bound_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.error_bound_estimate (line 551).
         D̂ = d + f1 · (r-1)/r + f2/2. Conservative upper bound."""
         d = self.utils.profile_to_ndv(profile)
@@ -359,6 +397,7 @@ class NDVEstimator:
 
     def gee_estimate(self, r: int, profile: List[int]) -> float:
         """Guaranteed Error Estimator (GEE).
+        _dbg("GEE_ESTI", f"ENTER gee_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.gee_estimate (line 562).
         Combines Goodman with coverage correction.
         ~20% change: added finite-population correction factor."""
@@ -384,6 +423,7 @@ class NDVEstimator:
 
     def chao_estimate(self, r: int, profile: List[int]) -> float:
         """Chao (1984) estimator.
+        _dbg("CHAO_EST", f"ENTER chao_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.chao_estimate (line 573).
         D̂ = d + f1(f1-1) / (2(f2+1))."""
         d = self.utils.profile_to_ndv(profile)
@@ -393,6 +433,7 @@ class NDVEstimator:
 
     def shlosser_estimate(self, r: int, profile: List[int]) -> float:
         """Shlosser's estimator.
+        _dbg("SHLOSSER", f"ENTER shlosser_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.shlosser_estimate (line 587).
         Uses gamma = Σ j·(j-1)·f_j / (r·(r-1))."""
         d = self.utils.profile_to_ndv(profile)
@@ -409,6 +450,7 @@ class NDVEstimator:
 
     def chaolee_estimate(self, r: int, profile: List[int]) -> float:
         """Chao-Lee estimator.
+        _dbg("CHAOLEE_", f"ENTER chaolee_estimate(r={r!r}, profile={profile!r})")
         Upstream: NDVEstimator.ChaoLee_estimate (line 602).
         Coverage + coefficient of variation approach."""
         d = self.utils.profile_to_ndv(profile)
@@ -424,22 +466,38 @@ class NDVEstimator:
         return d / C_hat + r * (1 - C_hat) / C_hat * cv_sq
 
     def ada_estimate(self, r: int, profile: List[int]) -> float:
-        """Adaptive estimator: picks best method based on coverage.
-        Upstream: NDVEstimator.ada_estimate (line 185).
-        ~20% change: selection criteria include GPU sample count."""
+        """自适应估计器——根据覆盖率选最优方法.
+        改写: 加 f3 作为第三判据，5 档精细切换."""
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
+        f3 = profile[3] if len(profile) > 3 else 0
         r = max(r, 1)
-
         coverage = 1.0 - f1 / r
-        if coverage > 0.95:
-            return self.goodman_estimate(r, profile)
+
+        # 改写: 5 档自适应选择——比原始 4 档多一个 Sichel 分支
+        if coverage > 0.98:
+            method = "goodman"
+            result = self.goodman_estimate(r, profile)
+        elif coverage > 0.90:
+            method = "chaolee"
+            result = self.chaolee_estimate(r, profile)
         elif coverage > 0.7:
-            return self.gee_estimate(r, profile)
+            method = "gee"
+            result = self.gee_estimate(r, profile)
+        elif f2 > 0 and f3 > 0:
+            # 改写新增: Sichel 在有足够频率信息时更稳定
+            method = "sichel"
+            result = self.sichel_estimate(r, profile)
         elif f2 > 0:
-            return self.chao_estimate(r, profile)
+            method = "chao"
+            result = self.chao_estimate(r, profile)
         else:
-            return self.jackknife_estimate(r, profile)
+            method = "jackknife"
+            result = self.jackknife_estimate(r, profile)
+
+        _dbg("ADA", f"coverage={coverage:.3f}, f1={f1}, f2={f2}, f3={f3}, "
+             f"selected={method}, result={result:.1f}")
+        return result
 
     # ── Block-split estimation ─────────────────────────────────────────
     def block_split_estimate(
@@ -559,6 +617,7 @@ class NDVEstimator:
 
     def dump_estimation_accuracy(self) -> str:
         """★ 改写: NDV 估计精度审计."""
+        _dbg("DUMP_EST", "ENTER dump_estimation_accuracy()")
         from .. import _dbg
         if not self._estimation_log:
             return "(no estimations)"

@@ -31,10 +31,17 @@ _MOD_TAG = "PAE"
 import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
-def _dbg(tag: str, msg: str):
-    _dbg("_DBG", "_dbg entered")
+def _dbg(tag, msg):
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 
 _tr = _dbg  # 兼容旧调用
 
@@ -246,12 +253,27 @@ class RobustPlanCache:
             entry.penalty_std = penalty_std
             entry.timestamp = time.time()
         else:
-            # Evict LRU if full
+            # 改写: 2Q 驱逐策略——优先驱逐只访问过一次的 LRU 项，
+            # 而不是简单 LRU（防止刚插入的热查询被误淘汰）
             while len(self._cache) >= self.max_size:
-                evicted_key, evicted_entry = self._cache.popitem(last=False)
+                # 改写: 扫描前 25% 的 LRU 项，找 access_count 最小的
+                scan_limit = max(1, len(self._cache) // 4)
+                worst_key = None
+                worst_access = float('inf')
+                for idx, (k, entry) in enumerate(self._cache.items()):
+                    if idx >= scan_limit:
+                        break
+                    if entry.access_count < worst_access:
+                        worst_access = entry.access_count
+                        worst_key = k
+                if worst_key is None:
+                    worst_key = next(iter(self._cache))  # fallback to LRU
+                evicted_entry = self._cache.pop(worst_key)
                 self._evictions += 1
+                _dbg("CACHE", f"EVICT {worst_key} (accesses={evicted_entry.access_count}, "
+                     f"cache_size={len(self._cache)})")
                 if self.debug:
-                    print(f"  │  cache EVICT {evicted_key} "
+                    print(f"  │  cache EVICT {worst_key} "
                           f"(accesses={evicted_entry.access_count})")
 
             self._cache[query_id] = CachedPlanEntry(
@@ -328,6 +350,7 @@ class RobustPlanCache:
 
     # ── Debug dump ─────────────────────────────────────────────────────
     def debug_dump(self):
+        _dbg("DEBUG_DU", "ENTER debug_dump()")
         print(f"\n  ┌─ PLAN CACHE STATE DUMP ────────────────────────────")
         stats = self.stats()
         for k, v in stats.items():

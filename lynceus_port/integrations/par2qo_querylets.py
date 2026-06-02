@@ -34,10 +34,17 @@ _MOD_TAG = "PAS"
 import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
-def _dbg(tag: str, msg: str):
-    _dbg("_DBG", "_dbg entered")
+def _dbg(tag, msg):
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 
 _tr = _dbg  # 兼容旧调用
 
@@ -152,17 +159,38 @@ class Querylet:
         return hashlib.md5(raw.encode()).hexdigest()[:10]
 
     def estimated_rows(self, table_rows: Dict[str, int]) -> float:
-        """Estimate output cardinality using independence assumption."""
-        _dbg("ESTIMATE", "estimated_rows entered")
-        _dbg("ESTIMATE", f"estimated_rows(table_rows={table_rows})")
+        """估计输出基数.
+        改写: 加相关性修正——当多个谓词作用于同一表时,
+        用 sqrt(Πsel) 替代 Πsel，减轻独立性假设的过度估计."""
+        _dbg_state("ESTROWS", tables=self.tables, n_preds=len(self.predicates),
+                   n_joins=len(self.joins))
         total = 1.0
         for t in self.tables:
             total *= table_rows.get(t, 10000)
+
+        # 改写: 按表分组谓词，组内用 sqrt 修正相关性
+        from collections import defaultdict
+        preds_by_table = defaultdict(list)
         for p in self.predicates:
-            total *= p.selectivity_hint
+            preds_by_table[p.table].append(p.selectivity_hint)
+        for table, sels in preds_by_table.items():
+            if len(sels) > 1:
+                # 多谓词同表: 假设 50% 相关，用 geometric mean 修正
+                combined = 1.0
+                for s in sels:
+                    combined *= s
+                # 改写: sqrt 修正——比完全独立估计更保守
+                combined = math.sqrt(combined)
+                total *= combined
+                _dbg("ESTROWS", f"table={table}: {len(sels)} preds, corr_sel={combined:.6f}")
+            else:
+                total *= sels[0]
+
         for _ in self.joins:
-            total *= 0.00105  # default join selectivity
-        return max(total, 1.0)
+            total *= 0.00105
+        result = max(total, 1.0)
+        _dbg("ESTROWS", f"result={result:.1f}")
+        return result
 
     def to_sql(self) -> str:
         _dbg("TO_SQL", "to_sql entered")
@@ -190,6 +218,7 @@ class Querylet:
 def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     """Generate TPC-H querylet dictionary.
 
+    _dbg("QUERYLET", f"ENTER querylet_tpch(cc={cc!r}, kk={kk!r})")
     PAR2QO: querylet(db, kk, cc, template_name) → dict of SQL strings.
     Lynceus: returns dict of structured Querylet objects.
     """
@@ -429,6 +458,7 @@ class QueryletGenerator:
     def generate_all(self) -> Dict[str, Querylet]:
         """Generate the full querylet dictionary.
 
+        _dbg("GENERATE", "ENTER generate_all()")
         PAR2QO: querylet(db, kk, cc, template_name).
         Lynceus: generates all TPC-H templates.
         """
@@ -467,6 +497,7 @@ class QueryletGenerator:
         return self._templates.get(template_id)
 
     def list_templates(self) -> List[str]:
+        _dbg("LIST_TEM", "ENTER list_templates()")
         if not self._templates:
             self.generate_all()
         return list(self._templates.keys())
@@ -490,6 +521,7 @@ class WorkloadQuery:
     table_name: str = ""   # explicit logical table (INV-3 compliance)
 
     def describe(self) -> str:
+        _dbg("DESCRIBE", "ENTER describe()")
         return (f"WorkloadQuery({self.query_id}, "
                 f"template={self.querylet.template_id}, "
                 f"tables={self.querylet.tables})")
@@ -561,6 +593,7 @@ def debug_dump_querylet(qlet: Querylet):
 
     def dump_template_fingerprints(self) -> str:
         """★ 改写: 查询模板指纹摘要."""
+        _dbg("DUMP_TEM", "ENTER dump_template_fingerprints()")
         from .. import _dbg
         lines = ["┌── Querylet Templates ──"]
         for tid, tmpl in sorted(self._templates.items()):

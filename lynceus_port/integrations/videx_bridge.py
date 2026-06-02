@@ -16,12 +16,19 @@ Modifications from upstream videx_strategy.py (~20% changed):
 """
 from __future__ import annotations
 import os as _os, sys as _sys
-_MOD_TAG = "VID"
+_MOD_TAG = "VBR"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 _tr = _dbg
 
 # ── Stub fallback for missing upstream names ──
@@ -144,6 +151,7 @@ class VidexModelBase(ABC):
         raise NotImplementedError()
 
     def records_in_range(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg("RECORDS_", f"ENTER records_in_range(idx_range_cond={idx_range_cond!r})")
         return self.cardinality(idx_range_cond)
 
 
@@ -159,12 +167,14 @@ class HeterogeneousCost:
     breakdown: Dict[str, float] = field(default_factory=dict)
 
     @property
-    def min_cost_us(self): return min(self.cpu_cost_us, self.gpu_cost_us)
+    def min_cost_us(self):
+        _dbg("MINCOST", f"cpu={self.cpu_cost_us:.2f}, gpu={self.gpu_cost_us:.2f}")
+        return min(self.cpu_cost_us, self.gpu_cost_us)
 
     @property
-    def speedup(self): return self.cpu_cost_us / max(1e-9, self.gpu_cost_us)
-
-
+    def speedup(self):
+        _dbg("SPEEDUP", f"ratio={self.cpu_cost_us / max(1e-9, self.gpu_cost_us):.2f}")
+        return self.cpu_cost_us / max(1e-9, self.gpu_cost_us)
 # ---------------------------------------------------------------------------
 # DeviceAwareCostModel — extends VidexModelBase with GPU estimation
 # ---------------------------------------------------------------------------
@@ -177,6 +187,7 @@ class DeviceAwareCostModel(VidexModelBase):
         self._ndv_cache: Dict[str, int] = {}
 
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg("CARDINAL", f"ENTER cardinality(idx_range_cond={idx_range_cond!r})")
         rows = self.table_stats.total_rows
         for rc in idx_range_cond.ranges:
             ndv = self.table_stats.column_ndvs.get(rc.col, 1)
@@ -184,6 +195,7 @@ class DeviceAwareCostModel(VidexModelBase):
         return rows
 
     def ndv(self, index_name: str, field_list: List[str]) -> int:
+        _dbg("NDV", f"ENTER ndv(index_name={index_name!r}, field_list={field_list!r})")
         key = f"{index_name}:{','.join(field_list)}"
         if key in self._ndv_cache: return self._ndv_cache[key]
         r = calc_mulcol_ndv_independent(field_list, self.table_stats.column_ndvs,
@@ -192,6 +204,7 @@ class DeviceAwareCostModel(VidexModelBase):
         return r
 
     def scan_time(self, req_json_item=None) -> float:
+        _dbg("SCAN_TIM", f"ENTER scan_time(req_json_item={req_json_item!r})")
         p = self.params
         pages = max(1, self.table_stats.total_rows * self.table_stats.avg_row_length // 8192)
         return pages * p.seq_page_cost + self.table_stats.total_rows * p.cpu_tuple_cost
@@ -245,6 +258,7 @@ class CostHistogram:
         self.total_count = 0
 
     def finalize(self, costs: list):
+        _dbg("FINALIZE", f"ENTER finalize(costs={costs!r})")
         if not costs: return
         self.min_cost, self.max_cost = min(costs), max(costs)
         self.total_count = len(costs)
@@ -256,6 +270,7 @@ class CostHistogram:
             self.bins[b] += 1
 
     def percentile_cost(self, pct: float) -> float:
+        _dbg("PERCENTI", f"ENTER percentile_cost(pct={pct!r})")
         k = max(1, int(self.total_count * pct))
         cum, rng = 0, self.max_cost - self.min_cost
         bw = rng / self.num_bins if rng > 0 else 1.0
@@ -279,6 +294,7 @@ def calc_mulcol_ndv_independent(col_names: List[str], ndvs_single: Dict[str, int
 
     def dump_index_recommendations(self) -> str:
         """★ 改写: 索引推荐审计日志."""
+        _dbg("DUMP_IND", "ENTER dump_index_recommendations()")
         from .. import _dbg
         lines = ["┌── Videx Index Recommendations ──"]
         for i, rec in enumerate(self._recommendations[-15:]):

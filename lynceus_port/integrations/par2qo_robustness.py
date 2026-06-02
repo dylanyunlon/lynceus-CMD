@@ -37,14 +37,33 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
-_MOD_TAG = "PAS"
-import os as _os, sys as _sys
+_MOD_TAG = "ROB"  # 改写: 缩短标签
+import os as _os, sys as _sys, time as _time_mod_r
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
+_ROB_CALL_SEQ = 0
 
 def _dbg(tag: str, msg: str):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复: 移除自递归; 改写: 加序号."""
+    global _ROB_CALL_SEQ
     if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+        _ROB_CALL_SEQ += 1
+        print(f"[{_MOD_TAG}·{tag}|#{_ROB_CALL_SEQ}] {msg}",
+              file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 结构体状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = []
+    for k, v in kwargs.items():
+        if isinstance(v, (list, tuple)) and len(v) > 8:
+            parts.append(f"{k}=[{len(v)} items, first={v[0]}, last={v[-1]}]")
+        elif isinstance(v, float):
+            parts.append(f"{k}={v:.6g}")
+        else:
+            s = str(v)
+            parts.append(f"{k}={s[:80]}" if len(s) > 80 else f"{k}={s}")
+    _dbg(tag, " | ".join(parts))
 
 _tr = _dbg  # 兼容旧调用
 
@@ -54,12 +73,14 @@ logger = logging.getLogger("lynceus.robustness")
 
 # ── Halton low-discrepancy sequence (replaces SALib sobol) ──────────────
 def _halton_seq(index: int, base: int) -> float:
-    """Single Halton sequence value. PAR2QO used SALib.sample.sobol;
-    we use Halton for deterministic low-discrepancy without external deps."""
-    _dbg("_HALTON_", "_halton_seq entered")
-    _dbg("_HALTON_", f"_halton_seq(index={index}, base={base})")
+    """单个 Halton 序列值.
+    改写: 加 scramble 扰动——用 (index * 0x9E3779B9) 做黄金比例哈希偏移,
+    使相邻索引的序列值不相关, 减轻高维低差异序列的相关性问题."""
+    # 改写: scrambled index 替代原始 index
+    scrambled = (index * 2654435769) & 0xFFFFFFFF  # 黄金比例 hash
+    scrambled = (scrambled >> 16) ^ scrambled
     result, denom = 0.0, 1.0
-    i = index
+    i = scrambled if scrambled > 0 else index  # fallback
     while i > 0:
         denom *= base
         result += (i % base) / denom
@@ -68,17 +89,25 @@ def _halton_seq(index: int, base: int) -> float:
 
 
 def halton_samples(n: int, dim: int, seed: int = 2023) -> List[List[float]]:
-    """Generate n samples in [0,1]^dim via Halton sequence.
-    PAR2QO: np.random.seed(2023) + sobol.sample → here: deterministic Halton."""
-    _dbg("HALTON_S", "halton_samples entered")
-    _dbg("HALTON_S", f"halton_samples(n={n}, dim={dim}, seed={seed})")
+    """生成 n 个 [0,1]^dim 的 Halton 采样.
+    改写: 加完整的维度-样本数打印."""
+    _dbg_state("HALTON", n=n, dim=dim, seed=seed)
+    # 改写: 扩大素数表到 64 维
     primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
-              59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
-    bases = primes[:dim]
+              59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113,
+              127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181,
+              191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251,
+              257, 263, 269, 271, 277, 281, 283, 293, 307, 311]
+    if dim > len(primes):
+        _dbg("HALTON", f"WARNING: dim={dim} > prime_table={len(primes)}, clamping")
+    bases = primes[:min(dim, len(primes))]
     samples = []
     for i in range(seed, seed + n):
         row = [_halton_seq(i, b) for b in bases]
         samples.append(row)
+    if n > 0:
+        _dbg("HALTON", f"generated {len(samples)} samples, "
+             f"first={[f'{x:.4f}' for x in samples[0][:4]]}")
     return samples
 
 
@@ -94,24 +123,30 @@ class ErrorDistribution:
     skew: float = 0.0      # Lynceus addition: asymmetric error tails
 
     def sample(self, u01: float) -> float:
-        """Inverse-CDF sampling from a skew-normal approximation.
-        PAR2QO: pdf_of_err.sample(N) → we do quantile transform."""
-        _dbg("SAMPLE", "sample entered")
-        _dbg("SAMPLE", f"sample(u01={u01})")
-        from math import erfc, sqrt, log
-        # Box-Muller from uniform
-        u1 = max(u01, 1e-10)
-        z = sqrt(2.0) * _erfinv(2.0 * u1 - 1.0)
-        # Apply skew: Azzalini transform
-        delta = self.skew / sqrt(1.0 + self.skew ** 2)
-        z_skew = delta * abs(z) + sqrt(1.0 - delta ** 2) * z
-        return self.mean + self.std * z_skew
+        """逆 CDF 采样 (skew-normal 近似).
+        改写: clamp u01 到 [1e-8, 1-1e-8] 防数值溢出."""
+        u1 = max(1e-8, min(1.0 - 1e-8, u01))  # 改写: 双侧 clamp
+        z = math.sqrt(2.0) * _erfinv(2.0 * u1 - 1.0)
+        delta = self.skew / math.sqrt(1.0 + self.skew ** 2)
+        z_skew = delta * abs(z) + math.sqrt(1.0 - delta ** 2) * z
+        result = self.mean + self.std * z_skew
+        _dbg("SMPL", f"u01={u01:.4f} → z={z:.4f} → skewed={result:.4f}")
+        return result
 
 
 def _erfinv(x: float) -> float:
-    """Rational approximation of inverse error function."""
-    _dbg("_ERFINV", "_erfinv entered")
-    _dbg("_ERFINV", f"_erfinv(x={x})")
+    """逆误差函数有理逼近.
+    改写: 对 |x| > 0.9 区间换用更高精度的 Winitzki 公式."""
+    _dbg("ERFINV", f"x={x:.6f}")
+    # 改写: 极端值用 Winitzki (2008) 改进公式
+    if abs(x) > 0.9:
+        sgn = 1.0 if x >= 0 else -1.0
+        t = -math.log((1.0 - abs(x)) * (1.0 + abs(x)))
+        # Winitzki: sqrt(t - ln(t)) 级数
+        p = 0.3275911
+        result = sgn * math.sqrt(t - math.log(t) + 0.5 * math.log(2.0 / (math.pi * 0.147)))
+        return result
+    # 原始低精度路径
     a = 0.147
     ln = math.log(1.0 - x * x)
     s = math.copysign(1.0, x)

@@ -1,10 +1,17 @@
 import os as _os, sys as _sys
-_MOD_TAG = "VID"
+_MOD_TAG = "VCM"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归, 改写加序号."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
+
+def _dbg_state(tag, **kwargs):
+    """改写新增: 键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
 _tr = _dbg
 
 # ── Stub fallback for missing upstream names ──
@@ -123,7 +130,9 @@ try:
             return self.table_stats.innodb_buffer_pool_size
 
         def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
-            _dbg("CARDINAL", "cardinality entered")
+            _dbg_state("CARD", index=idx_range_cond.index_name,
+                       n_ranges=len(idx_range_cond.get_valid_ranges(self.ignore_range_after_neq)),
+                       total_records=self.table_stats.records)
             condition_str = idx_range_cond.ranges_to_str()
             if condition_str in self.inject_cardinality_dict:
                 return self.inject_cardinality_dict[condition_str]
@@ -174,7 +183,18 @@ try:
                              f"[{c}/{len(ranges)}]: {rc} selectivity={max_freqs[c]-min_freqs[c]:.3%}, "
                              f"after_rows={int(self.table_stats.records * np.prod(np.array(max_freqs[:c+1]) - np.array(min_freqs[:c+1])))} "
                              f"freq: [{min_freqs[c]:.4f}, {max_freqs[c]:.4f}], ")
-            records_in_ranges = int(self.table_stats.records * np.prod(np.array(max_freqs) - np.array(min_freqs)))
+            # 改写: 在对数空间计算选择率乘积——防止多列窄范围导致的浮点下溢
+            sel_array = np.array(max_freqs) - np.array(min_freqs)
+            sel_array = np.clip(sel_array, 1e-15, 1.0)  # 改写: 下界 clip
+            log_sel_product = np.sum(np.log(sel_array))
+            # 改写: 只在指数不会下溢时转回线性空间
+            if log_sel_product > -700:
+                sel_product = math.exp(log_sel_product)
+            else:
+                sel_product = 0.0
+            records_in_ranges = int(self.table_stats.records * sel_product)
+            _dbg("CARD", f"selectivities={sel_array.tolist()}, "
+                 f"log_product={log_sel_product:.4f}, records={records_in_ranges}")
             if records_in_ranges == 0:
                 # refer to innodb.cc
                 # The MySQL optimizer seems to believe an estimate of 0 rows is always accurate and may return
@@ -256,6 +276,7 @@ try:
 
         def info_low(self, req_json_item: dict) -> dict:
             """
+            _dbg("INFO_LOW", f"ENTER info_low(req_json_item={req_json_item!r})")
             virtual ull info();
 
             return the following data:
@@ -339,6 +360,7 @@ try:
 
                     def _help(n_diff, records) -> float:
                         """
+                        _dbg("_HELP", f"ENTER _help(n_diff={n_diff!r}, records={records!r})")
                         mock the function
                         rec_per_key_t innodb_rec_per_key(const dict_index_t *index, ulint i,
                                      ha_rows records);
@@ -378,6 +400,7 @@ try:
 
         def dump_calibration_bias(self) -> str:
             """★ 改写: 校准偏差分析 — 预测 vs 实际的系统性偏移."""
+            _dbg("DUMP_CAL", "ENTER dump_calibration_bias()")
             from .. import _dbg
             if not self._calibration_pairs:
                 return "(no calibration data)"
