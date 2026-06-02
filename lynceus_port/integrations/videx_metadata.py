@@ -32,6 +32,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -86,10 +87,12 @@ class ColumnMeta:
 
     def storage_bytes(self, n_rows: int) -> int:
         """Estimate column storage in bytes."""
+        _dbg("STORAGE_", "storage_bytes entered")
         return n_rows * self.avg_width
 
     def gpu_memory_mb(self, n_rows: int) -> float:
         """Estimate GPU memory needed for this column."""
+        _dbg("GPU_MEMO", "gpu_memory_mb entered")
         return self.storage_bytes(n_rows) / (1024 * 1024)
 
 
@@ -113,14 +116,17 @@ class TableMeta:
 
     @property
     def data_size_mb(self) -> float:
+        _dbg("DATA_SIZ", "data_size_mb entered")
         if self.data_size_bytes > 0:
             return self.data_size_bytes / (1024 * 1024)
         return self.row_count * self.avg_row_length / (1024 * 1024)
 
     def column_names(self) -> List[str]:
+        _dbg("COLUMN_N", "column_names entered")
         return list(self.columns.keys())
 
     def get_column(self, name: str) -> Optional[ColumnMeta]:
+        _dbg("GET_COLU", "get_column entered")
         return self.columns.get(name.lower())
 
 
@@ -205,6 +211,7 @@ class TableStatisticsInfo:
     def get_col_hist(self, col: str) -> Optional[HistogramStats]:
         """Get histogram for a column.
         Upstream: VidexTableStats.get_col_hist(col)."""
+        _dbg("GET_COL_", "get_col_hist entered")
         return self.col_hists.get(col.lower())
 
     def get_ideal_ndv(
@@ -280,6 +287,7 @@ class VidexDBTaskStats:
 
     def get_stats_info_keys(self) -> Dict[str, List[str]]:
         """Upstream: VidexDBTaskStats.get_stats_info_keys."""
+        _dbg("GET_STAT", "get_stats_info_keys entered")
         return {
             db: sorted(tables.keys())
             for db, tables in self.stats_dict.items()

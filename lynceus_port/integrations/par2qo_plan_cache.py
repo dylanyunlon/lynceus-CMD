@@ -32,6 +32,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -58,11 +59,13 @@ class CachedPlanEntry:
     last_access: float = 0.0
 
     def touch(self):
+        _dbg("TOUCH", "touch entered")
         self.access_count += 1
         self.last_access = time.time()
 
     @property
     def best_plan(self) -> int:
+        _dbg("BEST_PLA", "best_plan entered")
         return self.plan_indices[0] if self.plan_indices else -1
 
 
@@ -263,6 +266,7 @@ class RobustPlanCache:
                   f"[{device_preference or 'auto'}] penalty={expected_penalty:.1f}")
 
     def remove(self, query_id: str) -> bool:
+        _dbg("REMOVE", "remove entered")
         _dbg("REMOVE", f"remove(query_id={query_id})")
         if query_id in self._cache:
             del self._cache[query_id]
@@ -271,14 +275,17 @@ class RobustPlanCache:
 
     @property
     def cache_hit_ratio(self) -> float:
+        _dbg("CACHE_HI", "cache_hit_ratio entered")
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     @property
     def cold_hit_rate(self) -> float:
+        _dbg("COLD_HIT", "cold_hit_rate entered")
         return self._cold_hits / self._hits if self._hits > 0 else 0.0
 
     def stats(self) -> Dict[str, Any]:
+        _dbg("STATS", "stats entered")
         return {
             "size": len(self._cache),
             "max_size": self.max_size,
@@ -292,6 +299,7 @@ class RobustPlanCache:
 
     # ── Serialization ──────────────────────────────────────────────────
     def to_json(self) -> str:
+        _dbg("TO_JSON", "to_json entered")
         data = {}
         for k, e in self._cache.items():
             data[k] = {

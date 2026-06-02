@@ -33,6 +33,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -81,6 +82,7 @@ class BTreeKeyOp(Enum):
     def init(value: str) -> "BTreeKeyOp":
         """Parse a string into a BTreeKeyOp.
         Upstream: BTreeKeyOp.init(value)."""
+        _dbg("INIT", "init entered")
         for member in BTreeKeyOp:
             if member.value == value or member.name == value:
                 return member
@@ -92,6 +94,7 @@ class BTreeKeyOp(Enum):
 
     @property
     def is_inclusive(self) -> bool:
+        _dbg("IS_INCLU", "is_inclusive entered")
         return self in (
             BTreeKeyOp.KEY_EXACT,
             BTreeKeyOp.KEY_OR_NEXT,
@@ -110,6 +113,7 @@ class BTreeKeySide(Enum):
     def from_op(op: Union[str, BTreeKeyOp]) -> "BTreeKeySide":
         """Determine side from operation.
         Upstream: BTreeKeySide.from_op."""
+        _dbg("FROM_OP", "from_op entered")
         if isinstance(op, str):
             op = BTreeKeyOp.init(op)
         if op in (BTreeKeyOp.KEY_OR_NEXT, BTreeKeyOp.AFTER_KEY):
@@ -141,6 +145,7 @@ class RangeCond:
     def _check_op_and_side(op: str, is_min: bool):
         """Validate op/side consistency.
         Upstream: RangeCond._check_op_and_side."""
+        _dbg("_CHECK_O", "_check_op_and_side entered")
         parsed = BTreeKeyOp.init(op)
         side = BTreeKeySide.from_op(parsed)
         expected = BTreeKeySide.MIN if is_min else BTreeKeySide.MAX
@@ -156,12 +161,14 @@ class RangeCond:
 
     def add_min(self, op: str, value: str, side: BTreeKeySide):
         """Upstream: RangeCond.add_min."""
+        _dbg("ADD_MIN", "add_min entered")
         self.min_op = op
         self.min_value = value
         self.min_side = side
 
     def add_max(self, op: str, value: str, side: BTreeKeySide):
         """Upstream: RangeCond.add_max."""
+        _dbg("ADD_MAX", "add_max entered")
         self.max_op = op
         self.max_value = value
         self.max_side = side
@@ -169,6 +176,7 @@ class RangeCond:
     @property
     def valid(self) -> bool:
         """Upstream: RangeCond.valid."""
+        _dbg("VALID", "valid entered")
         return self.has_min or self.has_max
 
     @property

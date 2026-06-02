@@ -19,6 +19,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -64,6 +65,7 @@ class RangeCond:
     is_equality: bool = False
 
     def selectivity(self, total_rows: int, ndv: int) -> float:
+        _dbg("SELECTIV", "selectivity entered")
         if ndv <= 0: return 1.0
         return 1.0 / ndv if self.is_equality else min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))
 
@@ -74,6 +76,7 @@ class IndexRangeCond:
     ranges: List[RangeCond] = field(default_factory=list)
 
     def ranges_to_str(self) -> str:
+        _dbg("RANGES_T", "ranges_to_str entered")
         parts = []
         for r in self.ranges:
             if r.is_equality:
@@ -116,23 +119,28 @@ class VidexModelBase(ABC):
     """Abstract cost model class. VIDEX-Statistic-Server receives requests
     from VIDEX-MySQL for Cardinality and NDV estimates."""
     def __init__(self, stats: TableStats, strategy: VidexStrategy):
+        _dbg("__INIT__", "__init__ entered")
         self.table_stats = stats
         self.strategy = strategy
 
     @property
     def table_name(self):
+        _dbg("TABLE_NA", "table_name entered")
         return self.table_stats.table_name
 
     @abstractmethod
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg("CARDINAL", "cardinality entered")
         pass
 
     @abstractmethod
     def ndv(self, index_name: str, field_list: List[str]) -> int:
+        _dbg("NDV", "ndv entered")
         raise NotImplementedError()
 
     @abstractmethod
     def scan_time(self, req_json_item: dict) -> float:
+        _dbg("SCAN_TIM", "scan_time entered")
         raise NotImplementedError()
 
     def records_in_range(self, idx_range_cond: IndexRangeCond) -> int:

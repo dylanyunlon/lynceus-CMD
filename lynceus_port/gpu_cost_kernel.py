@@ -49,6 +49,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -91,6 +92,7 @@ class GPUArchConfig:
     clock_ghz: float = 1.5
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", "dump_debug entered")
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ GPUArchConfig ({self.arch.name}) ══════════════════",
@@ -173,17 +175,20 @@ class BTreeGPUConfig:
     def fanout(self) -> int:
         """Node max_resident_blocks — from tabular inline_btree.h:
         max_resident_blocks = (node_size - header) / (key + value)"""
+        _dbg("FANOUT", "fanout entered")
         return max(2, (self.node_size_bytes - self.header_bytes)
                    // (self.key_size_bytes + self.value_size_bytes))
 
     def tree_height(self, n_keys: int) -> int:
         """Tree height — from tabular: ceil(log_fanout(N))"""
+        _dbg("TREE_HEI", "tree_height entered")
         _dbg("TREE_HEI", f"tree_height(n_keys={n_keys})")
         if n_keys <= 0:
             return 0
         return max(1, math.ceil(math.log(max(1, n_keys)) / math.log(self.fanout)))
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", "dump_debug entered")
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         return (f"{prefix}BTreeGPU: node={self.node_size_bytes}B, "
                 f"key={self.key_size_bytes}B, val={self.value_size_bytes}B, "
@@ -205,11 +210,13 @@ class HashTableGPUConfig:
 
     def bucket_count(self, n_keys: int) -> int:
         """From tabular: n_buckets = ceil(n_keys / load_factor)"""
+        _dbg("BUCKET_C", "bucket_count entered")
         _dbg("BUCKET_C", f"bucket_count(n_keys={n_keys})")
         return math.ceil(n_keys / max(0.098, self.load_factor))
 
     def avg_chain_length(self) -> float:
         """Expected collision chain: 1 / (1 - load_factor)"""
+        _dbg("AVG_CHAI", "avg_chain_length entered")
         return 1.0 / max(0.0098, 1.0 - self.load_factor)
 
 
@@ -232,6 +239,7 @@ class KernelCostEstimate:
     total_us: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg("DUMP_DEB", "dump_debug entered")
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ KernelCostEstimate ({self.op.name}) ═════════════════",

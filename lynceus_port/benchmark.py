@@ -33,6 +33,9 @@ _tr = _dbg  # 兼容旧调用
 
 
 @dataclass
+# ─── 工作负载配置 ────────────────────────────────────────────────
+# 参数空间定义: 查询类型混合比例, 选择率范围, 表行数,
+# 索引可用概率, 实验步数与种子数.
 class WorkloadConfig:
     name: str = "TPC-H_SF100"
     num_steps: int = 2000
@@ -54,6 +57,10 @@ class WorkloadConfig:
     table_skew: float = 1.2
 
 
+# ─── 查询序列生成 ────────────────────────────────────────────────
+# 改编自 PAR2QO utility.py evenly_sample_card.
+# 原版均匀采样基数; 移植版使用 zipf 分布更贴近真实工作负载.
+# 表选择概率按访问频率加权, 选择率从配置的范围内随机采样.
 def generate_query_sequence(config: WorkloadConfig,
                             seed: int) -> List[QueryDescriptor]:
     rng = random.Random(seed)
@@ -106,6 +113,10 @@ def generate_query_sequence(config: WorkloadConfig,
     return queries
 
 
+# ─── 策略执行器 ──────────────────────────────────────────────────
+# 管理多种路由策略 (CPU-only / GPU-only / Cost-driven / Adaptive)
+# 的生命周期. 每个策略实现 RoutingStrategyBase 接口.
+# 改编自 PAR2QO postgres.py 中对多个 plan candidate 的评估循环.
 class StrategyExecutor:
     def __init__(self, engine: CostModelEngine):
         self.engine = engine
@@ -135,6 +146,10 @@ class StrategyExecutor:
         return self.execute_strategy(RoutingStrategy.PAR2QO_ENHANCED, queries, data_location)
 
 
+# ─── 基准测试主入口 ──────────────────────────────────────────────
+# 流程: 初始化拓扑 → 创建 cost model engine → 注册策略 →
+# 逐步执行 → 收集 predicted vs observed → 多种子聚合.
+# 改编自 PAR2QO postgres.py get_real_latency 的中位数计时.
 def run_benchmark(workload: WorkloadConfig,
                   strategies: Optional[List[RoutingStrategy]] = None,
                   output_path: Optional[str] = None) -> BenchmarkOutput:
@@ -186,6 +201,10 @@ def run_benchmark(workload: WorkloadConfig,
     return output
 
 
+# ─── 累积基准测试 ────────────────────────────────────────────────
+# 逐步增加查询数量, 观察各策略的收敛行为.
+# 改编自 PAR2QO diagram.py 的 savePlot (画 convergence 图).
+# 移植版不画图, 而是输出 JSON 数据供离线分析.
 def run_cumulative_benchmark(workload: WorkloadConfig,
                              strategies: Optional[List[RoutingStrategy]] = None,
                              output_path: Optional[str] = None) -> BenchmarkOutput:
@@ -231,6 +250,11 @@ def run_cumulative_benchmark(workload: WorkloadConfig,
     return output
 
 
+# ─── 命令行入口 ──────────────────────────────────────────────────
+# 环境变量:
+#   LYNCEUS_STEPS — 每种子步数 (默认 2000)
+#   LYNCEUS_SEEDS — 随机种子数 (默认 5)
+#   LYNCEUS_OUTDIR — 输出目录 (默认 ./results)
 def main():
     def _int_env(key: str, default: int) -> int:
         _dbg("_INT_ENV", f"_int_env(key={key}, default={default})")
@@ -265,3 +289,151 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 断点调试辅助工具 — 不影响主流程, 仅用于脚本级调试
+# ═══════════════════════════════════════════════════════════════════════
+
+class BenchmarkDiagnostics:
+    """基准诊断工具 — 改编自 PAR2QO diagram.py 的统计分析部分.
+    
+    原版用 matplotlib 画图; 移植版输出文本统计 + ASCII 直方图.
+    提供:
+      - 策略间性能对比 (pairwise comparison)
+      - 误差分布分析 (percentile + histogram)
+      - 路由决策统计 (GPU vs CPU 比例随时间变化)
+      - 收敛性检测 (窗口内方差 < 阈值)
+    """
+    
+    def __init__(self, result=None):
+        """初始化诊断工具."""
+        self.result = result
+        self._dbg = _dbg
+    
+    def strategy_comparison(self, panel_name: str = "predicted_vs_actual"):
+        """策略间性能对比 — 输出各策略最终误差的排名."""
+        if not self.result or panel_name not in self.result.panels:
+            _dbg("DIAG", f"panel {panel_name} not found")
+            return {}
+        
+        panel = self.result.panels[panel_name]
+        rankings = {}
+        for method_name, mr in panel.methods.items():
+            if mr.mean:
+                # 取最后 10% 的均值作为收敛后性能
+                tail_start = max(0, len(mr.mean) - len(mr.mean) // 10)
+                tail_mean = sum(mr.mean[tail_start:]) / max(1, len(mr.mean) - tail_start)
+                rankings[method_name] = tail_mean
+                _dbg("DIAG", f"  {method_name}: tail_mean={tail_mean:.4f}")
+        
+        # 按性能排序
+        sorted_rankings = sorted(rankings.items(), key=lambda x: x[1])
+        _dbg("DIAG", f"strategy ranking (best→worst):")
+        for rank, (name, score) in enumerate(sorted_rankings, 1):
+            _dbg("DIAG", f"  #{rank}: {name} = {score:.4f}")
+        
+        return dict(sorted_rankings)
+    
+    def error_histogram(self, errors, bins=10, width=40):
+        """ASCII 误差直方图 — 改编自 PAR2QO diagram.py savePlot.
+        
+        原版用 matplotlib hist; 移植版用 ASCII art.
+        """
+        if not errors:
+            return ""
+        
+        import math
+        
+        min_e = min(errors)
+        max_e = max(errors)
+        step = (max_e - min_e) / bins if max_e > min_e else 1.0
+        
+        counts = [0] * bins
+        for e in errors:
+            idx = min(int((e - min_e) / step), bins - 1) if step > 0 else 0
+            counts[idx] += 1
+        
+        max_count = max(counts) if counts else 1
+        lines = []
+        for i, c in enumerate(counts):
+            lo = min_e + i * step
+            hi = lo + step
+            bar_len = int(c / max_count * width) if max_count > 0 else 0
+            bar = "█" * bar_len
+            lines.append(f"  {lo:8.4f}-{hi:8.4f} | {bar} ({c})")
+        
+        header = f"Error Distribution (n={len(errors)}, bins={bins})"
+        return header + "\n" + "\n".join(lines)
+    
+    def convergence_check(self, values, window=50, threshold=0.01):
+        """检测时间序列是否已收敛.
+        
+        使用滑动窗口内的变异系数 (CV) 判断:
+        CV < threshold → 已收敛.
+        """
+        if len(values) < window:
+            _dbg("CONV", f"insufficient data ({len(values)} < {window})")
+            return False
+        
+        import math
+        tail = values[-window:]
+        mean_v = sum(tail) / len(tail)
+        if mean_v == 0:
+            return True
+        var_v = sum((v - mean_v) ** 2 for v in tail) / len(tail)
+        cv = math.sqrt(var_v) / abs(mean_v)
+        
+        converged = cv < threshold
+        _dbg("CONV", f"window={window} mean={mean_v:.4f} cv={cv:.6f} "
+             f"threshold={threshold} converged={converged}")
+        return converged
+    
+    def routing_distribution_over_time(self, decisions, window=100):
+        """路由决策随时间的分布变化 — 滑动窗口 GPU 比例."""
+        if not decisions:
+            return []
+        
+        ratios = []
+        for i in range(0, len(decisions), window):
+            chunk = decisions[i:i+window]
+            gpu_count = sum(1 for d in chunk if "gpu" in str(getattr(d, 'target_device', '')).lower())
+            ratio = gpu_count / len(chunk)
+            ratios.append((i, ratio))
+            _dbg("ROUTE_DIST", f"  step={i}-{i+len(chunk)}: gpu_ratio={ratio:.3f}")
+        
+        return ratios
+
+
+def _dump_workload_snapshot(wl, label=""):
+    """打印 WorkloadConfig 完整快照到 stderr."""
+    import sys
+    print(f"╔══ WorkloadConfig [{label}] ══════════════════", file=sys.stderr)
+    for k, v in wl.__dict__.items():
+        val = str(v)[:100]
+        print(f"║ {k}: {val}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+def benchmark_quick_test(steps=50, seeds=1):
+    """快速冒烟测试 — 少量步数验证全链路.
+    
+    用于 CI 或实验前验证, 不需要完整 2000 步.
+    改编自 PAR2QO utility.py 的 quick_test 模式.
+    """
+    _dbg("QUICK", f"quick test: steps={steps} seeds={seeds}")
+    wl = WorkloadConfig(name="QuickTest", num_steps=steps, num_seeds=seeds)
+    _dump_workload_snapshot(wl, "quick_test")
+    out = run_benchmark(wl)
+    
+    diag = BenchmarkDiagnostics(out)
+    rankings = diag.strategy_comparison()
+    
+    for pname, panel in out.panels.items():
+        for mname, mr in panel.methods.items():
+            n = len(mr.mean)
+            converged = diag.convergence_check(mr.mean, window=min(10, n))
+            _dbg("QUICK", f"  {mname}: {n} points, "
+                 f"tail={mr.mean[-1]:.3f}ms, converged={converged}")
+    
+    return out

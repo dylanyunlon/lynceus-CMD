@@ -2,6 +2,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -70,6 +71,7 @@ try:
         """
 
         def __init__(self, stats: VidexTableStats, **kwargs):
+            _dbg("__INIT__", "__init__ entered")
             super().__init__(stats, VidexStrategy.innodb)
             # for multi col range query, if the first column is not equal, btree will ignore the rest.
             # refer to append_range_all_keyparts::keypart_range
@@ -97,6 +99,7 @@ try:
             # self.inject_cardinality_dict["'1995-01-01' <= O_ORDERDATE <= '1996-12-31'"] = 4509
 
         def loading_ndv_model(self):
+            _dbg("LOADING_", "loading_ndv_model entered")
 
             if self.table_stats and self.table_stats.sample_file_info is not None:
                 logging.info(f"loading ndv model: NDVEstimator, table_name={self.table_name}")
@@ -110,14 +113,17 @@ try:
                              f"use {time.perf_counter() - st:.2f} seconds")
 
         def scan_time(self, req_json_item: dict) -> float:
+            _dbg("SCAN_TIM", "scan_time entered")
             return self.table_stats.clustered_index_size
             # raise NotImplementedError(
             #     "This scan_time is not implemented in VidexModelInnoDB. how to get self.stats.clustered_index_size?")
 
         def get_memory_buffer_size(self, req_json_item: dict) -> int:
+            _dbg("GET_MEMO", "get_memory_buffer_size entered")
             return self.table_stats.innodb_buffer_pool_size
 
         def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+            _dbg("CARDINAL", "cardinality entered")
             condition_str = idx_range_cond.ranges_to_str()
             if condition_str in self.inject_cardinality_dict:
                 return self.inject_cardinality_dict[condition_str]
@@ -181,6 +187,7 @@ try:
             return records_in_ranges
 
         def ndv(self, index_name, field_list: List[str]) -> int:
+            _dbg("NDV", "ndv entered")
             ndv = self.table_stats.get_ideal_ndv(index_name, field_list)
             print("----GET_IDEAL_NDV   NDV IS :", ndv, "----", flush=True)
             if ndv is None:
@@ -262,6 +269,7 @@ try:
                 - rec_per_key: table_rows / ndv
                 - srv_innodb_stats_method，or set to default
             """
+            _dbg("INFO_LOW", "info_low entered")
             # Parse the ndv_method in @VIDEX_OPTIONS
             properties = req_json_item.get('properties', {})
             options_str = properties.get('videx_options', '{}')

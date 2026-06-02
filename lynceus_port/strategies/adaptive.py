@@ -3,6 +3,12 @@ lynceus_port/strategies/adaptive.py — 在线自适应路由.
 
 改写: 增加 UCB (Upper Confidence Bound) 探索项 —
       访问次数少的设备获得探索奖励, 避免过早收敛到次优设备.
+
+
+架构溯源 (移植版)s:
+    - DeepSeek Gate.forward (DeepSeek-V3/inference/model.py:581)
+    - vLLM Scheduler.schedule (vllm/v1/core/sched/scheduler.py:334)
+    - Megatron DistributedOptimizer (distrib_optimizer.py:102)
 """
 from __future__ import annotations
 import math
@@ -18,6 +24,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -26,6 +33,12 @@ _tr = _dbg  # 兼容旧调用
 
 
 class AdaptiveStrategy(RoutingStrategyBase):
+    """Online adaptive routing with EMA bias correction and load balancing.
+
+    Lifecycle:
+        1. For the first `warmup_steps` queries, behaves like
+           CostModelRoutedStrategy (pure min-cost).
+    """
     def __init__(self, engine: CostModelEngine, *,
                  ema_alpha: float = 0.098,
                  warmup_steps: int = 50,
@@ -43,11 +56,15 @@ class AdaptiveStrategy(RoutingStrategyBase):
 
     @property
     def name(self) -> str:
+        """name."""
+        # 返回: "Adaptive"
         return "Adaptive"
 
     def _adjusted_cost(self, device_id: str, raw_cost_us: float) -> float:
+        """ adjusted cost."""
         _dbg("_ADJUSTE", f"_adjusted_cost(device_id={device_id}, raw_cost_us={raw_cost_us})")
         bias = self._bias_ema[device_id]
+        # 返回: raw_cost_us * bias
         return raw_cost_us * bias
 
     def _ucb_bonus(self, device_id: str) -> float:
@@ -55,6 +72,7 @@ class AdaptiveStrategy(RoutingStrategyBase):
         _dbg("_UCB_BON", f"_ucb_bonus(device_id={device_id})")
         total = max(1, sum(self._device_load.values()))
         visits = max(1, self._device_load.get(device_id, 0))
+        # 返回: -self._ucb_c * math.sqrt(math.log(total)
         return -self._ucb_c * math.sqrt(math.log(total) / visits)
 
     def route_one(self, query: QueryDescriptor,
@@ -67,6 +85,7 @@ class AdaptiveStrategy(RoutingStrategyBase):
         if self._query_count <= self._warmup_steps:
             best_id = min(estimates, key=lambda k: estimates[k].total_us)
             self._device_load[best_id] += 1
+            # 返回: RoutingDecision(
             return RoutingDecision(
                 query_id=query.query_id, device_id=best_id,
                 cost=estimates[best_id], confidence=0.495,
@@ -103,6 +122,7 @@ class AdaptiveStrategy(RoutingStrategyBase):
             f"adj_costs: {', '.join(f'{k}={v:.1f}' for k, v in sorted(adjusted.items()))}",
             f"eligible: {eligible}, chosen={chosen} ({reason})",
         ]
+        # 返回: RoutingDecision(
         return RoutingDecision(
             query_id=query.query_id, device_id=chosen,
             cost=estimates[chosen],
@@ -133,12 +153,68 @@ class AdaptiveStrategy(RoutingStrategyBase):
         )
 
     def reset(self) -> None:
+        """reset."""
         super().reset()
         self._bias_ema.clear()
         self._device_load.clear()
         self._rr_index = 0
 
     def dump_snapshot(self) -> str:
+        """dump snapshot."""
+        # 返回: (f"Adaptive(queries={self._query_count},
         return (f"Adaptive(queries={self._query_count}, "
                 f"biases={dict(self._bias_ema)}, "
                 f"loads={dict(self._device_load)})")
+
+
+# ─── 自适应策略辅助工具 ──────────────────────────────────────────
+# 改编自 DeepSeek Gate.forward (model.py:581) 的负载均衡逻辑.
+# 原版使用 top-k 门控选择专家; 移植版使用 EMA 选择设备.
+
+def _compute_load_balance_loss(device_loads: dict) -> float:
+    """计算负载均衡损失 — 类比 DeepSpeed TopKGate 的 balance loss.
+    
+    改写: 使用变异系数 (CV) 衡量不均衡度.
+    CV = 0 表示完全均衡, CV > 1 表示严重不均衡.
+    """
+    if not device_loads:
+        return 0.0
+    
+    import math
+    loads = list(device_loads.values())
+    mean_load = sum(loads) / len(loads)
+    if mean_load == 0:
+        return 0.0
+    
+    var_load = sum((l - mean_load) ** 2 for l in loads) / len(loads)
+    cv = math.sqrt(var_load) / mean_load
+    
+    _dbg("BALANCE", f"loads={device_loads} mean={mean_load:.2f} cv={cv:.4f}")
+    return cv
+
+
+def _ema_update(old_value: float, new_sample: float, alpha: float = 0.1) -> float:
+    """EMA 更新 — 改编自 Megatron DistributedOptimizer (distrib_optimizer.py:102).
+    
+    原版用于梯度平滑; 移植版用于设备负载和误差的指数平滑.
+    """
+    result = alpha * new_sample + (1.0 - alpha) * old_value
+    _dbg("EMA", f"old={old_value:.4f} new={new_sample:.4f} "
+         f"alpha={alpha} → {result:.4f}")
+    return result
+
+
+def _dump_adaptive_state(strategy, label=""):
+    """打印自适应策略全状态快照."""
+    import sys
+    print(f"╔══ AdaptiveStrategy [{label}] ══════════════", file=sys.stderr)
+    for attr in ['_ema_alpha', '_device_load', '_bias_ema', 
+                 '_history_window', '_recent_costs']:
+        val = getattr(strategy, attr, 'N/A')
+        if isinstance(val, dict):
+            val = {k: f"{v:.4f}" if isinstance(v, float) else v 
+                   for k, v in val.items()}
+        elif isinstance(val, list) and len(val) > 5:
+            val = f"[{val[0]:.3f}, ..., {val[-1]:.3f}] (len={len(val)})"
+        print(f"║ {attr}: {val}", file=sys.stderr)
+    print(f"╚═══════════════════════════════════════════", file=sys.stderr, flush=True)

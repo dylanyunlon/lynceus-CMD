@@ -112,3 +112,11 @@ class HybridStaticStrategy(RoutingStrategyBase):
     def reset(self) -> None:
         super().reset()
         self._threshold = float(self._initial_threshold)
+
+
+# ─── 静态策略调试 ────────────────────────────────────────────────
+def _dump_static_strategy(strategy, label=""):
+    """打印静态策略快照."""
+    import sys
+    print(f"[STR·STATIC] {label}: target={getattr(strategy, 'target_device', '?')}", 
+          file=sys.stderr, flush=True)

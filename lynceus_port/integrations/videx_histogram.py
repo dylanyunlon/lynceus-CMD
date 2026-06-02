@@ -2,6 +2,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -102,6 +103,7 @@ try:
         Returns:
 
         """
+        _dbg("DECODE_B", "decode_base64 entered")
 
         decode_type, char_type, s = raw.split(":")
         assert decode_type == "base64" and char_type == "type254"
@@ -111,6 +113,7 @@ try:
 
 
     def is_base64(str_in_base4: bool, raw):
+        _dbg("IS_BASE6", "is_base64 entered")
         if not str_in_base4:
             return False
         if len(raw.split(":")) != 3:
@@ -132,6 +135,7 @@ try:
         Returns:
 
         """
+        _dbg("CONVERT_", "convert_str_by_type entered")
         if raw == NULL_STR:
             return None
 
@@ -173,6 +177,7 @@ try:
 
 
     def large_number_encoder(x):
+        _dbg("LARGE_NU", "large_number_encoder entered")
         MIN_LONG = -2 ** 63
         MAX_LONG = 2 ** 63 - 1
         if isinstance(x, int) and (x > MAX_LONG or x < MIN_LONG):
@@ -181,6 +186,7 @@ try:
 
 
     def large_number_decoder(y):
+        _dbg("LARGE_NU", "large_number_decoder entered")
         if isinstance(y, dict) and "bigint" in y:
             return int(y["bigint"])
         return y
@@ -214,6 +220,7 @@ try:
         Returns:
 
         """
+        _dbg("INIT_BUC", "init_bucket_by_type entered")
         if hist_type == 'singleton':
             assert len(bucket_raw) == 2, f"Singleton bucket must have 2 elements, got {len(bucket_raw)}"
 
@@ -276,6 +283,7 @@ try:
         database_type: Optional[str] = 'mysql'
 
         def model_post_init(self, __context: Any) -> None:
+            _dbg("MODEL_PO", "model_post_init entered")
             if int(self.null_values) == MEANINGLESS_INT:
                 self.null_values = 0
             assert self.null_values >= 0, f"null_values must >= 0, got {self.null_values}"

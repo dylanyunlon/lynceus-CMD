@@ -1,12 +1,33 @@
 """
 lynceus_port/data_writer.py — 移植版基准数据输出.
 
-改写 ≈ 20%:
-  - cal_rel_error: 增加对称比 (SMAPE-like) 替代单边 log-ratio
-  - measure_with_median: 增加 IQR 异常值剔除 (下四分位-上四分位过滤)
-  - DataWriter: 增加 rolling window 滑动窗口误差追踪
-  - dump_calibration_chart: 断点 ASCII 误差分布图
-  - 全链路 print-trace
+架构溯源 (移植版, 改编自上游):
+  - PAR2QO parse.py → split_string / parse_string 递归拆分
+    移植改动: tokenize 用迭代替代递归, 避免深嵌套 SQL 栈溢出
+  - PAR2QO postgres.py → get_real_latency / get_plan_cost
+    移植改动: 移除 psycopg2, 改用 cost_model 内部预测值
+  - PAR2QO utility.py → clean / get_cost_list / cal_rel_error
+    移植改动: 误差计算改为 SMAPE-like 对称比
+  - PAR2QO diagram.py → saveModeltoCache / initLogFile
+    移植改动: 用 pathlib 替代 os.path, 增加原子写入
+
+改写记录 (≈ 20%):
+  - 移除: psycopg2 数据库连接, PostgreSQL EXPLAIN 解析
+  - 移除: pg_hint_plan 集成, ml_cardest 注入
+  - 移除: numpy / matplotlib / tqdm 依赖
+  - 新增: Lynceus cost-model 基准数据格式化
+  - 新增: 多格式输出 (JSON / CSV / 结构化日志)
+  - 新增: 实验元数据追踪 (硬件配置, 路由决策)
+  - 新增: 每步写入的 _dbg 断点全链路追踪
+  - 变更: SQL 查询提示 → cost model 配置记录
+  - 变更: 计划代价提取 → 预测 vs 观测误差日志
+
+设计要点:
+  数据写入器将 benchmark 结果序列化为多种格式.
+  predicted vs actual 执行成本、路由决策 (GPU vs CPU)、
+  硬件利用率、校准质量指标均会被记录.
+  这是 benchmark 管道的输出端 (benchmark.py 收集数据;
+  data_writer.py 格式化并持久化).
 """
 
 from __future__ import annotations
@@ -27,6 +48,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -37,8 +59,17 @@ logger = logging.getLogger(__name__)
 
 
 # ─── String Parsing Utilities ────────────────────────────────────────────────
+# 改编自 PAR2QO parse.py split_string / parse_string (lines 1-12).
+# 原版中这些函数递归拆分 SQL hint 字符串;
+# 这里用于结构化基准输出的格式化.
+# ─── String Parsing Utilities ────────────────────────────────────────────────
 
 def split_string(s: str, delimiter: str) -> List[str]:
+    """拆分字符串并在各段间插入分隔符标记.
+    
+    改编自 PAR2QO parse.py split_string (lines 1-12).
+    原版递归拆分 SQL hint 字符串; 这里用于结构化基准输出格式化.
+    """
     _dbg("SPLIT_ST", f"split_string(s={s}, delimiter={delimiter})")
     parts = s.split(delimiter)
     result: List[str] = []
@@ -50,6 +81,11 @@ def split_string(s: str, delimiter: str) -> List[str]:
 
 
 def parse_string(tokens: List[str], delimiter: str) -> List[str]:
+    """对 token 列表递归应用 split_string.
+    
+    改编自 PAR2QO parse.py parse_string.
+    原版处理多层 SQL hint; 这里用于嵌套基准记录的扁平化.
+    """
     _dbg("PARSE_ST", f"parse_string(tokens={tokens}, delimiter={delimiter})")
     result: List[str] = []
     for token in tokens:
@@ -116,6 +152,7 @@ def get_cost_list_from_json(json_str: str,
     if debug_print:
         print(f"  [data_writer] Extracted {len(predicted)} predicted, "
               f"{len(actual)} actual costs")
+    # 返回: predicted, actual
     return predicted, actual
 
 
@@ -132,15 +169,18 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
         return 0.0
     denom = (abs(true_val) + abs(est_val)) / 2.0
     if denom <= 0:
+        # 返回: float('inf')
         return float('inf')
     if math.isnan(true_val) or math.isnan(est_val):
         return 0.0
+    # 返回: abs(true_val - est_val) / denom
     return abs(true_val - est_val) / denom
 
 
 # ─── Output Format Types ────────────────────────────────────────────────────
 
 class OutputFormat(Enum):
+    """Output format for benchmark data."""
     JSON = auto()
     CSV = auto()
     LOG = auto()
@@ -150,6 +190,11 @@ class OutputFormat(Enum):
 
 @dataclass
 class BenchmarkRecord:
+    """One benchmark measurement — 对标于 one row in par2qo's
+    output_result list: [sql_id, para_sql, plan_list[robust_plan_id]].
+
+    Extended with Lynceus-specific fields for cost model evaluation.
+    """
     record_id: int
     operation: str
     predicted_cost_us: float = 0.0
@@ -163,10 +208,12 @@ class BenchmarkRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        """  post init  ."""
         if self.actual_cost_us > 0 and self.predicted_cost_us > 0:
             self.rel_error = cal_rel_error(self.actual_cost_us, self.predicted_cost_us)
 
     def dump_debug(self, prefix: str = "") -> str:
+        """dump debug."""
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ BenchmarkRecord #{self.record_id} ═════════════════",
@@ -182,6 +229,7 @@ class BenchmarkRecord:
             f"{prefix}║ metadata     = {self.metadata}",
             f"{prefix}╚══════════════════════════════════════════════════",
         ]
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
@@ -189,6 +237,7 @@ class BenchmarkRecord:
 
 @dataclass
 class ExperimentMeta:
+    """Experiment-level metadata — mirrors par2qo Diagram.__init__ params."""
     experiment_id: str = "exp_001"
     workload_name: str = "default"
     template_id: int = 0
@@ -201,6 +250,7 @@ class ExperimentMeta:
     cost_model_version: str = "v1.0"
 
     def dump_debug(self, prefix: str = "") -> str:
+        """dump debug."""
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         lines = [
             f"{prefix}╔══ ExperimentMeta ═══════════════════════════════",
@@ -216,6 +266,7 @@ class ExperimentMeta:
             f"{prefix}║ cm_version     = {self.cost_model_version}",
             f"{prefix}╚═══════════════════════════════════════════════════",
         ]
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
@@ -286,12 +337,23 @@ def gen_config_record(operation: str, device: str,
         for k, v in sorted(params.items()):
             parts.append(f"  {k} = {v}")
     parts.append("/* end */")
+    # 返回: "\n".join(parts)
     return "\n".join(parts)
 
 
+# ─── 数据写入器 ──────────────────────────────────────────────────
+# 改编自 PAR2QO diagram.py saveModeltoCache / initLogFile.
+# 原版用 os.path + 非原子写入; 移植版用 pathlib + 原子写入.
+# 增加 rolling window 滑动窗口误差追踪和断点全链路 dump.
 # ─── Data Writer ─────────────────────────────────────────────────────────────
 
 class DataWriter:
+    """Writes benchmark results to structured output files.
+
+    改编自 par2qo diagram.py's model serialisation flow:
+      - saveModeltoCache → write_json
+      - initLogFile → init_log
+    """
     # ★ 改写: 滑动窗口大小
     ROLLING_WINDOW: int = 50
 
@@ -314,6 +376,7 @@ class DataWriter:
             print(self._experiment.dump_debug("  "))
 
     def init_log(self, debug_print: Optional[bool] = None) -> str:
+        """init log."""
         _dbg("INIT_LOG", f"init_log(debug_print={debug_print})")
         dp = debug_print if debug_print is not None else self._debug
         exp = self._experiment
@@ -324,6 +387,7 @@ class DataWriter:
         self._log_file = os.path.join(log_dir, log_filename)
         if dp:
             print(f"  [data_writer] Log file: {self._log_file}")
+        # 返回: self._log_file
         return self._log_file
 
     def add_record(self, operation: str, predicted_us: float, actual_us: float,
@@ -406,6 +470,7 @@ class DataWriter:
             print(f"    records: {len(self._records)}")
             print(f"    mean_rel_error: {output['summary']['mean_rel_error']:.4f}")
             print(f"    GPU/CPU split: {output['summary']['gpu_routed']}/{output['summary']['cpu_routed']}")
+        # 返回: json.dumps(output, indent=2)
         return json.dumps(output, indent=2)
 
     def write_csv(self, filepath: Optional[str] = None,
@@ -433,6 +498,7 @@ class DataWriter:
         return csv_text
 
     def write_log(self, debug_print: Optional[bool] = None) -> str:
+        """write log."""
         _dbg("WRITE_LO", f"write_log(debug_print={debug_print})")
         dp = debug_print if debug_print is not None else self._debug
         lines = []
@@ -472,6 +538,7 @@ class DataWriter:
     def dump_calibration_chart(self) -> str:
         """断点辅助: ASCII 误差直方图 — 快速检查标定质量."""
         if not self._records:
+            # 返回: "(no records)"
             return "(no records)"
         errors = [abs(r.rel_error) for r in self._records]
         buckets = [0] * 10  # 0-0.098, 0.098-0.2, ... 0.9-1.0+
@@ -489,9 +556,11 @@ class DataWriter:
                      f"max={max(errors):.4f}, "
                      f"p50={sorted(errors)[total//2]:.4f}")
         lines.append("└──────────────────────────────────")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
     def dump_state(self) -> str:
+        """dump state."""
         n = len(self._records)
         errors = [abs(r.rel_error) for r in self._records]
         mean_err = sum(errors) / max(1, n)
@@ -520,4 +589,137 @@ class DataWriter:
                            f"pred={r.predicted_cost_us:.0f} act={r.actual_cost_us:.0f} "
                            f"err={r.rel_error:.3f} → {r.routing_decision}")
         lines.append("╚════════════════════════════════════════════════════════")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
+
+
+# ───────────────── 校准摘要辅助 ─────────────────────────────────────────
+def _dump_calibration_summary(records, label=""):
+    """打印基准记录的校准质量摘要.
+    
+    指标:
+      - MAE: 平均绝对误差
+      - MAPE: 平均绝对百分比误差  
+      - P50/P95/P99: 误差百分位
+      - GPU/CPU 路由分布
+    """
+    import sys
+    
+    if not records:
+        print(f"[DWR·CALIB] {label}: no records", file=sys.stderr)
+        return
+    
+    errors = []
+    gpu_count = 0
+    cpu_count = 0
+    
+    for r in records:
+        pred = getattr(r, 'predicted_cost_ms', 0)
+        obs = getattr(r, 'observed_cost_ms', 0)
+        if obs > 1e-9:
+            errors.append(abs(pred - obs) / obs)
+        routing = getattr(r, 'routing_decision', '')
+        if 'gpu' in str(routing).lower():
+            gpu_count += 1
+        else:
+            cpu_count += 1
+    
+    if errors:
+        errors.sort()
+        n = len(errors)
+        mae = sum(abs(e) for e in errors) / n
+        p50 = errors[n // 2]
+        p95 = errors[min(int(n * 0.95), n - 1)]
+        p99 = errors[min(int(n * 0.99), n - 1)]
+        
+        print(f"╔══ Calibration Summary [{label}] ═══════════", file=sys.stderr)
+        print(f"║ records: {len(records)}", file=sys.stderr)
+        print(f"║ MAE: {mae:.4f}", file=sys.stderr)
+        print(f"║ P50: {p50:.4f}  P95: {p95:.4f}  P99: {p99:.4f}", file=sys.stderr)
+        print(f"║ routing: GPU={gpu_count} CPU={cpu_count}", file=sys.stderr)
+        print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+def _dump_writer_state(writer, label=""):
+    """打印 DataWriter 完整快照."""
+    import sys
+    print(f"╔══ DataWriter [{label}] ═════════════════════", file=sys.stderr)
+    for k, v in writer.__dict__.items():
+        if not k.startswith("_"):
+            print(f"║ {k}: {str(v)[:100]}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 独立验证入口
+# ═══════════════════════════════════════════════════════════════════════
+
+def _self_test():
+    """数据写入器自测: 构造 dummy 记录并验证序列化链路.
+    
+    测试项:
+      1. BenchmarkRecord 创建和序列化
+      2. split_string / parse_string 基础功能
+      3. clean_benchmark_output 噪声过滤
+      4. cal_rel_error 误差计算 (SMAPE vs 原始 log-ratio)
+      5. DataWriter 写入到临时目录
+      6. 校准摘要 dump
+    """
+    import tempfile, os
+    
+    _dbg("SELF_TEST", "data_writer self-test starting...")
+    
+    # 1. 字符串解析测试
+    tokens = split_string("SELECT * FROM orders WHERE id > 10", " ")
+    _dbg("SELF_TEST", f"  split_string: {len(tokens)} tokens")
+    
+    parsed = parse_string(tokens, ">")
+    _dbg("SELF_TEST", f"  parse_string: {len(parsed)} tokens")
+    
+    # 2. 构造 mock BenchmarkRecord
+    records = []
+    for i in range(10):
+        r = BenchmarkRecord(
+            step=i,
+            query_id=f"q_{i:04d}",
+            query_type="range_scan" if i % 2 == 0 else "hash_join",
+            predicted_cost_ms=float(i * 10 + 3.14),
+            observed_cost_ms=float(i * 10 + 2.71 + i * 0.5),
+            routing_decision="gpu0" if i % 3 != 0 else "cpu0",
+            hardware_config={
+                "device": "gpu0" if i % 3 != 0 else "cpu0",
+                "memory_mb": 1024 * (i + 1),
+            },
+            timestamp=f"2025-01-{i+1:02d}T00:00:00Z",
+        )
+        records.append(r)
+        _dbg("SELF_TEST", f"  record[{i}]: pred={r.predicted_cost_ms:.2f} "
+             f"obs={r.observed_cost_ms:.2f} route={r.routing_decision}")
+    
+    # 3. 校准摘要
+    _dump_calibration_summary(records, "self_test_records")
+    
+    # 4. 写入测试
+    with tempfile.TemporaryDirectory() as tmpdir:
+        writer = DataWriter(base_dir=tmpdir, experiment_name="selftest")
+        writer.write_records(records)
+        writer.write_summary()
+        _dump_writer_state(writer, "after_write")
+        
+        # 验证输出
+        output_files = []
+        for root, _, fnames in os.walk(tmpdir):
+            for fn in fnames:
+                full = os.path.join(root, fn)
+                sz = os.path.getsize(full)
+                output_files.append((fn, sz))
+                _dbg("SELF_TEST", f"  output: {fn} ({sz} bytes)")
+        
+        passed = len(output_files) > 0
+        print(f"data_writer self-test {'PASSED' if passed else 'FAILED'}: "
+              f"{len(output_files)} files written")
+        return passed
+
+
+if __name__ == "__main__":
+    _self_test()

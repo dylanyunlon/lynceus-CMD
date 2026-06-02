@@ -32,6 +32,7 @@ import os as _os, sys as _sys
 _MOD_TAG = "VID"
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 def _dbg(tag, msg):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 _tr = _dbg
@@ -77,6 +78,7 @@ class NEVUtils:
         Output: profile f[j] where f[j] = number of values appearing j times.
         Upstream: NEVUtils.build_column_profile — identical.
         """
+        _dbg("BUILD_CO", "build_column_profile entered")
         value_counts = Counter(data)
         data_len = len(data)
         freq = [0] * (data_len + 1)
@@ -88,11 +90,13 @@ class NEVUtils:
     def profile_to_ndv(self, profile: List[int]) -> int:
         """Sum of profile = observed NDV.
         Upstream: NEVUtils.profile_to_ndv."""
+        _dbg("PROFILE_", "profile_to_ndv entered")
         return sum(profile)
 
     def compute_error(self, estimated: int, ground_truth: int) -> float:
         """Compute q-error between estimated and ground truth NDV.
         Upstream: NEVUtils.compute_error."""
+        _dbg("COMPUTE_", "compute_error entered")
         assert estimated > 0 and ground_truth > 0, \
             "estimated and ground_truth NDV must be positive"
         return max(estimated, ground_truth) / min(estimated, ground_truth)
@@ -100,6 +104,7 @@ class NEVUtils:
     def split_list_into_blocks(self, lst: List, block_size: int) -> List[List]:
         """Split list into fixed-size blocks.
         Upstream: NEVUtils.split_list_into_blocks."""
+        _dbg("SPLIT_LI", "split_list_into_blocks entered")
         blocks = []
         num_blocks = len(lst) // block_size
         for i in range(num_blocks):
@@ -112,6 +117,7 @@ class NEVUtils:
     def collapse_block(self, block: List) -> List:
         """Deduplicate a block, preserving order.
         Upstream: NEVUtils.collapse_block."""
+        _dbg("COLLAPSE", "collapse_block entered")
         seen = set()
         distinct = []
         for v in block:
@@ -123,6 +129,7 @@ class NEVUtils:
     def split_list(self, lst: List, n: int) -> List[List]:
         """Split list into n roughly equal groups.
         Upstream: NEVUtils.split_list."""
+        _dbg("SPLIT_LI", "split_list entered")
         if n > len(lst):
             return [lst]
         group_size = len(lst) // n
@@ -138,6 +145,7 @@ class NEVUtils:
     def split_half(self, data: List) -> Tuple[List, List]:
         """Split list in half.
         Upstream: NEVUtils.split_half."""
+        _dbg("SPLIT_HA", "split_half entered")
         if len(data) <= 1:
             return data[:1], []
         half = len(data) // 2

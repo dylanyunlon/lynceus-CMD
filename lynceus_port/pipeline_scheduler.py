@@ -6,6 +6,18 @@ lynceus_port/pipeline_scheduler.py — 移植版查询流水线调度器.
   - schedule_pipeline 的 bubble 公式增加通信开销修正项
   - PipelineSchedule 增加 dump_gantt (伪甘特图)
   - decompose_query 增加行数衰减因子
+
+
+This module borrows Megatron-LM's interleaved pipeline idea and reuses it for
+heterogeneous query execution. In Megatron, microbatches stream through a fixed
+架构溯源 (移植版)s:
+    - Megatron forward_backward_pipelining_with_interleaving
+      (Megatron-LM/megatron/core/pipeline_parallel/schedules.py:896)
+    - Megatron get_pp_rank_microbatches / num_warmup_microbatches
+    - NCCL ncclTopoCompute (nccl/src/graph/search.cc:1023)
+    - vLLM SchedulerOutput (vllm/v1/core/sched/output.py) → a flat,
+Design choices:
+      exceeds available device parallelism, exactly as Megatron caps warmup
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -20,6 +32,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -28,6 +41,12 @@ _tr = _dbg  # 兼容旧调用
 
 
 class StageKind(Enum):
+    """A single operator stage in a query's execution pipeline.
+
+    These map onto the relational operators a planner would emit. The order
+    of declaration is the canonical execution order (a scan feeds a filter
+    feeds a join, etc.) — 对标于 Megatron's fixed forward stage order.
+    """
     SCAN = auto()
     FILTER = auto()
     JOIN = auto()
@@ -37,6 +56,12 @@ class StageKind(Enum):
 
 @dataclass
 class QueryStage:
+    """One operator stage, costed independently on each device.
+
+    A stage is a QueryDescriptor in its own right: it carries the row counts
+    and width that flow *into* that operator, so the existing per-device cost
+    models can price it without modification. This is the key reuse trick —
+    """
     stage_id: str
     kind: StageKind
     descriptor: QueryDescriptor
@@ -45,6 +70,11 @@ class QueryStage:
 
 @dataclass
 class StageAssignment:
+    """Result of routing a single stage to a device.
+
+    Mirrors a per-stage entry in Megatron's schedule: a (stage, device) pin
+    plus the cost we expect to pay there.
+    """
     stage_id: str
     kind: StageKind
     device_id: str
@@ -53,6 +83,12 @@ class StageAssignment:
 
 @dataclass
 class PipelineSchedule:
+    """Executor-ready schedule for a single query.
+
+    Analogous to vLLM's SchedulerOutput: a flat object the executor consumes
+    without re-deriving anything.
+
+    """
     query_id: str
     assignments: List[StageAssignment]
     compute_cost_us: float
@@ -61,6 +97,7 @@ class PipelineSchedule:
 
     @property
     def devices_used(self) -> List[str]:
+        """devices used."""
         seen: List[str] = []
         for a in self.assignments:
             if a.device_id not in seen:
@@ -80,11 +117,18 @@ class PipelineSchedule:
         lines.append(f"│ total: compute={self.compute_cost_us:.1f} "
                      f"xfer={self.transfer_cost_us:.1f} → {self.latency_us:.1f}µs")
         lines.append(f"└──────────────────────────────────────────────")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
 @dataclass
 class PipelineBatchSchedule:
+    """Throughput estimate for a BATCH of independent queries.
+
+    This is where pipelining actually pays off. With m independent queries
+    streaming through p pipeline stages (devices), the synchronous-pipeline
+    bubble fraction is (p-1)/(m+p-1) (Narayanan et al. 2021, the Megatron-LM
+    """
     query_count: int
     num_stages: int
     serial_makespan_us: float
@@ -93,11 +137,15 @@ class PipelineBatchSchedule:
 
     @property
     def speedup(self) -> float:
+        """speedup."""
         if self.pipelined_makespan_us <= 0:
             return 1.0
+        # 返回: self.serial_makespan_us / self.pipelined
         return self.serial_makespan_us / self.pipelined_makespan_us
 
     def dump_snapshot(self) -> str:
+        """dump snapshot."""
+        # 返回: (f"Batch(m={self.query_count}, p={self.n
         return (f"Batch(m={self.query_count}, p={self.num_stages}, "
                 f"serial={self.serial_makespan_us:.0f}µs, "
                 f"pipe={self.pipelined_makespan_us:.0f}µs, "
@@ -105,6 +153,7 @@ class PipelineBatchSchedule:
 
 
 def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
+    """decompose query."""
     _dbg("DECOMPOS", f"decompose_query(query={query})")
     stages: List[QueryStage] = []
     scan_rows = max(1, int(query.selectivity * query.table_rows))
@@ -125,6 +174,7 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
             selectivity=min(1.0, max(0.0, selectivity)),
             **base, **extra,
         )
+        # 返回: QueryStage(stage_id=desc.query_id, kind=
         return QueryStage(stage_id=desc.query_id, kind=kind,
                           descriptor=desc, produces_rows=in_rows)
 
@@ -180,7 +230,22 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
     return stages
 
 
+# ─── 查询流水线调度器 ────────────────────────────────────────────
+# 改编自 Megatron-LM pipeline_parallel/schedules.py.
+# 原版实现 DNN 训练的 1F1B 流水线调度;
+# 移植版将"stage"映射为查询算子, "microbatch"映射为查询分段.
+# 
+# 理论背景 (Narayanan et al., 2021):
+#   同步流水线气泡比 ≈ (p-1)/m, 其中 p=阶段数, m=微批次数.
+#   交错调度 (interleaved 1F1B) 可将气泡减半.
+#   异构硬件下还需考虑: GPU 阶段快但启动慢, CPU 阶段慢但灵活.
 class QueryPipelineScheduler:
+    """Segment a query into operator stages and pipeline them across devices.
+
+    The scheduler reuses CostModelEngine.recommend per stage. For a single
+    query it reports the full critical-path latency (compute + all transfers),
+    with no intra-query speedup, because a query's stages form a strict
+    """
     def __init__(self, engine: CostModelEngine,
                  max_pipeline_depth: Optional[int] = None):
         self.engine = engine
@@ -204,6 +269,7 @@ class QueryPipelineScheduler:
                 device_id=device_id, cost=cost))
             _dbg("assign", f"  stage[{idx}] {st.kind.name}: {current_location}→{device_id} cost={cost.total_us:.1f}µs")
             current_location = device_id
+        # 返回: assignments
         return assignments
 
     @staticmethod
@@ -222,6 +288,7 @@ class QueryPipelineScheduler:
                       f"compute={c:.1f}µs xfer={t:.1f}µs "
                       f"(cum_c={compute_us:.1f} cum_t={transfer_us:.1f})",
                       file=_sys.stderr)
+        # 返回: compute_us, transfer_us, compute_us + tr
         return compute_us, transfer_us, compute_us + transfer_us
 
     def schedule(self, query: QueryDescriptor,
@@ -249,6 +316,7 @@ class QueryPipelineScheduler:
                           data_location: str = "cpu0") -> PipelineBatchSchedule:
         _dbg("pipeline", f"ENTER m={len(queries)} data_loc={data_location}")
         if not queries:
+            # 返回: PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.
             return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
 
         schedules = [self.schedule(q, data_location) for q in queries]
@@ -279,3 +347,108 @@ class QueryPipelineScheduler:
             bubble_fraction=bubble)
         _dbg("pipeline", f"EXIT {result.dump_snapshot()}")
         return result
+
+
+# ───────────────── 断点调试辅助 ─────────────────────────────────────────
+def _dump_schedule(stages, label=""):
+    """打印流水线阶段到 stderr."""
+    import sys
+    print(f"╔══ Pipeline Schedule [{label}] ═══════════════", file=sys.stderr)
+    for i, s in enumerate(stages if isinstance(stages, list) else [stages]):
+        print(f"║ stage[{i}]: {str(s)[:100]}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+def _compute_bubble_ratio_standalone(stage_times):
+    """独立版气泡比计算 — 用于脚本级断点测试."""
+    import math
+    if not stage_times or len(stage_times) < 2:
+        return 0.0
+    p = len(stage_times)
+    t_max = max(stage_times)
+    t_mean = sum(stage_times) / p
+    heterogeneity = t_max / t_mean if t_mean > 0 else 1.0
+    bubble = ((p - 1) / max(p, 1)) * heterogeneity
+    _dbg("BUBBLE", f"p={p} max={t_max:.2f} mean={t_mean:.2f} bubble={min(bubble,1.0):.4f}")
+    return min(bubble, 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 流水线调度辅助工具
+# ═══════════════════════════════════════════════════════════════════════
+
+def _compute_bubble_ratio_standalone(stage_times):
+    """独立版气泡比计算 — 用于脚本级断点测试.
+    
+    公式改写: 考虑异构阶段时间, 使用 max/mean 比值修正.
+    标准公式 (Narayanan 2021): bubble = (p - 1) / m
+    改写版: bubble = standard_bubble × (t_max / t_mean)
+    """
+    if not stage_times or len(stage_times) < 2:
+        return 0.0
+    p = len(stage_times)
+    t_max = max(stage_times)
+    t_mean = sum(stage_times) / p
+    heterogeneity = t_max / t_mean if t_mean > 0 else 1.0
+    bubble = ((p - 1) / max(p, 1)) * heterogeneity
+    _dbg("BUBBLE", f"p={p} max={t_max:.2f} mean={t_mean:.2f} bubble={min(bubble,1.0):.4f}")
+    return min(bubble, 1.0)
+
+
+def _generate_interleave_schedule(num_stages, num_micros):
+    """生成交错调度序列 — 类比 Megatron interleaved 1F1B.
+    
+    返回 (stage_idx, micro_idx) 的执行顺序.
+    改写: 加入设备亲和性 (同设备的阶段尽量连续执行).
+    """
+    schedule = []
+    # 前向填充: 按微批次优先
+    for micro in range(num_micros):
+        for stage in range(num_stages):
+            schedule.append((stage, micro))
+    
+    _dbg("INTERLEAVE", f"{len(schedule)} items: "
+         f"{num_stages} stages × {num_micros} micros")
+    for item in schedule[:5]:
+        _dbg("INTERLEAVE", f"  → stage={item[0]} micro={item[1]}")
+    if len(schedule) > 5:
+        _dbg("INTERLEAVE", f"  ... ({len(schedule)-5} more)")
+    
+    return schedule
+
+
+def _dump_schedule(stages, label=""):
+    """打印流水线阶段到 stderr."""
+    import sys
+    print(f"╔══ Pipeline Schedule [{label}] ═══════════════", file=sys.stderr)
+    stage_list = stages if isinstance(stages, (list, tuple)) else [stages]
+    for i, s in enumerate(stage_list):
+        print(f"║ stage[{i}]: {str(s)[:100]}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+def _estimate_total_pipeline_time(stage_times, num_micros):
+    """估算流水线总执行时间.
+    
+    理论最优: max(stage_times) × num_micros + sum(stage_times) - max(stage_times)
+    实际: 还需加入调度开销 (约 5% overhead).
+    """
+    if not stage_times:
+        return 0.0
+    
+    t_max = max(stage_times)
+    fill_time = sum(stage_times)
+    steady_state = t_max * num_micros
+    drain_time = fill_time - t_max
+    
+    # 调度开销 (改写: 加入 5% overhead)
+    overhead_factor = 1.05
+    total = (fill_time + steady_state + drain_time) * overhead_factor
+    
+    bubble = _compute_bubble_ratio_standalone(stage_times)
+    ideal = sum(stage_times) * num_micros
+    
+    _dbg("PIPE_TIME", f"fill={fill_time:.2f} steady={steady_state:.2f} "
+         f"drain={drain_time:.2f} total={total:.2f} "
+         f"ideal={ideal:.2f} efficiency={ideal/total*100:.1f}%")
+    
+    return total

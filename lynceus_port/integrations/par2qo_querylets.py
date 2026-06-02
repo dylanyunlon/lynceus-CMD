@@ -35,6 +35,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -111,6 +112,7 @@ class Predicate:
     selectivity_hint: float = 0.098   # estimated selectivity for cost model
 
     def to_sql(self, param_id: int = 0) -> str:
+        _dbg("TO_SQL", "to_sql entered")
         _dbg("TO_SQL", f"to_sql(param_id={param_id})")
         col = f"{self.alias}.{self.column}" if self.alias else self.column
         if self.pred_type == PredicateType.RANGE:
@@ -145,11 +147,13 @@ class Querylet:
     device_hint: str = ""     # Lynceus: "gpu" | "cpu" | "" for auto
 
     def fingerprint(self) -> str:
+        _dbg("FINGERPR", "fingerprint entered")
         raw = f"{self.template_id}:{','.join(sorted(self.tables))}"
         return hashlib.md5(raw.encode()).hexdigest()[:10]
 
     def estimated_rows(self, table_rows: Dict[str, int]) -> float:
         """Estimate output cardinality using independence assumption."""
+        _dbg("ESTIMATE", "estimated_rows entered")
         _dbg("ESTIMATE", f"estimated_rows(table_rows={table_rows})")
         total = 1.0
         for t in self.tables:
@@ -161,6 +165,7 @@ class Querylet:
         return max(total, 1.0)
 
     def to_sql(self) -> str:
+        _dbg("TO_SQL", "to_sql entered")
         if self.sql_template:
             return self.sql_template
         # Build SQL from components
@@ -188,6 +193,7 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     PAR2QO: querylet(db, kk, cc, template_name) → dict of SQL strings.
     Lynceus: returns dict of structured Querylet objects.
     """
+    _dbg("QUERYLET", "querylet_tpch entered")
     _dbg("QUERYLET", f"querylet_tpch(cc={cc}, 1={1}, kk={kk}, 1={1})")
     templates = {}
 
@@ -426,6 +432,7 @@ class QueryletGenerator:
         PAR2QO: querylet(db, kk, cc, template_name).
         Lynceus: generates all TPC-H templates.
         """
+        _dbg("GENERATE", "generate_all entered")
         t0 = time.time()
         self._templates = querylet_tpch()
 
@@ -453,6 +460,7 @@ class QueryletGenerator:
         return self._templates
 
     def get_template(self, template_id: str) -> Optional[Querylet]:
+        _dbg("GET_TEMP", "get_template entered")
         _dbg("GET_TEMP", f"get_template(template_id={template_id})")
         if not self._templates:
             self.generate_all()

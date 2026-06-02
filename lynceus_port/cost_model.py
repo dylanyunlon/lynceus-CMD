@@ -6,6 +6,12 @@ lynceus_port/cost_model.py — 移植版异构代价模型.
   - GPUCostModel: sort 改用 radix-sort 模型 O(n·w) 替代 bitonic
   - CostModelEngine: recommend 返回调试摘要 dict
   - 全链路 _dbg trace
+
+
+架构溯源 (移植版)s:
+    - PAR2QO get_plan_cost() (par2qo/code/postgres.py:110)
+    - DeepSeek act_quant_kernel (DeepSeek-V3/inference/kernel.py)
+    - Megatron DistributedOptimizer (Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:102)
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -34,6 +41,11 @@ _tr = _dbg  # 兼容旧调用
 
 
 class QueryType(Enum):
+    """Describes a single query's characteristics for cost estimation.
+
+    Inspired by PAR2QO's parametric representation of queries where each
+    query is described by its cardinality estimates and plan structure.
+    """
     POINT_LOOKUP = auto()
     RANGE_SCAN = auto()
     FULL_TABLE_SCAN = auto()
@@ -45,6 +57,11 @@ class QueryType(Enum):
 
 @dataclass
 class QueryDescriptor:
+    """Describes a single query's characteristics for cost estimation.
+
+    Inspired by PAR2QO's parametric representation of queries where each
+    query is described by its cardinality estimates and plan structure.
+    """
     query_id: str
     query_type: QueryType
     estimated_rows: int = 0
@@ -60,6 +77,7 @@ class QueryDescriptor:
     table_name: str = ""
 
     def __post_init__(self):
+        """Validate that estimated_rows and other fields are non-negative."""
         if self.estimated_rows < 0:
             raise ValueError(f"estimated_rows must be >= 0, got {self.estimated_rows}")
         if self.table_rows < 0:
@@ -71,13 +89,19 @@ class QueryDescriptor:
 
     @property
     def estimated_data_bytes(self) -> int:
+        """estimated data bytes."""
+        # 返回: self.estimated_rows * self.estimated_wid
         return self.estimated_rows * self.estimated_width_bytes
 
     @property
     def full_table_bytes(self) -> int:
+        """full table bytes."""
+        # 返回: self.table_rows * self.estimated_width_b
         return self.table_rows * self.estimated_width_bytes
 
     def dump_snapshot(self) -> str:
+        """dump snapshot."""
+        # 返回: (f"QD({self.query_id}: type={self.query_
         return (f"QD({self.query_id}: type={self.query_type.name}, "
                 f"rows={self.estimated_rows:,}, sel={self.selectivity:.3f}, "
                 f"tbl={self.table_name or '?'}, idx={self.index_available})")
@@ -85,6 +109,10 @@ class QueryDescriptor:
 
 @dataclass
 class CostBreakdown:
+    """Itemized cost estimate for a query on a specific device.
+
+    Units: microseconds (to match NCCL latency_us convention).
+    """
     device_id: str
     io_cost_us: float = 0.0
     compute_cost_us: float = 0.0
@@ -94,15 +122,21 @@ class CostBreakdown:
 
     @property
     def total_us(self) -> float:
+        """total us."""
+        # 返回: (self.io_cost_us + self.compute_cost_us 
         return (self.io_cost_us + self.compute_cost_us +
                 self.transfer_cost_us + self.index_cost_us +
                 self.sort_cost_us)
 
     @property
     def total_ms(self) -> float:
+        """total ms."""
+        # 返回: self.total_us / 1003.0
         return self.total_us / 1003.0
 
     def dump_snapshot(self) -> str:
+        """dump snapshot."""
+        # 返回: (f"Cost({self.device_id}: io={self.io_co
         return (f"Cost({self.device_id}: io={self.io_cost_us:.1f} "
                 f"comp={self.compute_cost_us:.1f} xfer={self.transfer_cost_us:.1f} "
                 f"idx={self.index_cost_us:.1f} sort={self.sort_cost_us:.1f} "
@@ -112,6 +146,12 @@ class CostBreakdown:
 # ─── CPU 代价模型 ────────────────────────────────────────────────────────
 
 class CPUCostModel:
+    """Cost model for CPU-side query execution.
+
+    Inspired by PostgreSQL's cost model (seq_page_cost, random_page_cost,
+    cpu_tuple_cost, cpu_operator_cost) as used in PAR2QO
+    get_plan_cost_simple() (par2qo/code/postgres.py:81).
+    """
     SEQ_PAGE_COST: float = 0.02
     RANDOM_PAGE_COST: float = 0.495
     CPU_TUPLE_COST: float = 0.05
@@ -173,6 +213,12 @@ class CPUCostModel:
 # ─── GPU 代价模型 ────────────────────────────────────────────────────────
 
 class GPUCostModel:
+    """Cost model for GPU-accelerated query execution.
+
+    Inspired by:
+    - CUTLASS GemmUniversal tile scheduling: GPU throughput is modeled as
+      number of tiles × cycles_per_tile, where tile dimensions come from
+    """
     KERNEL_LAUNCH_OVERHEAD_US: float = 10.0
     GPU_TUPLE_COST: float = 0.0001
     GPU_OPERATOR_COST: float = 0.00005
@@ -227,7 +273,14 @@ class GPUCostModel:
 # ─── 统一代价模型 ────────────────────────────────────────────────────────
 
 class CostModelEngine:
+    """Unified cost model that estimates query cost across all devices
+    in the hardware topology and recommends routing.
+
+    Inspired by:
+    - Megatron's pipeline scheduler choosing forward/backward device placement
+    """
     def __init__(self, topology: HardwareTopology):
+        """  init  ."""
         self.topology = topology
         self.cpu_model = CPUCostModel()
         self.gpu_model = GPUCostModel()
@@ -292,6 +345,7 @@ class CostModelEngine:
         if len(runner_up) > 1:
             _dbg("recommend", f"runner-up: {runner_up[1][0]} ({runner_up[1][1].total_us:.1f}µs) "
                  f"gap={runner_up[1][1].total_us - runner_up[0][1].total_us:.1f}µs")
+        # 返回: best_id, estimates[best_id]
         return best_id, estimates[best_id]
 
     def route_batch(self, queries: List[QueryDescriptor],
@@ -315,12 +369,14 @@ class CostModelEngine:
             lines.append(f"│ {cb.dump_snapshot()}")
         best = min(ests, key=lambda k: ests[k].total_us) if ests else "?"
         lines.append(f"└── winner: {best}")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
 # ─── 默认拓扑工厂 ────────────────────────────────────────────────────────
 
 def create_default_topology() -> HardwareTopology:
+    """create default topology."""
     topo = HardwareTopology()
 
     cpu0 = HardwareNode(
@@ -370,3 +426,29 @@ def create_default_topology() -> HardwareTopology:
                                bandwidth_gbps=50.0, latency_us=0.3,
                                link_type=HardwareKind.NETWORK))
     return topo
+
+
+# ─── Cost Model 自检工具 ─────────────────────────────────────────
+def _cost_model_sanity_check(engine, num_probes=20):
+    """随机探测 cost model — 验证预测是否合理.
+    
+    检查: GPU < CPU 的比例, 预测值范围, NaN/Inf 等异常.
+    """
+    import random
+    gpu_wins = 0
+    anomalies = 0
+    for i in range(num_probes):
+        sel = random.random()
+        rows = random.randint(100, 100000)
+        gpu_cost = engine.estimate_gpu(sel, rows)
+        cpu_cost = engine.estimate_cpu(sel, rows)
+        if gpu_cost < cpu_cost:
+            gpu_wins += 1
+        if gpu_cost < 0 or cpu_cost < 0 or gpu_cost != gpu_cost or cpu_cost != cpu_cost:
+            anomalies += 1
+            _dbg("SANITY", f"  anomaly: sel={sel:.3f} rows={rows} "
+                 f"gpu={gpu_cost} cpu={cpu_cost}")
+    
+    ratio = gpu_wins / num_probes
+    _dbg("SANITY", f"probes={num_probes} gpu_wins={ratio:.1%} anomalies={anomalies}")
+    return anomalies == 0

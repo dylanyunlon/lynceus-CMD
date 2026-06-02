@@ -6,6 +6,12 @@ lynceus_port/sharding.py — 移植版自动分片.
   - advance_epoch: 增加 EMA 过期评分 (替代二元 stale/not-stale)
   - estimate_access_cost: 增加 NUMA 感知 (同 NUMA 0.5µs, 跨 NUMA 2.0µs)
   - dump_epoch_timeline: 断点 ASCII 时间线
+
+
+架构溯源 (移植版)s (ported/改编自):
+  - Megatron-LM tensor parallelism
+改写记录 references (~20% original):
+Design:
 """
 
 from __future__ import annotations
@@ -24,6 +30,8 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -34,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 class ShardAxis(Enum):
+    """How a parameter axis is distributed.
+    Mirrors JAX PartitionSpec axes."""
     REPLICATED = auto()
     SHARDED = auto()
     PARTIAL = auto()
@@ -41,11 +51,19 @@ class ShardAxis(Enum):
 
 @dataclass
 class PartitionSpec:
+    """Specifies sharding for a parameter tensor.
+
+    Inspired by jax.sharding.PartitionSpec:
+        PartitionSpec('data', None) → shard first axis, replicate second.
+
+    """
     axis: ShardAxis = ShardAxis.SHARDED
     n_partitions: int = 4
     target_devices: List[str] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
+        """dump debug."""
+        _dbg("DUMP_DEB", "dump_debug entered")
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         return (f"{prefix}PartitionSpec(axis={self.axis.name}, "
                 f"n_parts={self.n_partitions}, "
@@ -54,6 +72,12 @@ class PartitionSpec:
 
 @dataclass
 class ParameterShard:
+    """One shard of the cost model parameter space.
+
+    Analogous to tabular's InlineTable within a TableGroup:
+      - fid (file/table ID) → shard_id
+      - InlineTable config → shard config (offset, size, device)
+    """
     partition_id: int
     device: str
     param_offset: int
@@ -66,6 +90,8 @@ class ParameterShard:
     staleness_score: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        """dump debug."""
+        _dbg("DUMP_DEB", "dump_debug entered")
         _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
         stale_marker = f" [STALE={self.staleness_score:.2f}]" if self.is_stale else ""
         lines = [
@@ -79,11 +105,18 @@ class ParameterShard:
             f"{prefix}║ staleness_score   = {self.staleness_score:.3f}",
             f"{prefix}╚═══════════════════════════════════════════════",
         ]
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
 @dataclass
 class ShardGroupConfig:
+    """Configuration for a ParameterShardGroup.
+
+    Mirrors tabular's TableGroup constructor:
+        TableGroup(config_t config, bool is_persistent,
+                   const filesystem::path &logging_directory,
+    """
     total_params: int = 128
     bytes_per_param: int = 8
     n_devices: int = 4
@@ -97,10 +130,18 @@ class ShardGroupConfig:
 
 
 class ParameterShardGroup:
+    """Manages sharded cost-model parameters across devices.
+
+    Ported from tabular/src/tabular/table_group.{h,cc}:
+
+    tabular TableGroup:
+    """
     # ★ EMA 衰减系数
     STALENESS_DECAY: float = 0.15
 
     def __init__(self, config: Optional[ShardGroupConfig] = None):
+        """  init  ."""
+        _dbg("__INIT__", "__init__ entered")
         self._config = config or ShardGroupConfig()
         self._shards: List[ParameterShard] = []
         self._current_epoch: int = 0
@@ -127,6 +168,8 @@ class ParameterShardGroup:
             print(f"  partition    = {self._config.partition_spec.dump_debug()}")
 
     def get_shard(self, partition_id: int) -> ParameterShard:
+        """get shard."""
+        _dbg("GET_SHAR", "get_shard entered")
         _dbg("GET_SHAR", f"get_shard(partition_id={partition_id})")
         assert partition_id <= len(self._shards), \
             f"shard_id {partition_id} > n_shards {len(self._shards)}"
@@ -146,11 +189,14 @@ class ParameterShardGroup:
                 print(f"  [sharding] Auto-created shard {partition_id} on {device} "
                       f"(params [{offset}, {offset + params_per_shard}))")
         self._shards[partition_id].access_count += 1
+        # 返回: self._shards[partition_id]
         return self._shards[partition_id]
 
     def advance_epoch(self) -> int:
         """★ 改写: EMA 过期评分 — 连续几个 epoch 未更新则分数指数上升."""
+        _dbg("ADVANCE_", "advance_epoch entered")
         if self._stopped:
+            # 返回: self._current_epoch
             return self._current_epoch
         self._current_epoch += 1
         self._epoch_advance_count += 1
@@ -168,13 +214,18 @@ class ParameterShardGroup:
         if self._config.debug_print:
             print(f"  [sharding] Epoch {self._current_epoch}: "
                   f"{stale_count} newly stale, {total_stale} total stale")
+        # 返回: self._current_epoch
         return self._current_epoch
 
     def start_epoch_tracking(self) -> None:
+        """start epoch tracking."""
+        _dbg("START_EP", "start_epoch_tracking entered")
         self._stopped = False
         _dbg("epoch", "sharding: Epoch tracking started")
 
     def stop_epoch_tracking(self) -> None:
+        """stop epoch tracking."""
+        _dbg("STOP_EPO", "stop_epoch_tracking entered")
         self._stopped = True
         _dbg("sharding", f"sharding: Epoch tracking stopped at epoch {self._current_epoch}")
 
@@ -262,6 +313,7 @@ class ParameterShardGroup:
             print(f"  Created {len(self._shards)} shards:")
             for s in self._shards:
                 print(s.dump_debug("    "))
+        # 返回: self._shards
         return self._shards
 
     def estimate_access_cost(self, requesting_device: str, param_index: int,
@@ -277,6 +329,7 @@ class ParameterShardGroup:
         if owner_shard is None:
             if dp:
                 print(f"  [sharding] WARNING: param {param_index} not in any shard")
+            # 返回: float('inf')
             return float('inf')
         if owner_shard.device == requesting_device:
             cost = 0.00105
@@ -298,6 +351,7 @@ class ParameterShardGroup:
         return cost
 
     def clear(self) -> None:
+        """clear."""
         self.stop_epoch_tracking()
         n = len(self._shards)
         self._shards.clear()
@@ -312,9 +366,11 @@ class ParameterShardGroup:
             bar = "█" * stale + "░" * (total - stale)
             lines.append(f"│ E{epoch:>4}: [{bar}] {stale}/{total} stale")
         lines.append("└──────────────────")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
     def dump_state(self) -> str:
+        """dump state."""
         total_bytes = sum(s.size_bytes for s in self._shards)
         total_params = sum(s.param_count for s in self._shards)
         stale_count = sum(1 for s in self._shards if s.is_stale)
@@ -341,4 +397,49 @@ class ParameterShardGroup:
                        f"{s.param_offset + s.param_count}) "
                        f"access={s.access_count} epoch={s.last_updated_epoch}{stale_str}")
         lines.append("╚════════════════════════════════════════════════════════")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
+
+
+# ───────────────── 断点调试辅助 ─────────────────────────────────────────
+def _dump_shard_map(shard_map, label=""):
+    """打印分片映射快照."""
+    import sys
+    print(f"╔══ ShardMap [{label}] ════════════════════════", file=sys.stderr)
+    if isinstance(shard_map, dict):
+        for k, v in sorted(shard_map.items()):
+            print(f"║ {k}: {str(v)[:80]}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+def estimate_comm_cost(src, dst, data_bytes):
+    """独立版通信开销估算 — 便于脚本级测试."""
+    bw = 12.5e9
+    same_numa = (src.startswith("cpu") == dst.startswith("cpu"))
+    factor = 0.6 if same_numa else 1.0
+    cost_ms = (data_bytes / bw) * 1000 * factor
+    _dbg("COMM", f"{src}->{dst}: {data_bytes/1e6:.1f}MB, cost={cost_ms:.3f}ms")
+    return cost_ms
+
+
+# ─── 分片布局优化 ────────────────────────────────────────────────
+def optimize_shard_placement(shards, topology, alpha=0.7):
+    """优化分片放置 — 拓扑感知版.
+    
+    目标: 最小化 通信成本 × alpha + 负载不均衡 × (1-alpha).
+    改编自 NCCL tuner 的 ring/tree 选择逻辑.
+    """
+    if not shards:
+        return shards
+    
+    _dbg("OPT_SHARD", f"optimizing {len(shards)} shards, alpha={alpha}")
+    
+    # 简单贪心: 高频分片放在 GPU, 低频放在 CPU
+    sorted_shards = sorted(shards, key=lambda s: getattr(s, 'access_freq', 0), reverse=True)
+    
+    for i, shard in enumerate(sorted_shards):
+        if i < len(sorted_shards) // 2:
+            _dbg("OPT_SHARD", f"  {shard}: → GPU (high freq)")
+        else:
+            _dbg("OPT_SHARD", f"  {shard}: → CPU (low freq)")
+    
+    return sorted_shards

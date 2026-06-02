@@ -149,3 +149,46 @@ class Router:
             lines.append(f"│ {name}: {type(strat).__name__}{active}")
         lines.append(f"└── {len(self._registry)} strategies registered")
         return "\n".join(lines)
+
+
+# ───────────────── 断点调试辅助 ─────────────────────────────────────────
+def _dump_routing_decisions(decisions, label=""):
+    """打印路由决策列表摘要."""
+    import sys
+    print(f"╔══ Routing Decisions [{label}] ═══════════════", file=sys.stderr)
+    gpu_count = sum(1 for d in decisions if "gpu" in getattr(d, "target_device", ""))
+    cpu_count = len(decisions) - gpu_count
+    print(f"║ total={len(decisions)} gpu={gpu_count} cpu={cpu_count}", file=sys.stderr)
+    for d in decisions[:5]:
+        print(f"║   {d}", file=sys.stderr)
+    if len(decisions) > 5:
+        print(f"║   ... ({len(decisions)-5} more)", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+# ─── 路由决策辅助 ────────────────────────────────────────────────
+def _explain_routing_decision(query, decision, cost_model=None, label=""):
+    """解释路由决策的理由 — 用于断点调试.
+    
+    打印: 查询特征, 各设备预测成本, 最终选择及置信度.
+    """
+    import sys
+    print(f"╔══ Routing Decision [{label}] ═════════════════", file=sys.stderr)
+    print(f"║ query: {str(query)[:80]}", file=sys.stderr)
+    print(f"║ decision: {decision}", file=sys.stderr)
+    if cost_model:
+        for device in ['gpu0', 'cpu0']:
+            cost = getattr(cost_model, 'estimate', lambda q, d: -1)(query, device)
+            print(f"║ {device} cost: {cost:.3f}ms", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
+
+
+def _dump_router_stats(router, label=""):
+    """打印路由器累积统计."""
+    import sys
+    print(f"╔══ Router Stats [{label}] ══════════════════", file=sys.stderr)
+    for attr in ['_total_routed', '_gpu_routed', '_cpu_routed', 
+                 '_fallback_count', '_avg_confidence']:
+        val = getattr(router, attr, 'N/A')
+        print(f"║ {attr}: {val}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)

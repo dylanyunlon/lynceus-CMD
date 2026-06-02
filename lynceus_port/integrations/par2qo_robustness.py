@@ -42,6 +42,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    _dbg("_DBG", "_dbg entered")
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -55,6 +56,7 @@ logger = logging.getLogger("lynceus.robustness")
 def _halton_seq(index: int, base: int) -> float:
     """Single Halton sequence value. PAR2QO used SALib.sample.sobol;
     we use Halton for deterministic low-discrepancy without external deps."""
+    _dbg("_HALTON_", "_halton_seq entered")
     _dbg("_HALTON_", f"_halton_seq(index={index}, base={base})")
     result, denom = 0.0, 1.0
     i = index
@@ -68,6 +70,7 @@ def _halton_seq(index: int, base: int) -> float:
 def halton_samples(n: int, dim: int, seed: int = 2023) -> List[List[float]]:
     """Generate n samples in [0,1]^dim via Halton sequence.
     PAR2QO: np.random.seed(2023) + sobol.sample → here: deterministic Halton."""
+    _dbg("HALTON_S", "halton_samples entered")
     _dbg("HALTON_S", f"halton_samples(n={n}, dim={dim}, seed={seed})")
     primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
               59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
@@ -93,6 +96,7 @@ class ErrorDistribution:
     def sample(self, u01: float) -> float:
         """Inverse-CDF sampling from a skew-normal approximation.
         PAR2QO: pdf_of_err.sample(N) → we do quantile transform."""
+        _dbg("SAMPLE", "sample entered")
         _dbg("SAMPLE", f"sample(u01={u01})")
         from math import erfc, sqrt, log
         # Box-Muller from uniform
@@ -106,6 +110,7 @@ class ErrorDistribution:
 
 def _erfinv(x: float) -> float:
     """Rational approximation of inverse error function."""
+    _dbg("_ERFINV", "_erfinv entered")
     _dbg("_ERFINV", f"_erfinv(x={x})")
     a = 0.147
     ln = math.log(1.0 - x * x)
@@ -137,6 +142,7 @@ class PlanHint:
     hint_str: str = ""
 
     def fingerprint(self) -> str:
+        _dbg("FINGERPR", "fingerprint entered")
         raw = json.dumps({
             "jo": [(a, b) for a, b in self.join_order],
             "jm": [m.name for m in self.join_methods],
@@ -155,10 +161,12 @@ class CostEstimate:
 
     @property
     def total_cpu(self) -> float:
+        _dbg("TOTAL_CP", "total_cpu entered")
         return self.cpu_cost
 
     @property
     def total_gpu(self) -> float:
+        _dbg("TOTAL_GP", "total_gpu entered")
         return self.gpu_cost + self.data_movement_expense
 
     @property

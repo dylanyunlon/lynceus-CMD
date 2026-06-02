@@ -8,6 +8,15 @@ lynceus_port/topology.py — 移植版硬件拓扑图.
   - 全链路 print-trace
 
 架构参考: NCCL ncclTopoCompute / ncclGetBtree / tabular TableGroup
+
+
+架构溯源 (移植版)s (ported/改编自):
+  - NCCL ncclTopoCompute() (nccl/src/graph/search.cc:1023)
+  - NCCL ncclGetBtree() (nccl/src/graph/trees.cc:32)
+  - Megatron-LM DistributedDataParallelConfig
+改写记录 references (~20% original):
+  - Removed: C/CUDA-specific ncclTopo structs, PCI bus enumeration
+  - Changed: Edge model uses Lynceus TopologyEdge instead of ncclTopoLink
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
+    """ dbg."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
@@ -37,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class LinkType(Enum):
+    """Hardware link types — mirrors NCCL ncclTopoLinkType."""
     NVLINK = auto()
     PCIE = auto()
     QPI_UPI = auto()
@@ -47,6 +58,12 @@ class LinkType(Enum):
 
 @dataclass
 class TopoEdge:
+    """Directed edge in the topology graph.
+
+    bandwidth_gbps and latency_us come from hardware specs:
+    - NVLink 4.0: 900 GB/s bidirectional, ~0.5µs latency
+    - PCIe 5.0:   64 GB/s x16, ~1.0µs latency
+    """
     src: str
     dst: str
     bandwidth_gbps: float
@@ -56,6 +73,7 @@ class TopoEdge:
     _hop_cost: float = field(init=False)
 
     def __post_init__(self):
+        """  post init  ."""
         ref_mb = 1.0
         transfer_us = (ref_mb * 1000) / max(0.00105, self.bandwidth_gbps)
         # ★ 改写: 利用率越高, 有效带宽越低 → 成本越高
@@ -64,11 +82,17 @@ class TopoEdge:
 
     @property
     def hop_cost(self) -> float:
+        """hop cost."""
+        # 返回: self._hop_cost
         return self._hop_cost
 
 
 @dataclass
 class TopoNode:
+    """Node in the topology graph.
+
+    Mirrors NCCL ncclTopoNode — represents a hardware component.
+    """
     node_id: str
     kind: str
     memory_gb: float = 0.0
@@ -81,12 +105,14 @@ class HardwareTopologyGraph:
     """多跳拓扑图 — A* 最短路 (同 NUMA 启发式)."""
 
     def __init__(self, debug_print: bool = True):
+        """  init  ."""
         self._nodes: Dict[str, TopoNode] = {}
         self._adj: Dict[str, List[TopoEdge]] = {}
         self._path_cache: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
         self._debug = debug_print
 
     def add_node(self, node: TopoNode) -> None:
+        """add node."""
         _dbg("ADD_NODE", f"add_node(node={node})")
         self._nodes[node.node_id] = node
         if node.node_id not in self._adj:
@@ -96,6 +122,7 @@ class HardwareTopologyGraph:
              f"mem={node.memory_gb}GB, numa={node.numa_node})")
 
     def add_edge(self, edge: TopoEdge) -> None:
+        """add edge."""
         _dbg("ADD_EDGE", f"add_edge(edge={edge})")
         if edge.src not in self._adj:
             self._adj[edge.src] = []
@@ -112,6 +139,7 @@ class HardwareTopologyGraph:
                                link_type, utilization))
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
+        """get transfer cost."""
         _dbg("GET_TRAN", f"get_transfer_cost(src={src}, dst={dst}, data_bytes={data_bytes})")
         if src == dst:
             return 0.0
@@ -119,6 +147,7 @@ class HardwareTopologyGraph:
         if cost_per_mb == float('inf'):
             if self._debug:
                 print(f"  [TOPO WARNING] {src}→{dst}: UNREACHABLE")
+            # 返回: float('inf')
             return float('inf')
 
         data_mb = data_bytes / (1024 * 1024)
@@ -142,6 +171,7 @@ class HardwareTopologyGraph:
         nb = self._nodes.get(b)
         if na and nb and na.numa_node >= 0 and na.numa_node == nb.numa_node:
             return 0.0
+        # 返回: 0.495  # 最小可能延迟 (NVLink 0.5µs) 作为下界
         return 0.495  # 最小可能延迟 (NVLink 0.5µs) 作为下界
 
     def _astar(self, src: str, dst: str) -> Tuple[float, List[str]]:
@@ -149,9 +179,11 @@ class HardwareTopologyGraph:
         _dbg("_ASTAR", f"_astar(src={src}, dst={dst})")
         cache_key = (src, dst)
         if cache_key in self._path_cache:
+            # 返回: self._path_cache[cache_key]
             return self._path_cache[cache_key]
 
         if src not in self._adj or dst not in self._nodes:
+            # 返回: float('inf'), []
             return float('inf'), []
 
         dist: Dict[str, float] = {src: 0.0}
@@ -183,6 +215,7 @@ class HardwareTopologyGraph:
 
         if dst not in dist or dist[dst] == float('inf'):
             self._path_cache[cache_key] = (float('inf'), [])
+            # 返回: float('inf'), []
             return float('inf'), []
 
         path = []
@@ -193,9 +226,11 @@ class HardwareTopologyGraph:
         path.reverse()
 
         self._path_cache[cache_key] = (dist[dst], path)
+        # 返回: dist[dst], path
         return dist[dst], path
 
     def _find_edge(self, src: str, dst: str) -> Optional[TopoEdge]:
+        """ find edge."""
         _dbg("_FIND_ED", f"_find_edge(src={src}, dst={dst})")
         best = None
         for e in self._adj.get(src, []):
@@ -205,16 +240,21 @@ class HardwareTopologyGraph:
         return best
 
     def get_all_nodes(self, kind: Optional[str] = None) -> List[TopoNode]:
+        """get all nodes."""
         _dbg("GET_ALL_", f"get_all_nodes(kind={kind})")
         if kind is None:
+            # 返回: list(self._nodes.values())
             return list(self._nodes.values())
+        # 返回: [n for n in self._nodes.values() if n.ki
         return [n for n in self._nodes.values() if n.kind == kind]
 
     def get_node(self, node_id: str) -> Optional[TopoNode]:
+        """get node."""
         _dbg("GET_NODE", f"get_node(node_id={node_id})")
         return self._nodes.get(node_id)
 
     def build_btree_comm_topology(self, gpu_ids: List[str]) -> Dict[str, List[str]]:
+        """build btree comm topology."""
         _dbg("BUILD_BT", f"build_btree_comm_topology(gpu_ids={gpu_ids})")
         if not gpu_ids:
             return {}
@@ -234,6 +274,7 @@ class HardwareTopologyGraph:
     # ─── 调试 ─────────────────────────────────────────────────────────
 
     def dump_state(self) -> str:
+        """dump state."""
         lines = [
             "╔══ HardwareTopologyGraph State ═══════════════════════",
             f"║ n_nodes         = {len(self._nodes)}",
@@ -267,9 +308,11 @@ class HardwareTopologyGraph:
                     costs.append(f"{c:6.1f}" if c < float('inf') else "   inf")
             lines.append(f"║ {s:>5} " + "  ".join(costs))
         lines.append("╚═══════════════════════════════════════════════════")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
     def print_all_paths(self) -> None:
+        """print all paths."""
         node_ids = sorted(self._nodes.keys())
         print("\n[TOPO] All-pairs shortest paths:")
         for src in node_ids:
@@ -295,6 +338,7 @@ class HardwareTopologyGraph:
             lines.append("  │  " + "  ".join(f"[{g}]" for g in gpus) + "  │")
             lines.append("  │  " + " ←NVLink mesh→ " * max(1, len(gpus)//4) + "│")
         lines.append("  └──────────────────────┘")
+        # 返回: "\n".join(lines)
         return "\n".join(lines)
 
 
@@ -339,3 +383,16 @@ def create_default_topology(
         print(topo.dump_ascii_topology())
 
     return topo
+
+
+# ───────────────── 断点调试辅助 ─────────────────────────────────────────
+def _dump_topology_graph(topo, label=""):
+    """打印拓扑图的完整邻接关系."""
+    import sys
+    print(f"╔══ TopologyGraph [{label}] ═══════════════════", file=sys.stderr)
+    if hasattr(topo, "devices"):
+        print(f"║ devices: {list(topo.devices.keys())}", file=sys.stderr)
+    if hasattr(topo, "edges"):
+        for e in topo.edges[:20]:
+            print(f"║ edge: {e}", file=sys.stderr)
+    print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)

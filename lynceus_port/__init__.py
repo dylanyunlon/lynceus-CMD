@@ -12,5 +12,6 @@ LYNCEUS_DEBUG: bool = _os.environ.get("LYNCEUS_DEBUG", "0") == "1"
 
 def _dbg(*args, **kw):
     """条件调试输出 — 运行实验时 export LYNCEUS_DEBUG=1 即可打开."""
+    _dbg("_DBG", "_dbg entered")
     if LYNCEUS_DEBUG:
         print("[DBG]", *args, **kw)
