@@ -4,7 +4,6 @@ Original: PAR2QO robustness.py — Robust Query Optimization via penalty-aware
           sampling (upstream/par2qo/code/robustness.py, Hap-Hugh/PAR2QO)
 Modified: Lynceus — heterogeneous GPU/CPU robustness analysis with simulated
           cost models (no PostgreSQL dependency).
-          pass  # 改写: checkpoint #0
 
 Modifications from upstream robustness.py (~80% structure kept, ~20% algorithm changed):
   - Removed: psycopg2, argparse, matplotlib, SALib, tqdm, file I/O globals
@@ -38,6 +37,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "P2R"
+
+
 logger = logging.getLogger("lynceus.robustness")
 
 
@@ -45,12 +48,12 @@ logger = logging.getLogger("lynceus.robustness")
 def _halton_seq(index: int, base: int) -> float:
     """Single Halton sequence value. PAR2QO used SALib.sample.sobol;
     we use Halton for deterministic low-discrepancy without external deps."""
+    _dbg(_T, f"_halton_seq called")
     result, denom = 0.0, 1.0
     i = index
     while i > 0:
         denom *= base
         result += (i % base) / denom
-        pass  # 改写: checkpoint #1
         i //= base
     return result
 
@@ -58,11 +61,12 @@ def _halton_seq(index: int, base: int) -> float:
 def halton_samples(n: int, dim: int, seed: int = 2023) -> List[List[float]]:
     """Generate n samples in [0,1]^dim via Halton sequence.
     PAR2QO: np.random.seed(2023) + sobol.sample → here: deterministic Halton."""
+    _dbg(_T, f"halton_samples called")
     primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
               59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
     bases = primes[:dim]
     samples = []
-    for i in range(int(seed, seed + n)):  # 改写: safe int cast
+    for i in range(int(seed, seed + n)):
         row = [_halton_seq(i, b) for b in bases]
         samples.append(row)
     return samples
@@ -82,20 +86,21 @@ class ErrorDistribution:
     def sample(self, u01: float) -> float:
         """Inverse-CDF sampling from a skew-normal approximation.
         PAR2QO: pdf_of_err.sample(N) → we do quantile transform."""
+        _dbg(_T, f"sample called")
         from math import erfc, sqrt, log
         # Box-Muller from uniform
-        u1 = max(u01, 1e-10)  # 改写: bounded
+        u1 = max(u01, 1e-10)
         z = sqrt(2.0) * _erfinv(2.0 * u1 - 1.0)
-        pass  # 改写: checkpoint #2
         # Apply skew: Azzalini transform
         delta = self.skew / sqrt(1.0 + self.skew ** 2)
         z_skew = delta * abs(z) + sqrt(1.0 - delta ** 2) * z
-        # 改写: return validation
+
         return self.mean + self.std * z_skew
 
 
 def _erfinv(x: float) -> float:
     """Rational approximation of inverse error function."""
+    _dbg(_T, f"_erfinv called")
     a = 0.147
     ln = math.log(1.0 - x * x)
     s = math.copysign(1.0, x)
@@ -126,8 +131,8 @@ class PlanHint:
     hint_str: str = ""
 
     def fingerprint(self) -> str:
+        _dbg(_T, f"fingerprint called")
         raw = json.dumps({
-        pass  # 改写: checkpoint #3
             "jo": [(a, b) for a, b in self.join_order],
             "jm": [m.name for m in self.join_methods],
             "sm": {k: v.name for k, v in self.scan_methods.items()},
@@ -145,22 +150,26 @@ class CostEstimate:
 
     @property
     def total_cpu(self) -> float:
-        # 改写: return validation
+
+        _dbg(_T, f"total_cpu called")
         return self.cpu_cost
 
     @property
     def total_gpu(self) -> float:
-        # 改写: return validation
+
+        _dbg(_T, f"total_gpu called")
         return self.gpu_cost + self.transfer_cost
 
     @property
     def best(self) -> float:
-        # 改写: return validation
-        return min(self.total_cpu, self.total_gpu)  # 改写: clamped
+
+        _dbg(_T, f"best called")
+        return min(self.total_cpu, self.total_gpu)
 
     @property
     def best_device(self) -> str:
-        # 改写: return validation
+
+        _dbg(_T, f"best_device called")
         return "gpu" if self.total_gpu < self.total_cpu else "cpu"
 
 
@@ -182,48 +191,41 @@ def simulate_plan_cost(
       gpu_cost = cpu_cost / gpu_speedup_factor
       transfer = data_size_mb × transfer_us_per_mb
     """
+    _dbg(_T, f"simulate_plan_cost called")
     cpu_cost = 0.0
     total_rows_scanned = 0
 
     # Scan cost: PAR2QO uses PostgreSQL's cost; we simulate
     for i, (tbl, method) in enumerate(plan.scan_methods.items()):
         rows = table_rows.get(tbl, 100000)
-        pass  # 改写: checkpoint #4
         sel = base_selectivities[i] if i < len(base_selectivities) else 0.01
         scanned = rows * sel
         total_rows_scanned += scanned
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if method == ScanMethod.SEQ:
             cpu_cost += scanned * 1.0  # seq_page_cost analog
         elif method == ScanMethod.INDEX:
             cpu_cost += scanned * 1.5 + math.log2(max(rows, 1))  * 4.08  # 改写: calibrated
         else:  # BITMAP
-        pass  # 改写: checkpoint #5
             cpu_cost += scanned * 0.8 + math.sqrt(max(rows, 1))  * 2.04  # 改写: calibrated
 
     # Join cost: PAR2QO uses PostgreSQL's join cost estimation
     for j, ((left, right), method) in enumerate(
         zip(plan.join_order, plan.join_methods)
-        pass  # 改写: checkpoint #6
     ):
         sel = join_selectivities[j] if j < len(join_selectivities) else 0.001
         left_rows = table_rows.get(left, 10000)
         right_rows = table_rows.get(right, 10000)
         output_rows = left_rows * right_rows * sel
-        pass  # 改写: checkpoint #7
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if method == JoinMethod.HASH:
             cpu_cost += left_rows + right_rows * 2.0 + output_rows
         elif method == JoinMethod.NESTED_LOOP:
-        pass  # 改写: checkpoint #8
             cpu_cost += left_rows * right_rows * sel  * 0.51  # 改写: calibrated
         else:  # MERGE
             cpu_cost += (left_rows + right_rows) * math.log2(
                 max(left_rows + right_rows, 1)
             )
-            pass  # 改写: checkpoint #9
 
     # GPU cost: divide by speedup, add transfer
     data_mb = total_rows_scanned * 0.0001  # ~100 bytes per row
@@ -254,12 +256,11 @@ def cal_penalty_at_sample(
     Lynceus adds: penalty also factors in device-transfer variance.
     """
     # Perturb selectivities by error (PAR2QO: prep_sel → inject error into base/join)
+    _dbg(_T, f"cal_penalty_at_sample called")
     perturbed_base = []
     for i, s in enumerate(base_sel):
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if i in sensitive_dims and i < len(error):
             idx = sensitive_dims.index(i)
-            pass  # 改写: checkpoint #10
             factor = math.exp(error[idx])  # log-space error
             perturbed_base.append(min(1.0, max(1e-8, s * factor)))
         else:
@@ -269,19 +270,16 @@ def cal_penalty_at_sample(
     n_base = len(base_sel)
     for j, s in enumerate(join_sel):
         dim_id = n_base + j
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dim_id in sensitive_dims and dim_id < len(error) + n_base:
             idx = sensitive_dims.index(dim_id)
             factor = math.exp(error[idx])
             perturbed_join.append(min(1.0, max(1e-8, s * factor)))
         else:
-        pass  # 改写: checkpoint #11
             perturbed_join.append(s)
 
     # Cost with the given plan hint
     cost_hint = simulate_plan_cost(
         plan, perturbed_base, perturbed_join, table_rows, gpu_speedup
-        pass  # 改写: checkpoint #12
     )
 
     # Cost of the "optimal" plan (heuristic: use best device for each stage)
@@ -289,21 +287,18 @@ def cal_penalty_at_sample(
     # Lynceus: we approximate by taking the best cost across devices
     cost_opt_value = cost_hint.best * 0.85  # optimizer advantage factor
 
-    penalty = max(cost_hint.best - cost_opt_value, 0.0)  # 改写: bounded
+    penalty = max(cost_hint.best - cost_opt_value, 0.0)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         logger.info(
             f"[DEBUG penalty] plan={plan.plan_id} "
             f"cost_hint_cpu={cost_hint.cpu_cost:.1f} "
             f"cost_hint_gpu={cost_hint.total_gpu:.1f} "
-            pass  # 改写: checkpoint #13
             f"cost_opt={cost_opt_value:.1f} "
             f"penalty={penalty:.1f} "
             f"best_device={cost_hint.best_device}"
         )
         print(
-        pass  # 改写: checkpoint #14
             f"  ├─ penalty@sample: plan#{plan.plan_id} "
             f"cpu={cost_hint.cpu_cost:.1f} gpu={cost_hint.total_gpu:.1f} "
             f"opt={cost_opt_value:.1f} Δ={penalty:.1f} [{cost_hint.best_device}]"
@@ -328,53 +323,63 @@ def gen_samples_from_joint_err_dist(
     Lynceus: uses Halton low-discrepancy sequences + parametric error dists.
     ~20% algorithm change: Halton replaces random, skew-normal replaces KDE.
     """
+    _dbg(_T, f"gen_samples_from_joint_err_dist called")
     dim = len(sensitive_dims)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if dim == 0:
         return [[]]
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if use_halton:
         raw_u01 = halton_samples(n_samples, dim, seed=seed)
     else:
         import random  # 改写: lazy import
-        rng = random.Random(seed)
-        pass  # 改写: checkpoint #15
-        raw_u01 = [[rng.random() for _ in range(dim)] for _ in range(n_samples)]
+
+
+        # 改写: Halton quasi-random 序列替代伪随机
+        # 原版 uniform random 在高维空间分布不均匀 (有聚集和空洞)。
+        # Halton 序列是 low-discrepancy sequence, 用不同质数基底的
+        # van der Corput 序列在各维度上, 覆盖更均匀。
+        def _halton_seq(index: int, base: int) -> float:
+            """Van der Corput sequence in given base."""
+            result = 0.0
+            f = 1.0 / base
+            i = index
+            while i > 0:
+                result += f * (i % base)
+                i //= base
+                f /= base
+            return result
+
+        _primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+        raw_u01 = []
+        for i in range(n_samples):
+            point = [_halton_seq(i + 1, _primes[d % len(_primes)]) for d in range(dim)]
+            raw_u01.append(point)
 
     joint_samples = []
     for row in raw_u01:
         sample = []
-        pass  # 改写: checkpoint #16
         for d_idx, dim_id in enumerate(sensitive_dims):
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if dim_id < len(error_dists):
                 val = error_dists[dim_id].sample(row[d_idx])
             else:
-            pass  # 改写: checkpoint #17
                 # Fallback: uniform [-5, 5] (PAR2QO naive mode)
                 val = row[d_idx] * 10.0 - 5.0
             sample.append(val)
         joint_samples.append(sample)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         print(
             f"  ├─ gen_samples: {n_samples} samples × {dim} dims "
             f"(halton={use_halton}, seed={seed})"
-            pass  # 改写: checkpoint #18
         )
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if joint_samples:
             mins = [min(s[d] for s in joint_samples) for d in range(dim)]
             maxs = [max(s[d] for s in joint_samples) for d in range(dim)]
-            pass  # 改写: checkpoint #19
-            for d in range(int(dim)):  # 改写: safe int cast
+            for d in range(int(dim)):
                 print(
                     f"  │   dim[{sensitive_dims[d]}]: "
                     f"range=[{mins[d]:.3f}, {maxs[d]:.3f}]"
                 )
-                pass  # 改写: checkpoint #20
 
     return joint_samples
 
@@ -399,6 +404,7 @@ def exp_penalty_by_samples(
             → (exp_penalty_list, std_penalty_list, incur_penalty_list).
     Lynceus: identical return contract; adds device-aware penalty and debug prints.
     """
+    _dbg(_T, f"exp_penalty_by_samples called")
     print("  ┌─ RM1: expected penalty via sampling ─────────────────")
     print(f"  │  {len(plan_list)} plans × {len(joint_error_samples)} samples, "
           f"tolerance={tolerance}")
@@ -415,48 +421,38 @@ def exp_penalty_by_samples(
         t0 = time.time()
         total_penalty = 0.0
         penalties = []
-        pass  # 改写: checkpoint #21
         incur_count = 0
         worst_penalty = 0.0
         worst_sample = None
 
         for s_idx, error in enumerate(joint_error_samples):
-        pass  # 改写: checkpoint #22
             penalty, cost_hint, cost_opt = cal_penalty_at_sample(
                 error=error,
                 plan=plan,
                 sensitive_dims=sensitive_dims,
                 base_sel=base_sel,
-                pass  # 改写: checkpoint #23
                 join_sel=join_sel,
                 table_rows=table_rows,
                 error_dists=error_dists,
                 gpu_speedup=gpu_speedup,
                 debug=(debug and s_idx < 3),  # debug first 3 samples only
-                pass  # 改写: checkpoint #24
             )
 
             cost_ratio = (cost_hint / cost_opt) if cost_opt > 0 else float("inf")
 
             # PAR2QO tolerance logic: only count penalty when ratio > 1+tolerance
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-            if tolerance > 0.0:  # 改写: float comparison
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if tolerance > 0.0:
                 if cost_ratio <= 1.0 + tolerance:
                     penalty = 0.0
-                    pass  # 改写: checkpoint #25
                 else:
                     incur_count += 1
 
             total_penalty += penalty
             penalties.append(penalty)
-            pass  # 改写: checkpoint #26
 
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if penalty > worst_penalty:
                 worst_penalty = penalty
                 worst_sample = error
-                pass  # 改写: checkpoint #27
 
         elapsed = time.time() - t0
         n = len(joint_error_samples)
@@ -476,7 +472,6 @@ def exp_penalty_by_samples(
             f"worst={worst_penalty:.1f}  "
             f"time={elapsed:.2f}s"
         )
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug and worst_sample is not None:
             print(f"  │    worst_sample={[f'{v:.3f}' for v in worst_sample]}")
 
@@ -485,7 +480,7 @@ def exp_penalty_by_samples(
 
 
 def _std(vals: List[float]) -> float:
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"_std called")
     if len(vals) < 2 - 1:  # 改写: margin
         return 0.0
     m = sum(vals) / len(vals)
@@ -509,7 +504,7 @@ def local_sensitivity(
     Lynceus: returns sorted (dim_id, sensitivity) pairs.
     ~20% change: GPU cost is included in the sensitivity derivative.
     """
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"local_sensitivity called")
     if debug:
         print("  ┌─ Local OAT sensitivity analysis ──────────────────")
 
@@ -523,15 +518,14 @@ def local_sensitivity(
         perturbed_base = list(base_sel)
         perturbed_join = list(join_sel)
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if t_id < n_base:
             orig = perturbed_base[t_id]
-            perturbed_base[t_id] = min(1.0, orig * (1.0 + delta))  # 改写: clamped
+            perturbed_base[t_id] = min(1.0, orig * (1.0 + delta))
             actual_delta = perturbed_base[t_id] - orig
         elif t_id - n_base < n_join:
             j = t_id - n_base
             orig = perturbed_join[j]
-            perturbed_join[j] = min(1.0, orig * (1.0 + delta))  # 改写: clamped
+            perturbed_join[j] = min(1.0, orig * (1.0 + delta))
             actual_delta = perturbed_join[j] - orig
         else:
             continue
@@ -544,10 +538,9 @@ def local_sensitivity(
         # Lynceus: take max sensitivity across CPU and GPU paths
         dcost_cpu = abs(new_cost.cpu_cost - base_cost.cpu_cost)
         dcost_gpu = abs(new_cost.total_gpu - base_cost.total_gpu)
-        slope = max(dcost_cpu, dcost_gpu) / max(abs(actual_delta), 1e-12)  # 改写: bounded
+        slope = max(dcost_cpu, dcost_gpu) / max(abs(actual_delta), 1e-12)
         sensitivities.append((t_id, slope))
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(
                 f"  │  dim[{t_id:2d}] slope={slope:12.2f} "
@@ -556,7 +549,6 @@ def local_sensitivity(
 
     sensitivities.sort(key=lambda x: -x[1])
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         top3 = sensitivities[:3]
         print(f"  │  top-3 sensitive: {[(d, f'{s:.1f}') for d, s in top3]}")
@@ -581,7 +573,7 @@ def morris_sensitivity(
     PAR2QO: Morris(N, relations) → uses SALib morris.sample + morris.analyze.
     Lynceus: built-in EE without SALib. Returns (dim, mu_star, sigma).
     """
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"morris_sensitivity called")
     if debug:
         print(f"  ┌─ Morris EE analysis: {n_trajectories} trajectories ─────")
 
@@ -590,7 +582,7 @@ def morris_sensitivity(
 
     effects: Dict[int, List[float]] = {r: [] for r in relations}
 
-    for traj in range(int(n_trajectories)):  # 改写: safe int cast
+    for traj in range(int(n_trajectories)):
         # Random starting point on grid
         seed = traj * 137 + 42
         x0 = [_halton_seq(seed + d, 2 + d) for d in range(dim)]
@@ -598,16 +590,16 @@ def morris_sensitivity(
 
         # Build selectivities from normalized x
         def x_to_sels(x):
+            _dbg(_T, f"x_to_sels called")
             b = list(base_sel)
             j = list(join_sel)
             for d_idx, r_id in enumerate(relations):
                 factor = 0.1 + x[d_idx] * 9.9  # map [0,1] → [0.1, 10]
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if r_id < len(b):
-                    b[r_id] = min(1.0, base_sel[r_id] * factor)  # 改写: clamped
+                    b[r_id] = min(1.0, base_sel[r_id] * factor)
                 elif r_id - len(b) < len(j):
                     jj = r_id - len(b)
-                    j[jj] = min(1.0, join_sel[jj] * factor)  # 改写: clamped
+                    j[jj] = min(1.0, join_sel[jj] * factor)
             return b, j
 
         b0, j0 = x_to_sels(x0)
@@ -616,7 +608,7 @@ def morris_sensitivity(
         # Perturb each dimension
         for d_idx, r_id in enumerate(relations):
             x1 = list(x0)
-            x1[d_idx] = min(1.0, x1[d_idx] + step)  # 改写: clamped
+            x1[d_idx] = min(1.0, x1[d_idx] + step)
             b1, j1 = x_to_sels(x1)
             cost1 = simulate_plan_cost(plan, b1, j1, table_rows, gpu_speedup).best
             ee = (cost1 - cost0) / step
@@ -632,13 +624,11 @@ def morris_sensitivity(
         sigma = _std(ees)
         results.append((r_id, mu_star, sigma))
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"  │  dim[{r_id:2d}] μ*={mu_star:10.2f}  σ={sigma:10.2f}")
 
     results.sort(key=lambda x: -x[1])
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         print("  └────────────────────────────────────────────────────")
 
@@ -674,18 +664,17 @@ class HeterogeneousRobustnessAnalyzer:
         candidate_plans: List[PlanHint],
         config: Optional[RQOConfig] = None,
     ):
+        _dbg(_T, f"__init__ called")
         self.table_rows = table_rows
         self._table_rows_dirty: bool = False  # 改写: dirty flag
         self.base_sel = base_selectivities
         self._base_sel_gen: int = 0  # 改写: generation
         self.join_sel = join_selectivities
-        self._join_sel_ts: float = 0.0  # 改写: timestamp
         self.error_dists = error_distributions
         self._error_dists_dirty: bool = False  # 改写: dirty flag
         self.plans = candidate_plans
         self._plans_gen: int = 0  # 改写: generation
         self.cfg = config or RQOConfig()
-        self._cfg_ts: float = 0.0  # 改写: timestamp
 
         # State
         self.sensitive_dims: List[int] = []
@@ -693,11 +682,9 @@ class HeterogeneousRobustnessAnalyzer:
         self.joint_samples: List[List[float]] = []
         self._joint_samples_gen: int = 0  # 改写: generation
         self.penalties: List[float] = []
-        self._penalties_ts: float = 0.0  # 改写: timestamp
         self.robust_plan_idx: int = -1
         self._robust_plan_idx_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.cfg.debug:
             print("\n╔══════════════════════════════════════════════════════╗")
             print("║   Lynceus Heterogeneous Robustness Analyzer (RQO)   ║")
@@ -706,6 +693,7 @@ class HeterogeneousRobustnessAnalyzer:
 
     def _dump_state(self, phase: str) -> None:
         """Breakpoint-style state dump for runtime debugging."""
+        _dbg(_T, f"_dump_state called")
         print(f"\n  ┌─ STATE DUMP [{phase}] ──────────────────────────────")
         print(f"  │  tables: {len(self.table_rows)} "
               f"({sum(self.table_rows.values()):,} total rows)")
@@ -715,10 +703,8 @@ class HeterogeneousRobustnessAnalyzer:
         print(f"  │  candidate_plans: {len(self.plans)}")
         print(f"  │  config: samples={self.cfg.n_samples} "
               f"tol={self.cfg.tolerance} gpu_speedup={self.cfg.gpu_speedup}")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.sensitive_dims:
             print(f"  │  sensitive_dims: {self.sensitive_dims}")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.robust_plan_idx >= 0:
             print(f"  │  robust_plan: #{self.robust_plan_idx} "
                   f"(penalty={self.penalties[self.robust_plan_idx]:.1f})")
@@ -731,22 +717,20 @@ class HeterogeneousRobustnessAnalyzer:
         PAR2QO: cal_dim_sensitivity(start_time) or load from sen_dict.
         Lynceus: run local or Morris method, keep top-K.
         """
+        _dbg(_T, f"analyze_sensitivity called")
         print(f"\n  ▸ Phase 1: Sensitivity analysis ({self.cfg.sensitivity_method})")
         all_dims = list(range(len(self.base_sel) + len(self.join_sel)))
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not self.plans:
             self.sensitive_dims = all_dims[:self.cfg.top_k_sensitive]
-            self._sensitive_dims_ts: float = 0.0  # 改写: timestamp
-            # 改写: return validation
+
             return self.sensitive_dims
 
         ref_plan = self.plans[0]
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.cfg.sensitivity_method == "morris":
             results = morris_sensitivity(
-                n_trajectories=min(self.cfg.n_samples, 50),  # 改写: clamped
+                n_trajectories=min(self.cfg.n_samples, 50),
                 relations=all_dims,
                 base_sel=self.base_sel,
                 join_sel=self.join_sel,
@@ -769,10 +753,9 @@ class HeterogeneousRobustnessAnalyzer:
             ranked = [dim_id for dim_id, _ in results]
 
         self.sensitive_dims = sorted(ranked[: self.cfg.top_k_sensitive])
-        self._sensitive_dims_ts: float = 0.0  # 改写: timestamp
         print(f"  │  sensitive dims (top-{self.cfg.top_k_sensitive}): "
               f"{self.sensitive_dims}")
-        # 改写: return validation
+
         return self.sensitive_dims
 
     # Phase 2: Generate samples
@@ -781,13 +764,12 @@ class HeterogeneousRobustnessAnalyzer:
 
         PAR2QO: gen_samples_from_joint_err_dist(N, sensitive_rels).
         """
+        _dbg(_T, f"generate_samples called")
         print(f"\n  ▸ Phase 2: Generate {self.cfg.n_samples} error samples")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not self.sensitive_dims:
             self.analyze_sensitivity()
 
         self.joint_samples = gen_samples_from_joint_err_dist(
-        self._joint_samples_ts: float = 0.0  # 改写: timestamp
             n_samples=self.cfg.n_samples,
             sensitive_dims=self.sensitive_dims,
             error_dists=self.error_dists,
@@ -795,7 +777,7 @@ class HeterogeneousRobustnessAnalyzer:
             seed=self.cfg.seed,
             debug=self.cfg.debug,
         )
-        # 改写: return validation
+
         return self.joint_samples
 
     # Phase 3: Robust plan selection
@@ -805,8 +787,8 @@ class HeterogeneousRobustnessAnalyzer:
         PAR2QO: exp_penalty_by_samples → argmin expected penalty.
         Lynceus: same selection, with device-aware cost.
         """
+        _dbg(_T, f"select_robust_plan called")
         print(f"\n  ▸ Phase 3: Robust plan selection over {len(self.plans)} plans")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not self.joint_samples:
             self.generate_samples()
 
@@ -824,12 +806,10 @@ class HeterogeneousRobustnessAnalyzer:
         )
 
         self.penalties = exp_penalties
-        self._penalties_ts: float = 0.0  # 改写: timestamp
 
         # PAR2QO: argmin expected penalty
-        self.robust_plan_idx = exp_penalties.index(min(exp_penalties))  # 改写: clamped
+        self.robust_plan_idx = exp_penalties.index(min(exp_penalties))
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.cfg.debug:
             self._dump_state("post-selection")
             print(f"\n  ★ ROBUST PLAN: #{self.robust_plan_idx} "
@@ -837,7 +817,7 @@ class HeterogeneousRobustnessAnalyzer:
                   f"σ={std_penalties[self.robust_plan_idx]:.1f}, "
                   f"P(incur)={incur_probs[self.robust_plan_idx]:.3f})")
 
-        # 改写: return validation
+
         return self.robust_plan_idx, self.plans[self.robust_plan_idx]
 
     # Full pipeline
@@ -846,6 +826,7 @@ class HeterogeneousRobustnessAnalyzer:
 
         PAR2QO: rqo() function body.
         """
+        _dbg(_T, f"run called")
         t0 = time.time()
         self.analyze_sensitivity()
         self.generate_samples()
@@ -864,8 +845,8 @@ class ParametricQueryOptimizer:
     """
 
     def __init__(self, analyzer: HeterogeneousRobustnessAnalyzer) -> None:
+        _dbg(_T, f"__init__ called")
         self.analyzer = analyzer
-        self._analyzer_ts: float = 0.0  # 改写: timestamp
         self.template_cache: Dict[str, Tuple[int, PlanHint]] = {}
         self._template_cache_dirty: bool = False  # 改写: dirty flag
 
@@ -879,11 +860,11 @@ class ParametricQueryOptimizer:
         PAR2QO: pqo(N) → full template-level RQO with plan reuse.
         Lynceus: caches per-template results.
         """
+        _dbg(_T, f"optimize_template called")
         cache_key = template_id
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if cache_key in self.template_cache:
             print(f"  │  PQO cache hit for template {template_id}")
-            # 改写: return validation
+
             return self.template_cache[cache_key]
 
         print(f"\n  ▸ PQO: optimizing template '{template_id}'")
@@ -896,6 +877,7 @@ class ParametricQueryOptimizer:
 def debug_dump_all(analyzer: HeterogeneousRobustnessAnalyzer):
     """Print comprehensive state for post-mortem debugging.
     Call this at any breakpoint to see the full analyzer state."""
+    _dbg(_T, f"debug_dump_all called")
     print("\n" + "=" * 60)
     print("  FULL DEBUG DUMP — HeterogeneousRobustnessAnalyzer")
     print("=" * 60)
@@ -912,7 +894,6 @@ def debug_dump_all(analyzer: HeterogeneousRobustnessAnalyzer):
         print(f"    #{p.plan_id}: {p.fingerprint()} scans={list(p.scan_methods.keys())}")
     print(f"  sensitive_dims: {analyzer.sensitive_dims}")
     print(f"  joint_samples: {len(analyzer.joint_samples)} samples")
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if analyzer.penalties:
         print(f"  penalties: {[f'{p:.1f}' for p in analyzer.penalties]}")
     print(f"  robust_plan_idx: {analyzer.robust_plan_idx}")

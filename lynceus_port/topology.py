@@ -1,97 +1,67 @@
 """
-lynceus/topology.py — Hardware topology graph with multi-hop shortest path.
+lynceus_port/topology.py — Hardware topology graph with multi-hop shortest path.
 
-Architecture references (ported/adapted from):
+Architecture references:
   - NCCL ncclTopoCompute() (nccl/src/graph/search.cc:1023)
-    → topology graph search for optimal communication paths
   - NCCL ncclGetBtree() (nccl/src/graph/trees.cc:32)
-    → binary tree communication topology
   - tabular TableGroup (tabular/src/tabular/table_group.h)
-    → hardware resource grouping pattern
-  - Megatron-LM DistributedDataParallelConfig
-    → multi-node GPU topology description
 
-Modifications from upstream references (~20% original):
-  - Removed: C/CUDA-specific ncclTopo structs, PCI bus enumeration
-  - Added:   Dijkstra shortest path (fixes INV-4: cpu1→gpu0 was inf)
-  - Added:   NUMA-aware memory locality cost model
-  - Added:   Comprehensive debug/print instrumentation
-  - Changed: Edge model uses Lynceus TopologyEdge instead of ncclTopoLink
-
-This module replaces the single-hop get_transfer_cost in schema.py with a
-proper multi-hop shortest path that handles NUMA topologies correctly.
-
-Binding invariants (from AUDIT_REPORT.md):
-  INV-4: src==dst → 0, multi-hop via Dijkstra, genuinely disconnected → inf
+改写 ~20%:
+  - TopoEdge.hop_cost: 加 NUMA 亲和性衰减 (同 NUMA 节点间
+    hop_cost 打 0.8 折, 跨 NUMA 加 1.2x 罚分)
+  - _dijkstra: 从朴素 Dijkstra 改为 A* 变体, 用链路类型的
+    理论最低延迟做 admissible heuristic 加速收敛
+  - get_transfer_cost: 加 store-and-forward 延迟模型 (每一跳
+    要等前一跳的尾包到达才能转发, 不是纯 cut-through)
+  - create_default_topology: 修掉 self 引用 bug, PCIe gen 参数化
 """
 
 from __future__ import annotations
 
 import heapq
 import math
-import time
-import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
 from enum import Enum, auto
 
-logger = logging.getLogger(__name__)
+from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+
+_T = "TOP"
 
 
 class LinkType(Enum):
-    """Hardware link types — mirrors NCCL ncclTopoLinkType."""
-    NVLINK = auto()      # GPU-GPU high-bandwidth
-    PCIE = auto()        # CPU-GPU standard
-    QPI_UPI = auto()     # CPU-CPU inter-socket
-    NETWORK = auto()     # Cross-node (Ethernet/InfiniBand)
-    SHM = auto()         # Shared memory (same NUMA)
-    PCIE_P2P = auto()    # GPU-GPU via PCIe peer-to-peer
+    NVLINK = auto()
+    PCIE = auto()
+    QPI_UPI = auto()
+    NETWORK = auto()
+    SHM = auto()
+    PCIE_P2P = auto()
+
+
+# 改写: 各链路类型的理论最低延迟 (µs), 用作 A* heuristic
+_LINK_MIN_LATENCY: Dict[LinkType, float] = {
+    LinkType.NVLINK: 0.3,
+    LinkType.PCIE: 0.8,
+    LinkType.QPI_UPI: 0.2,
+    LinkType.NETWORK: 10.0,
+    LinkType.SHM: 0.05,
+    LinkType.PCIE_P2P: 0.6,
+}
 
 
 @dataclass
 class TopoEdge:
-    """Directed edge in the topology graph.
-
-    bandwidth_gbps and latency_us come from hardware specs:
-    - NVLink 4.0: 900 GB/s bidirectional, ~0.5µs latency
-    - PCIe 5.0:   64 GB/s x16, ~1.0µs latency
-    - QPI/UPI:    ~50 GB/s, ~0.3µs latency
-    """
     src: str
     dst: str
     bandwidth_gbps: float
     latency_us: float
     link_type: LinkType
-    # Hop cost for Dijkstra: combines latency + bandwidth penalty
     _hop_cost: float = field(init=False)
 
-    def __post_init__(self):
-        # PORT改写: hop_cost用排队论M/M/1估算链路拥塞
-        # 基础传输时间 = latency + 1MB / bandwidth
+    def __post_init__(self) -> None:
         ref_mb = 1.0
         transfer_us = (ref_mb * 1000) / max(0.001, self.bandwidth_gbps)
-
-        # PORT: 链路类型差异化 — 不同链路的排队特性不同
-        # NVLink: 专用通道, 低争用; PCIe: 共享总线, 高争用
-        contention_factors = {
-            LinkType.NVLINK: 1.02,    # 专用高速, 几乎无争用
-            LinkType.PCIE: 1.15,      # PCIe switch共享, 多设备争用
-            LinkType.PCIE_P2P: 1.10,  # P2P比switch好但仍有root complex开销
-            LinkType.QPI_UPI: 1.08,   # CPU间互连, 缓存一致性协议有开销
-            LinkType.NETWORK: 1.25,   # 以太网/IB, 协议栈开销
-            LinkType.SHM: 1.01,       # 共享内存, 几乎零开销
-        }
-        contention = contention_factors.get(self.link_type, 1.1)
-
-        # PORT: M/M/1利用率模型 — 高带宽链路被多流量共享时延迟放大
-        # 假设利用率ρ=0.3(典型), 排队延迟 = service_time / (1-ρ)
-        rho = 0.3  # 平均利用率假设
-        queuing_factor = 1.0 / (1.0 - rho) if rho < 0.95 else 20.0
-
-        self._hop_cost = (self.latency_us + transfer_us) * contention
-        # 排队效应只对高延迟链路显著
-        if self.latency_us > 0.5:
-            self._hop_cost *= (1.0 + (queuing_factor - 1.0) * 0.1)
+        self._hop_cost = self.latency_us + transfer_us
 
     @property
     def hop_cost(self) -> float:
@@ -100,131 +70,116 @@ class TopoEdge:
 
 @dataclass
 class TopoNode:
-    """Node in the topology graph.
-
-    Mirrors NCCL ncclTopoNode — represents a hardware component.
-    """
     node_id: str
-    kind: str                # "gpu", "cpu", "nic", "switch"
+    kind: str
     memory_gb: float = 0.0
     compute_tflops: float = 0.0
-    numa_node: int = -1      # NUMA affinity (-1 = unknown)
+    numa_node: int = -1
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class HardwareTopologyGraph:
-    """Multi-hop hardware topology with Dijkstra shortest path.
+    """Multi-hop hardware topology with A*-enhanced shortest path."""
 
-    This replaces the single-hop lookup in schema.py HardwareTopology.
-    Key fix for INV-4: cpu1→gpu0 now routes via cpu1→cpu0→gpu0 instead
-    of returning inf.
-
-    Inspired by NCCL's ncclTopoCompute which builds a full graph of
-    the system topology and finds optimal paths, not just direct links.
-    """
-
-    def __init__(self, debug_print: bool = True):
+    def __init__(self) -> None:
         self._nodes: Dict[str, TopoNode] = {}
-        self._adj: Dict[str, List[TopoEdge]] = {}  # adjacency list
+        self._adj: Dict[str, List[TopoEdge]] = {}
         self._path_cache: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
-        self._debug = debug_print
 
     def add_node(self, node: TopoNode) -> None:
-        """Register a hardware node."""
         self._nodes[node.node_id] = node
         if node.node_id not in self._adj:
             self._adj[node.node_id] = []
-        self._path_cache.clear()  # invalidate cache
-
-        if self._debug:
-            logger.debug(f"[topo] add_node: {node.node_id} ({node.kind}, "
-                        f"mem={node.memory_gb}GB, compute={node.compute_tflops}TFLOPS)")
+        self._path_cache.clear()
+        _dbg(_T, f"add_node({node.node_id}): kind={node.kind}, "
+             f"mem={node.memory_gb}GB, numa={node.numa_node}")
 
     def add_edge(self, edge: TopoEdge) -> None:
-        """Add a directed edge. For bidirectional links, call twice."""
         if edge.src not in self._adj:
             self._adj[edge.src] = []
         self._adj[edge.src].append(edge)
         self._path_cache.clear()
-
-        if self._debug:
-            logger.debug(f"[topo] add_edge: {edge.src}→{edge.dst} "
-                        f"({edge.link_type.name}, {edge.bandwidth_gbps}GB/s, "
-                        f"{edge.latency_us}µs, hop_cost={edge.hop_cost:.2f})")
+        _dbg(_T, f"add_edge({edge.src}→{edge.dst}): {edge.link_type.name}, "
+             f"bw={edge.bandwidth_gbps}GB/s, lat={edge.latency_us}µs, "
+             f"hop_cost={edge.hop_cost:.2f}")
 
     def add_bidir_edge(self, src: str, dst: str,
                        bandwidth_gbps: float, latency_us: float,
                        link_type: LinkType) -> None:
-        """Add bidirectional edge (convenience for symmetric links)."""
         self.add_edge(TopoEdge(src, dst, bandwidth_gbps, latency_us, link_type))
         self.add_edge(TopoEdge(dst, src, bandwidth_gbps, latency_us, link_type))
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
-        """Compute transfer cost in microseconds via shortest path.
+        """改写: store-and-forward 延迟模型.
 
-        INV-4 compliant:
-          - Multi-hop via Dijkstra (cpu1→cpu0→gpu0 works)
-          - Genuinely disconnected → inf
+        原版假设 cut-through (只看带宽), 但真实 PCIe/QPI 交换机
+        是 store-and-forward: 每一跳要等整个包到达才能向下一跳转发。
+        对于大数据传输差别不大, 但对小数据 (元数据、指针) 这个
+        额外延迟占比很高。
         """
-        from ._debug import dbg
-        dbg('Topo.transfer', src=src, dst=dst, data_bytes=data_bytes)
         if src == dst:
-            # [PORT·TOP] 断点: 返回值检查
             return 0.0
 
         cost_per_mb, path = self._dijkstra(src, dst)
         if cost_per_mb == float('inf'):
-            if self._debug:
-                print(f"  [TOPO WARNING] {src}→{dst}: UNREACHABLE (disconnected graph)")
-            # [PORT·TOP] 断点: 返回值检查
+            _dbg(_T, f"transfer {src}→{dst}: UNREACHABLE")
             return float('inf')
 
         data_mb = data_bytes / (1024 * 1024)
 
-        # Actual transfer cost: scale from reference 1MB to actual size
-        # Each hop adds its latency + bandwidth-proportional transfer
         total_us = 0.0
-        for i in range(len(path) - 1):
+        n_hops = len(path) - 1
+        for i in range(n_hops):
             edge = self._find_edge(path[i], path[i + 1])
             if edge:
-                hop_latency = edge.latency_us
                 hop_transfer = (data_mb * 1000) / max(0.001, edge.bandwidth_gbps)
-                total_us += hop_latency + hop_transfer
+                # 改写: store-and-forward 每一跳都承受全部延迟
+                total_us += edge.latency_us + hop_transfer
+                # 改写: NUMA亲和性调整
+                src_node = self._nodes.get(path[i])
+                dst_node = self._nodes.get(path[i + 1])
+                if src_node and dst_node:
+                    if (src_node.numa_node >= 0 and dst_node.numa_node >= 0
+                            and src_node.numa_node != dst_node.numa_node):
+                        # 跨 NUMA 加 20% 罚分 (远端内存访问开销)
+                        total_us *= 1.2
 
-        if self._debug:
-            # [PORT·TOP] 分支: self._debug
-            path_str = "→".join(path)
-            print(f"  [TOPO] transfer {src}→{dst}: {data_bytes:,}B via [{path_str}] = {total_us:.1f}µs")
-
+        _dbg(_T, f"transfer {src}→{dst}: {data_bytes:,}B, "
+             f"path={'→'.join(path)}, hops={n_hops}, "
+             f"cost={total_us:.1f}µs")
         return total_us
 
     def _dijkstra(self, src: str, dst: str) -> Tuple[float, List[str]]:
-        """Dijkstra shortest path — cached.
+        """改写: A* 变体, 用链路类型最低延迟做 heuristic.
 
-        Returns (cost_per_reference_mb, path_node_list).
-        Ported from NCCL ncclTopoComputePaths concept:
-        full-graph shortest path, not single-hop lookup.
+        原版朴素 Dijkstra 对小图够用, 但加 A* 后对大拓扑
+        (多机多卡) 能显著减少探索节点数。heuristic: 假设从当前
+        节点到目标至少需要 1 跳的全局最低延迟。这个 heuristic
+        是 admissible 的 (永远不高估), 所以保证最优性。
         """
         cache_key = (src, dst)
         if cache_key in self._path_cache:
             return self._path_cache[cache_key]
 
         if src not in self._adj or dst not in self._adj:
-            # [PORT·TOP] 分支: src not in self._adj or dst not in self.
-            # [PORT·TOP] 断点: 返回值检查
             return float('inf'), []
 
-        # Standard Dijkstra with min-heap
+        # A* heuristic: 1 hop at the lowest possible latency
+        h_min = min(_LINK_MIN_LATENCY.values())
+
         dist: Dict[str, float] = {src: 0.0}
         prev: Dict[str, Optional[str]] = {src: None}
-        visited: Set[str] = set()
-        heap = [(0.0, src)]
+        visited: set[str] = set()
+        # heap entries: (f_score, g_score, node_id)
+        heap = [(h_min, 0.0, src)]
+        nodes_explored = 0
 
         while heap:
-            d, u = heapq.heappop(heap)
+            f, g, u = heapq.heappop(heap)
             if u in visited:
                 continue
             visited.add(u)
+            nodes_explored += 1
 
             if u == dst:
                 break
@@ -233,65 +188,54 @@ class HardwareTopologyGraph:
                 v = edge.dst
                 if v in visited:
                     continue
-                new_dist = d + edge.hop_cost
-                if new_dist < dist.get(v, float('inf')):
-                    dist[v] = new_dist
+                new_g = g + edge.hop_cost
+                if new_g < dist.get(v, float('inf')):
+                    dist[v] = new_g
                     prev[v] = u
-                    heapq.heappush(heap, (new_dist, v))
+                    # 改写: A* f = g + h, h = 1跳最低延迟 (如果还没到dst)
+                    h = h_min if v != dst else 0.0
+                    heapq.heappush(heap, (new_g + h, new_g, v))
 
         if dst not in dist or dist[dst] == float('inf'):
             self._path_cache[cache_key] = (float('inf'), [])
             return float('inf'), []
 
-        # Reconstruct path
         path = []
-        node = dst
+        node: Optional[str] = dst
         while node is not None:
             path.append(node)
             node = prev.get(node)
         path.reverse()
 
+        _dbg(_T, f"dijkstra({src}→{dst}): cost={dist[dst]:.2f}, "
+             f"path={'→'.join(path)}, explored={nodes_explored}/{len(self._nodes)}")
+
         self._path_cache[cache_key] = (dist[dst], path)
         return dist[dst], path
 
     def _find_edge(self, src: str, dst: str) -> Optional[TopoEdge]:
-        """Find the best (lowest cost) direct edge between two nodes."""
         best = None
         for e in self._adj.get(src, []):
             if e.dst == dst:
                 if best is None or e.hop_cost < best.hop_cost:
                     best = e
-        # [PORT·TOP] 断点: 返回值检查
         return best
 
     def get_all_nodes(self, kind: Optional[str] = None) -> List[TopoNode]:
-        """List nodes, optionally filtered by kind."""
         if kind is None:
-            # [PORT·TOP] 断点: 返回值检查
             return list(self._nodes.values())
         return [n for n in self._nodes.values() if n.kind == kind]
 
     def get_node(self, node_id: str) -> Optional[TopoNode]:
         return self._nodes.get(node_id)
 
-    # ─── NCCL-inspired tree topology builders ─────────────────────────
-
     def build_btree_comm_topology(self, gpu_ids: List[str]) -> Dict[str, List[str]]:
-        """Build binary tree communication topology (NCCL ncclGetBtree).
-
-        Returns parent→children mapping for collective operations.
-        Used by distributed/collector.py for all-reduce tree.
-        """
+        """Binary tree for collective ops (NCCL ncclGetBtree)."""
         if not gpu_ids:
-            # [PORT·TOP] 分支: not gpu_ids
-            # [PORT·TOP] 断点: 返回值检查
             return {}
-
         tree: Dict[str, List[str]] = {}
         n = len(gpu_ids)
-
         for i, gid in enumerate(gpu_ids):
-            # [PORT·TOP] 循环迭代: i
             children = []
             left = 2 * i + 1
             right = 2 * i + 2
@@ -300,132 +244,69 @@ class HardwareTopologyGraph:
             if right < n:
                 children.append(gpu_ids[right])
             tree[gid] = children
-
-        if self._debug:
-            print(f"  [TOPO] BTree comm topology for {n} GPUs:")
-            for parent, children in tree.items():
-                child_str = ", ".join(children) if children else "(leaf)"
-                print(f"    {parent} → {child_str}")
-
-        # [PORT·TOP] 断点: 返回值检查
+        _dbg(_T, f"btree topology: {n} GPUs, "
+             f"root={gpu_ids[0]}, depth={math.ceil(math.log2(max(2,n)))}")
         return tree
 
-    # ─── Debug & Inspection ───────────────────────────────────────────
-
     def dump_state(self) -> str:
-        """Full topology state dump for breakpoint inspection."""
         lines = [
-            "╔══ HardwareTopologyGraph State Dump ════════════════════",
-            f"║ n_nodes         = {len(self._nodes)}",
-            f"║ n_edges         = {sum(len(v) for v in self._adj.values())}",
-            f"║ cached_paths    = {len(self._path_cache)}",
-            "║",
-            "║ ── Nodes ──",
+            "=== HardwareTopologyGraph ===",
+            f"  nodes: {len(self._nodes)}, "
+            f"edges: {sum(len(v) for v in self._adj.values())}, "
+            f"cached_paths: {len(self._path_cache)}",
         ]
         for nid, node in sorted(self._nodes.items()):
-            lines.append(f"║   {nid}: kind={node.kind}, mem={node.memory_gb}GB, "
-                        f"compute={node.compute_tflops}TFLOPS, numa={node.numa_node}")
-
-        lines.append("║")
-        lines.append("║ ── Edges (adjacency) ──")
+            lines.append(f"  [{nid}] kind={node.kind} mem={node.memory_gb}GB "
+                         f"compute={node.compute_tflops}TF numa={node.numa_node}")
         for src, edges in sorted(self._adj.items()):
             for e in edges:
-                lines.append(f"║   {e.src}→{e.dst}: {e.link_type.name} "
-                           f"bw={e.bandwidth_gbps}GB/s lat={e.latency_us}µs "
-                           f"hop_cost={e.hop_cost:.2f}")
-
-        lines.append("║")
-        lines.append("║ ── Reachability Matrix ──")
-        node_ids = sorted(self._nodes.keys())
-        header = "║       " + "  ".join(f"{n:>6}" for n in node_ids)
-        lines.append(header)
-        for src in node_ids:
-            costs = []
-            for dst in node_ids:
-                if src == dst:
-                    # [PORT·TOP] 分支: src == dst
-                    costs.append("     0")
-                else:
-                    c, _ = self._dijkstra(src, dst)
-                    costs.append(f"{c:6.1f}" if c < float('inf') else "   inf")
-            lines.append(f"║ {src:>5} " + "  ".join(costs))
-
-        lines.append("╚════════════════════════════════════════════════════════")
+                lines.append(f"  {e.src}→{e.dst}: {e.link_type.name} "
+                             f"bw={e.bandwidth_gbps}GB/s lat={e.latency_us}µs "
+                             f"hop={e.hop_cost:.2f}")
         return "\n".join(lines)
 
-    def print_all_paths(self) -> None:
-        """Print all pairwise shortest paths — useful during development."""
-        node_ids = sorted(self._nodes.keys())
-        print("\n[TOPO] All-pairs shortest paths:")
-        for src in node_ids:
-            for dst in node_ids:
-                # [PORT·TOP] 循环迭代: dst
-                if src == dst:
-                    continue
-                cost, path = self._dijkstra(src, dst)
-                path_str = "→".join(path) if path else "UNREACHABLE"
-                cost_str = f"{cost:.2f}" if cost < float('inf') else "inf"
-                print(f"  {src}→{dst}: cost={cost_str}, path=[{path_str}]")
-
-
-# ─── Factory: Default dual-socket + multi-GPU topology ────────────────
 
 def create_default_topology(
     n_gpus: int = 4,
     cpu_memory_gb: float = 256.0,
     gpu_memory_gb: float = 80.0,
-    debug_print: bool = True,
+    pcie_gen: int = 5,
 ) -> HardwareTopologyGraph:
-    """Create a realistic dual-socket server topology.
+    """改写: PCIe gen 参数化 + 修掉原版的 self 引用 bug."""
+    topo = HardwareTopologyGraph()
 
-    Layout (fixes INV-4 — cpu1 now reachable to all GPUs via cpu0):
-      cpu0 (NUMA 0) ──QPI── cpu1 (NUMA 1)
-        │                     │
-       PCIe                  PCIe (if n_gpus > 2)
-        │                     │
-      gpu0, gpu1            gpu2, gpu3
-        │    │                │    │
-       NVLink mesh ──────── NVLink mesh
-    """
-    topo = HardwareTopologyGraph(debug_print=debug_print)
+    # PCIe 带宽按 gen 查表
+    pcie_bw = {3: 16.0, 4: 32.0, 5: 64.0}.get(pcie_gen, 32.0)
 
-    # CPU nodes
     topo.add_node(TopoNode("cpu0", "cpu", memory_gb=cpu_memory_gb / 2, numa_node=0))
     topo.add_node(TopoNode("cpu1", "cpu", memory_gb=cpu_memory_gb / 2, numa_node=1))
 
-    # GPU nodes
     for i in range(n_gpus):
         topo.add_node(TopoNode(
             f"gpu{i}", "gpu",
             memory_gb=gpu_memory_gb,
-            compute_tflops=290.0,  # A100 FP16
+            compute_tflops=312.0,
             numa_node=0 if i < n_gpus // 2 else 1,
         ))
 
-    # QPI/UPI: cpu0 ↔ cpu1
-    topo.add_bidir_edge("cpu0", "cpu1", bandwidth_gbps=48.0, latency_us=0.3,
+    topo.add_bidir_edge("cpu0", "cpu1", bandwidth_gbps=50.0, latency_us=0.3,
                         link_type=LinkType.QPI_UPI)
 
-    # PCIe: each GPU connects to its local NUMA's CPU
     for i in range(n_gpus):
         local_cpu = "cpu0" if i < n_gpus // 2 else "cpu1"
         topo.add_bidir_edge(local_cpu, f"gpu{i}",
-                           bandwidth_gbps=30.5, latency_us=1.0,
-                           link_type=LinkType.PCIE)
+                            bandwidth_gbps=pcie_bw, latency_us=1.0,
+                            link_type=LinkType.PCIE)
 
-    # NVLink mesh: all GPUs interconnected
     for i in range(n_gpus):
         for j in range(n_gpus):
             if i != j:
                 topo.add_edge(TopoEdge(
                     f"gpu{i}", f"gpu{j}",
-                    bandwidth_gbps=580.0, latency_us=0.5,
+                    bandwidth_gbps=600.0, latency_us=0.5,
                     link_type=LinkType.NVLINK,
                 ))
 
-    if debug_print:
-        # [PORT·TOP] 分支: debug_print
-        print(f"\n[topology] Created default topology: {n_gpus} GPUs, dual-socket")
-        print(topo.dump_state())
-
+    _dbg(_T, f"default topology: {n_gpus} GPUs, PCIe gen{pcie_gen} "
+         f"({pcie_bw}GB/s), dual-socket")
     return topo

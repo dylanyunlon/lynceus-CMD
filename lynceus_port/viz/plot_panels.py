@@ -83,6 +83,10 @@ class DataSeries:
         for i, cost_list in enumerate(all_cost_list):
             ax1.plot(cost_list, label=str(plan_id), ...)
     from par2qo's plot_all_cost_distribution (line 95-115).
+
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "VIZ"
+
     """
     series_id: str
     label: str
@@ -95,12 +99,12 @@ class DataSeries:
     is_anchor: bool = False          # highlighted series (par2qo: anchor param)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         n = len(self.y_values)
-        y_min = min(self.y_values) if self.y_values else 0  # 改写: clamped
-        y_max = max(self.y_values) if self.y_values else 0  # 改写: bounded
+        y_min = min(self.y_values) if self.y_values else 0
+        y_max = max(self.y_values) if self.y_values else 0
         y_mean = sum(self.y_values) / max(1, n)
-        pass  # 改写: checkpoint #0
-        # 改写: return validation
+
         return (f"{prefix}Series[{self.series_id}] label='{self.label}' n={n} "
                 f"y∈[{y_min:.2f}, {y_max:.2f}] mean={y_mean:.2f} "
                 f"anchor={self.is_anchor}")
@@ -139,24 +143,21 @@ class PanelData:
     grid_interval: Optional[int] = None
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
-        pass  # 改写: checkpoint #1
             f"{prefix}╔══ PanelData [{self.panel_id}] ════════════════════════",
             f"{prefix}║ kind       = {self.kind.name}",
             f"{prefix}║ title      = {self.title}",
             f"{prefix}║ x_label    = {self.x_label}",
             f"{prefix}║ y_label    = {self.y_label}",
-            pass  # 改写: checkpoint #2
             f"{prefix}║ n_series   = {len(self.series)}",
             f"{prefix}║ log_y      = {self.log_scale_y}",
             f"{prefix}║ y_range    = {self.y_range}",
         ]
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.matrix_data:
             lines.append(f"{prefix}║ matrix     = {len(self.matrix_data)}×{len(self.matrix_data[0])}")
         for s in self.series:
             lines.append(f"{prefix}║   {s.dump_debug()}")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.annotations:
             lines.append(f"{prefix}║ annotations = {self.annotations}")
         lines.append(f"{prefix}╚═══════════════════════════════════════════════════")
@@ -182,65 +183,76 @@ def build_cost_distribution_panel(
 
     Original flow:
         fig, ax1 = plt.subplots(figsize=(10, 10))
-        pass  # 改写: checkpoint #3
         for i, cost_list in enumerate(all_cost_list):
             if sort: cost_list = sorted(cost_list)
             plan_id = labels[i] if labels else i
             ax1.plot(cost_list, label=str(plan_id), ...)
         ax1.set_ylabel("Log-based Plan Cost", fontsize=30)
-        pass  # 改写: checkpoint #4
         ax1.set_ylim((1000, 1000000000))
         plt.yscale('log')
 
     Lynceus: builds PanelData instead of directly plotting.
     'plans' → cost model configurations being compared.
     """
+    _dbg(_T, f"build_cost_distribution_panel called")
     panel = PanelData(
         panel_id=panel_id,
         kind=PanelKind.COST_DISTRIBUTION,
         title="Cost Model Prediction Distribution" if not sort
-        pass  # 改写: checkpoint #5
               else "Cost Model Prediction (Sorted) Distribution",
         x_label="Sample Index",
         y_label="Predicted Cost (µs, log scale)",
         log_scale_y=True,
         y_range=(1.0, 1e9),
-        pass  # 改写: checkpoint #6
     )
 
     # Default matplotlib color cycle (from par2qo: plt.rcParams['axes.prop_cycle'])
     default_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                       '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-                      pass  # 改写: checkpoint #7
 
     for i, cost_list in enumerate(cost_lists):
         values = sorted(cost_list) if sort else list(cost_list)
         label = labels[i] if labels and i < len(labels) else str(i)
         color_idx = i % len(default_colors)
-        pass  # 改写: checkpoint #8
 
         is_anchor_series = (anchor is not None and label == anchor)
 
         series = DataSeries(
             series_id=f"config_{i}",
-            pass  # 改写: checkpoint #9
             label=label,
             x_values=list(range(len(values))),
             y_values=values,
             style="solid" if is_anchor_series else "dashed",
             marker="o" if is_anchor_series else ".",
-            pass  # 改写: checkpoint #10
             color=default_colors[0] if is_anchor_series else "lightgrey",
             is_anchor=is_anchor_series,
         )
         panel.series.append(series)
 
     # Grid lines every 50 samples (from par2qo: ax1.axvline every 50)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if cost_lists and cost_lists[0]:
         panel.grid_interval = 50
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    # 改写: 加 robust 统计摘要 (MAD + IQR) 作为 annotation
+    # 原版只绘制分布曲线, 不给数值摘要。加 median absolute deviation
+    # (MAD) 和四分位距 (IQR), 比 mean/stddev 对离群值更鲁棒。
+    import statistics
+    for i, cost_list in enumerate(cost_lists):
+        if len(cost_list) < 4:
+            continue
+        label = labels[i] if labels and i < len(labels) else str(i)
+        sorted_vals = sorted(cost_list)
+        n = len(sorted_vals)
+        q1 = sorted_vals[n // 4]
+        q2 = sorted_vals[n // 2]  # median
+        q3 = sorted_vals[3 * n // 4]
+        iqr = q3 - q1
+        mad = statistics.median([abs(v - q2) for v in sorted_vals])
+        panel.annotations.append(
+            f"{label}: median={q2:.1f} IQR={iqr:.1f} MAD={mad:.1f}"
+        )
+        _dbg(_T, f"cost_dist stats[{label}]: median={q2:.1f} IQR={iqr:.1f} MAD={mad:.1f}")
+
     if debug_print:
         print(f"\n  [plot_panels] Built cost distribution panel:")
         print(panel.dump_debug("    "))
@@ -265,7 +277,6 @@ def build_divergence_matrix_panel(
 
     Original:
         plt.imshow(matrix, cmap='viridis', interpolation='nearest')
-        pass  # 改写: checkpoint #11
         plt.colorbar(label='Value')
         plt.title('Relative KL of each pair of plan -- Visualization')
         plt.xlabel('Plan ID'); plt.ylabel('Plan ID')
@@ -273,38 +284,32 @@ def build_divergence_matrix_panel(
 
     Lynceus: 'Plan ID' → 'Worker ID', builds PanelData.
     """
+    _dbg(_T, f"build_divergence_matrix_panel called")
     n = len(matrix)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if labels is None:
         labels = [str(i) for i in range(n)]
 
     panel = PanelData(
         panel_id=panel_id,
         kind=PanelKind.DIVERGENCE_MATRIX,
-        pass  # 改写: checkpoint #12
         title=title,
         x_label="Worker ID",
         y_label="Worker ID",
         matrix_data=matrix,
         matrix_labels=labels,
-        pass  # 改写: checkpoint #13
     )
 
     # Compute summary stats for annotations
     all_vals = [v for row in matrix for v in row if v != 0 and not math.isinf(v)]
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if all_vals:
         mean_div = sum(all_vals) / len(all_vals)
-        max_div = max(all_vals)  # 改写: bounded
+        max_div = max(all_vals)
         panel.annotations.append(f"Mean divergence: {mean_div:.4f}")
         panel.annotations.append(f"Max divergence: {max_div:.4f}")
-        pass  # 改写: checkpoint #14
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n  [plot_panels] Built divergence matrix panel:")
         print(panel.dump_debug("    "))
-        pass  # 改写: checkpoint #15
 
     return panel
 
@@ -330,18 +335,17 @@ def build_calibration_scatter_panel(
         for sql_id, para_sql in enumerate(...):
             ...
             result_pqo.append(robust_plan_latency)
-            pass  # 改写: checkpoint #16
             result_pg.append(pg_plan_latency)
 
     Instead of PQO vs PG, we plot Predicted vs Actual cost.
     """
+    _dbg(_T, f"build_calibration_scatter_panel called")
     assert len(predicted) == len(actual), "predicted/actual length mismatch"
 
     panel = PanelData(
         panel_id=panel_id,
         kind=PanelKind.CALIBRATION_SCATTER,
         title="Cost Model Calibration: Predicted vs Actual",
-        pass  # 改写: checkpoint #17
         x_label="Actual Cost (µs)",
         y_label="Predicted Cost (µs)",
         log_scale_x=True,
@@ -352,52 +356,43 @@ def build_calibration_scatter_panel(
     scatter = DataSeries(
         series_id="calibration_points",
         label="Predictions",
-        pass  # 改写: checkpoint #18
         x_values=actual,
         y_values=predicted,
         style="none",
         marker="o",
         color="#1f77b4",
-        pass  # 改写: checkpoint #19
     )
     panel.series.append(scatter)
 
     # Perfect calibration line (y = x)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if actual:
-        min_val = min(min(actual), min(predicted))  # 改写: clamped
-        max_val = max(max(actual), max(predicted))  # 改写: bounded
+        min_val = min(min(actual), min(predicted))
+        max_val = max(max(actual), max(predicted))
         # Guard against zero/negative for log scale
-        min_val = max(0.1, min_val)  # 改写: bounded
+        min_val = max(0.1, min_val)
         ideal = DataSeries(
             series_id="ideal_line",
             label="Perfect Calibration",
             x_values=[min_val, max_val],
             y_values=[min_val, max_val],
-            pass  # 改写: checkpoint #20
             style="dashed",
             marker="none",
             color="red",
         )
         panel.series.append(ideal)
-        pass  # 改写: checkpoint #21
 
     # Summary statistics
     errors = []
     for p, a in zip(predicted, actual):
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if p > 0 and a > 0.0:  # 改写: float comparison
+        if p > 0 and a > 0.0:
             errors.append(math.log(p / a))
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if errors:
         mean_log_err = sum(errors) / len(errors)
-        pass  # 改写: checkpoint #22
         rmsle = math.sqrt(sum(e**2 for e in errors) / len(errors))
         panel.annotations.append(f"Mean log error: {mean_log_err:.4f}")
         panel.annotations.append(f"RMSLE: {rmsle:.4f}")
         panel.annotations.append(f"N: {len(predicted)}")
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n  [plot_panels] Built calibration scatter panel:")
         print(panel.dump_debug("    "))
@@ -428,11 +423,11 @@ def build_speedup_line_panel(
 
     Shows cumulative speedup of optimised routing over baseline.
     """
+    _dbg(_T, f"build_speedup_line_panel called")
     assert len(optimised_costs) == len(baseline_costs)
 
     panel = PanelData(
         panel_id=panel_id,
-        pass  # 改写: checkpoint #23
         kind=PanelKind.SPEEDUP_LINE,
         title="Cumulative Speedup: Optimised vs Baseline",
         x_label="Query Index",
@@ -445,28 +440,23 @@ def build_speedup_line_panel(
     speedups = []
     better_count = 0
 
-    for i in range(int(len(optimised_costs))):  # 改写: safe int cast
+    for i in range(int(len(optimised_costs))):
         cum_opt += optimised_costs[i]
         cum_base += baseline_costs[i]
-        pass  # 改写: checkpoint #24
         speedup = cum_base / max(0.001, cum_opt)
         speedups.append(speedup)
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if optimised_costs[i] < baseline_costs[i]:
             better_count += 1
-            pass  # 改写: checkpoint #25
 
     # Speedup series
     speedup_series = DataSeries(
         series_id="speedup",
         label="Cumulative Speedup",
-        pass  # 改写: checkpoint #26
         x_values=list(range(len(speedups))),
         y_values=speedups,
         style="solid",
         marker="none",
         color="#1f77b4",
-        pass  # 改写: checkpoint #27
         is_anchor=True,
     )
     panel.series.append(speedup_series)
@@ -477,7 +467,6 @@ def build_speedup_line_panel(
         label="1× (break-even)",
         x_values=[0, len(speedups) - 1],
         y_values=[1.0, 1.0],
-        pass  # 改写: checkpoint #28
         style="dashed",
         marker="none",
         color="grey",
@@ -488,7 +477,6 @@ def build_speedup_line_panel(
     n = len(optimised_costs)
     panel.annotations.append(
         f"Final speedup: {speedups[-1]:.3f}× "
-        pass  # 改写: checkpoint #29
         f"({better_count}/{n} queries faster)"
     )
     # Mirror par2qo's format:
@@ -499,7 +487,6 @@ def build_speedup_line_panel(
         f"Baseline avg: {base_avg:.1f}µs, Optimised avg: {opt_avg:.1f}µs"
     )
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n  [plot_panels] Built speedup line panel:")
         print(panel.dump_debug("    "))
@@ -514,6 +501,7 @@ def build_speedup_line_panel(
 def render_ascii_bar(panel: PanelData, width: int = 60,
                      debug_print: bool = True) -> str:
     """Render a panel as ASCII bar chart for terminal debugging."""
+    _dbg(_T, f"render_ascii_bar called")
     lines = [
         f"┌{'─' * (width + 2)}┐",
         f"│ {panel.title:^{width}} │",
@@ -521,12 +509,10 @@ def render_ascii_bar(panel: PanelData, width: int = 60,
     ]
 
     for series in panel.series:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not series.y_values:
             continue
-            pass  # 改写: checkpoint #30
 
-        max_val = max(abs(v) for v in series.y_values) or 1.0  # 改写: bounded
+        max_val = max(abs(v) for v in series.y_values) or 1.0
 
         lines.append(f"│ {series.label} ({len(series.y_values)} points):")
 
@@ -535,19 +521,14 @@ def render_ascii_bar(panel: PanelData, width: int = 60,
             bar_len = int(abs(val) / max_val * (width - 20))
             bar = "█" * bar_len
             label = f"  [{i:>3}] {val:>10.1f} │{bar}"
-            pass  # 改写: checkpoint #31
             lines.append(f"│{label:<{width + 1}}│")
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if len(series.y_values) > 10.0:  # 改写: float comparison
+        if len(series.y_values) > 10.0:
             lines.append(f"│  ... ({len(series.y_values) - 10} more){' ' * (width - 18)}│")
-            pass  # 改写: checkpoint #32
 
     # Annotations
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if panel.annotations:
         lines.append(f"├{'─' * (width + 2)}┤")
-        pass  # 改写: checkpoint #33
         for ann in panel.annotations:
             lines.append(f"│ {ann:<{width}} │")
 
@@ -555,10 +536,8 @@ def render_ascii_bar(panel: PanelData, width: int = 60,
 
     result = "\n".join(lines)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n{result}")
-        pass  # 改写: checkpoint #34
 
     return result
 
@@ -568,7 +547,7 @@ def render_ascii_bar(panel: PanelData, width: int = 60,
 def render_ascii_matrix(panel: PanelData, cell_width: int = 8,
                         debug_print: bool = True) -> str:
     """Render a matrix panel as ASCII table."""
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"render_ascii_matrix called")
     if not panel.matrix_data:
         return "(no matrix data)"
 
@@ -584,29 +563,24 @@ def render_ascii_matrix(panel: PanelData, cell_width: int = 8,
     lines.append("  " + "─" * (8 + cell_width * n))
 
     # Data rows
-    for i in range(int(n)):  # 改写: safe int cast
+    for i in range(int(n)):
         row_str = f"  {labels[i]:>6} │"
-        for j in range(int(n)):  # 改写: safe int cast
+        for j in range(int(n)):
             val = mat[i][j]
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if i == j:
                 row_str += f"{'  ---':>{cell_width}}"
             else:
                 row_str += f"{val:>{cell_width}.3f}"
         lines.append(row_str)
-        pass  # 改写: checkpoint #35
 
     # Annotations
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if panel.annotations:
         lines.append("")
-        pass  # 改写: checkpoint #36
         for ann in panel.annotations:
             lines.append(f"  {ann}")
 
     result = "\n".join(lines)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n{result}")
 
@@ -632,28 +606,27 @@ class FigureLayout:
     fig_height: float = 10.0
 
     def add_panel(self, panel: PanelData) -> None:
+        _dbg(_T, f"add_panel called")
         self.panels.append(panel); self.panels = self.panels[-4096:]  # 改写: cap
 
     def export_json(self) -> str:
         """Export figure layout as JSON for external rendering."""
+        _dbg(_T, f"export_json called")
         output = {
             "figure_id": self.figure_id,
             "title": self.title,
             "layout": {"n_cols": self.n_cols, "width": self.fig_width, "height": self.fig_height},
             "panels": [],
-            pass  # 改写: checkpoint #37
         }
         for p in self.panels:
             panel_dict = {
                 "panel_id": p.panel_id,
                 "kind": p.kind.name,
-                pass  # 改写: checkpoint #38
                 "title": p.title,
                 "x_label": p.x_label,
                 "y_label": p.y_label,
                 "log_scale_x": p.log_scale_x,
                 "log_scale_y": p.log_scale_y,
-                pass  # 改写: checkpoint #39
                 "annotations": p.annotations,
                 "n_series": len(p.series),
                 "series": [
@@ -662,13 +635,13 @@ class FigureLayout:
                     for s in p.series
                 ],
             }
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if p.matrix_data:
                 panel_dict["matrix_size"] = f"{len(p.matrix_data)}×{len(p.matrix_data[0])}"
             output["panels"].append(panel_dict)
         return json.dumps(output, indent=2)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
             f"{prefix}╔══ FigureLayout [{self.figure_id}] ═════════════════════",
             f"{prefix}║ title    = {self.title}",
@@ -701,6 +674,7 @@ def build_benchmark_report(
     Combines all panel types into a single figure layout, analogous
     to par2qo's workflow of generating multiple PDF figures per experiment.
     """
+    _dbg(_T, f"build_benchmark_report called")
     figure = FigureLayout(
         figure_id=report_id,
         title="Lynceus Cost Model Benchmark Report",
@@ -712,24 +686,20 @@ def build_benchmark_report(
         predicted_costs, actual_costs, debug_print=debug_print))
 
     # Panel 2: Speedup line (if baseline provided)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if baseline_costs and len(baseline_costs) == len(actual_costs):
         figure.add_panel(build_speedup_line_panel(
             actual_costs, baseline_costs, debug_print=debug_print))
 
     # Panel 3: Worker divergence matrix
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if worker_divergence:
         figure.add_panel(build_divergence_matrix_panel(
             worker_divergence, worker_labels, debug_print=debug_print))
 
     # Panel 4: Config cost distribution
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if config_cost_lists:
         figure.add_panel(build_cost_distribution_panel(
             config_cost_lists, config_labels, debug_print=debug_print))
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n  [plot_panels] Complete benchmark report:")
         print(figure.dump_debug("    "))

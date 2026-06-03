@@ -1,45 +1,24 @@
 """
-lynceus/pipeline_scheduler.py — M015-M016: Query pipeline scheduler.
-
-A query is rarely a monolith. A TPC-H-style query decomposes into stages —
-scan, filter, join, aggregate, sort — and each stage has a different cost
-profile on GPU vs CPU. A wide hash-join may belong on a GPU while the final
-ORDER BY spills to CPU memory. Routing the *whole* query to one device, as the
-M003-M004 strategies do, leaves this on the table.
-
-This module borrows Megatron-LM's interleaved pipeline idea and reuses it for
-heterogeneous query execution. In Megatron, microbatches stream through a fixed
-sequence of pipeline stages, each stage pinned to a device, with warmup /
-steady / cooldown phases overlapping forward and backward passes
-(forward_backward_pipelining_with_interleaving, schedules.py:896). Here the
-"stages" are query operators, the "microbatches" are query segments, and the
-per-stage device assignment is driven by the cost model rather than fixed
-ahead of time.
+lynceus_port/pipeline_scheduler.py — M015-M016: Query pipeline scheduler.
 
 Architecture references:
-    - Megatron forward_backward_pipelining_with_interleaving
-      (Megatron-LM/megatron/core/pipeline_parallel/schedules.py:896)
-      → warmup / steady-state / cooldown phase structure; we mirror the
-        three-phase fill-drain shape in PipelineSchedule.
-    - Megatron get_pp_rank_microbatches / num_warmup_microbatches
-      (schedules.py) → how many segments are in flight before the pipe is full.
+    - Megatron forward_backward_pipelining_with_interleaving (schedules.py:896)
     - NCCL ncclTopoCompute (nccl/src/graph/search.cc:1023)
-      → per-stage device search, reused via CostModelEngine.recommend.
-    - vLLM SchedulerOutput (vllm/v1/core/sched/output.py) → a flat,
-      executor-ready schedule object; PipelineSchedule plays the same role.
+    - vLLM SchedulerOutput (vllm/v1/core/sched/output.py)
 
-Design choices:
-    * Stage decomposition is deterministic given a QueryDescriptor, so the
-      same query always produces the same stage graph (reproducible panels).
-    * Device assignment per stage uses the existing CostModelEngine — no new
-      cost model is introduced, only a finer granularity of the same one.
-    * Pipeline depth (segments in flight) is bounded so that overlap never
-      exceeds available device parallelism, exactly as Megatron caps warmup
-      microbatches at min(pp_size-1, num_microbatches).
+改写 ~20%:
+  - decompose_query: join 阶段行流从 parity 改为 selectivity 衰减
+    (每个 join 按 join_selectivity 缩减行数, 更贴近真实基数估计)
+  - _critical_path: 设备切换时加 context-switch 罚分
+    (DMA 重映射 + TLB flush 开销, 不只是带宽延迟)
+  - schedule_pipeline: bubble 公式从均匀 stage 推广到非均匀 stage
+    (用最长 stage 的比例代替 1/p, 因为瓶颈 stage 决定吞吐)
+  - _compute_bubble_ratio: 异构阶段时间修正
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
@@ -51,6 +30,9 @@ from .cost_model import (
     QueryType,
 )
 from .schema import HardwareKind
+from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+
+_T = "PIP"
 
 
 # ---------------------------------------------------------------------------
@@ -58,34 +40,15 @@ from .schema import HardwareKind
 # ---------------------------------------------------------------------------
 
 class StageKind(Enum):
-    """A single operator stage in a query's execution pipeline.
-
-    These map onto the relational operators a planner would emit. The order
-    of declaration is the canonical execution order (a scan feeds a filter
-    feeds a join, etc.) — analogous to Megatron's fixed forward stage order.
-    """
-    SCAN = auto()       # read base table / index
-    FILTER = auto()     # apply predicates
-    JOIN = auto()       # hash / merge join
-    AGGREGATE = auto()  # group-by aggregation
-    SORT = auto()       # ORDER BY
+    SCAN = auto()
+    FILTER = auto()
+    JOIN = auto()
+    AGGREGATE = auto()
+    SORT = auto()
 
 
 @dataclass
 class QueryStage:
-    """One operator stage, costed independently on each device.
-
-    A stage is a QueryDescriptor in its own right: it carries the row counts
-    and width that flow *into* that operator, so the existing per-device cost
-    models can price it without modification. This is the key reuse trick —
-    the cost model never learns it is being asked about a fragment.
-
-    Attributes:
-        stage_id:   Stable identifier, "<query_id>::<kind>".
-        kind:       Which operator this stage represents.
-        descriptor: Synthetic QueryDescriptor describing this stage's inputs.
-        produces_rows: Estimated output cardinality, fed to the next stage.
-    """
     stage_id: str
     kind: StageKind
     descriptor: QueryDescriptor
@@ -94,11 +57,6 @@ class QueryStage:
 
 @dataclass
 class StageAssignment:
-    """Result of routing a single stage to a device.
-
-    Mirrors a per-stage entry in Megatron's schedule: a (stage, device) pin
-    plus the cost we expect to pay there.
-    """
     stage_id: str
     kind: StageKind
     device_id: str
@@ -107,29 +65,6 @@ class StageAssignment:
 
 @dataclass
 class PipelineSchedule:
-    """Executor-ready schedule for a single query.
-
-    Analogous to vLLM's SchedulerOutput: a flat object the executor consumes
-    without re-deriving anything.
-
-    A single query's stages form a STRICT data-dependency chain
-    (SCAN -> FILTER -> JOIN -> AGGREGATE -> SORT): each stage consumes the
-    previous stage's output, so they CANNOT overlap. The end-to-end latency is
-    therefore the full critical path — every stage's compute PLUS every
-    cross-device handoff (including the initial load from the data's home).
-    There is no intra-query pipeline speedup; pipelining only helps when
-    *multiple independent queries* flow through the stages (see
-    QueryPipelineScheduler.schedule_pipeline, which uses the Megatron bubble
-    formula for that case).
-
-    Fields:
-        compute_cost_us  — sum of per-stage compute (transfer excluded).
-        transfer_cost_us — sum of ALL handoffs on the critical path: the
-                           initial data load into the first stage's device,
-                           plus every device switch between consecutive stages.
-        latency_us       — compute_cost_us + transfer_cost_us. The physical
-                           lower bound for one query on a dependency chain.
-    """
     query_id: str
     assignments: List[StageAssignment]
     compute_cost_us: float
@@ -144,26 +79,20 @@ class PipelineSchedule:
                 seen.append(a.device_id)
         return seen
 
+    def dump_state(self) -> str:
+        lines = [f"PipelineSchedule({self.query_id}): "
+                 f"latency={self.latency_us:.2f}us "
+                 f"(compute={self.compute_cost_us:.2f} + "
+                 f"transfer={self.transfer_cost_us:.2f})"]
+        for a in self.assignments:
+            lines.append(f"  {a.kind.name:>10s} → {a.device_id} "
+                         f"total={a.cost.total_us:.2f}us "
+                         f"xfer={a.cost.transfer_cost_us:.2f}us")
+        return "\n".join(lines)
+
 
 @dataclass
 class PipelineBatchSchedule:
-    """Throughput estimate for a BATCH of independent queries.
-
-    This is where pipelining actually pays off. With m independent queries
-    streaming through p pipeline stages (devices), the synchronous-pipeline
-    bubble fraction is (p-1)/(m+p-1) (Narayanan et al. 2021, the Megatron-LM
-    pipeline-bubble result). We apply it to estimate aggregate makespan vs the
-    fully-serial baseline.
-
-    Fields:
-        num_queries      — m, number of independent queries in the batch.
-        num_stages       — p, the pipeline depth actually used.
-        serial_makespan_us   — Σ over queries of each query's full latency
-                               (no cross-query overlap).
-        pipelined_makespan_us — estimated makespan once queries overlap across
-                                stages, using the Megatron bubble fraction.
-        bubble_fraction  — (p-1)/(m+p-1), the idle fraction.
-    """
     num_queries: int
     num_stages: int
     serial_makespan_us: float
@@ -172,9 +101,7 @@ class PipelineBatchSchedule:
 
     @property
     def speedup(self) -> float:
-        """Serial / pipelined makespan. 1.0 when m=1 (no overlap possible)."""
         if self.pipelined_makespan_us <= 0:
-            # [PORT·PIP] 断点: 返回值检查
             return 1.0
         return self.serial_makespan_us / self.pipelined_makespan_us
 
@@ -183,21 +110,17 @@ class PipelineBatchSchedule:
 # Stage decomposition
 # ---------------------------------------------------------------------------
 
+# 改写: join selectivity 衰减系数, 每个 join 阶段行数乘以此系数
+_JOIN_SELECTIVITY: float = 0.4
+
+
 def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
-    """Break a query into an ordered list of operator stages.
+    """Break a query into operator stages.
 
-    Deterministic: the same descriptor always yields the same stages, so any
-    benchmark panel built on top of this is reproducible across seeds (only
-    the cost-model noise varies, not the stage graph itself).
-
-    Row-flow model (kept deliberately simple and monotone):
-        SCAN      reads selectivity * table_rows.
-        FILTER    keeps the estimated_rows the planner predicted.
-        JOIN      fans out by ~num_joins (each join roughly preserves rows
-                  for a primary-key join; we keep it at parity to avoid
-                  unphysical blow-up in a cost demo).
-        AGGREGATE collapses to group_by_cardinality.
-        SORT      preserves its input cardinality.
+    改写: join 阶段的行流模型从 parity (1:1) 改为 selectivity 衰减。
+    原版每个 join 输出行数 = 输入行数 (假设 PK join), 对 multi-way join
+    会让后续 stage 的 cost 虚高。改为每个 join 按 _JOIN_SELECTIVITY
+    衰减, 更接近 TPC-H 里 lineitem JOIN orders 这种实际比例。
     """
     stages: List[QueryStage] = []
 
@@ -228,12 +151,12 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
             produces_rows=in_rows,
         )
 
-    # 1. SCAN — always present.
+    # 1. SCAN
     scan_type = (QueryType.INDEX_SCAN if query.index_available
                  else QueryType.FULL_TABLE_SCAN)
     stages.append(mk(StageKind.SCAN, scan_type, scan_rows, query.selectivity))
 
-    # 2. FILTER — present when predicates narrow the scan output.
+    # 2. FILTER
     filtered = max(1, query.estimated_rows or scan_rows)
     if query.num_predicates > 0 and filtered < scan_rows:
         st = mk(StageKind.FILTER, QueryType.RANGE_SCAN, scan_rows,
@@ -243,16 +166,18 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
     else:
         filtered = scan_rows
 
-    # 3. JOIN — one stage per join, parity row-flow.
+    # 3. JOIN — 改写: 每个 join 按 selectivity 衰减
     join_rows = filtered
-    for _ in range(max(0, query.num_joins)):
-        # [PORT·PIP] 循环迭代: _
-        st = mk(StageKind.JOIN, QueryType.JOIN, join_rows, 1.0,
+    for j in range(int(max(0, query.num_joins))):
+        st = mk(StageKind.JOIN, QueryType.JOIN, join_rows, _JOIN_SELECTIVITY,
                 num_joins=1)
-        st.produces_rows = join_rows
+        # 改写: 输出行数按 selectivity 衰减, 不再 parity
+        out_rows = max(1, int(join_rows * _JOIN_SELECTIVITY))
+        st.produces_rows = out_rows
         stages.append(st)
+        join_rows = out_rows
 
-    # 4. AGGREGATE — collapses to group cardinality.
+    # 4. AGGREGATE
     if query.group_by_cardinality > 0:
         gb = max(1, query.group_by_cardinality)
         st = mk(StageKind.AGGREGATE, QueryType.AGGREGATE, join_rows,
@@ -262,14 +187,15 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
         stages.append(st)
         join_rows = gb
 
-    # 5. SORT — preserves cardinality.
+    # 5. SORT
     if query.sort_required:
-        # [PORT·PIP] 分支: query.sort_required
         st = mk(StageKind.SORT, QueryType.SORT, join_rows, 1.0,
                 sort_required=True)
         st.produces_rows = join_rows
         stages.append(st)
 
+    _dbg(_T, f"decompose({query.query_id}): {len(stages)} stages, "
+         f"row_flow={[s.produces_rows for s in stages]}")
     return stages
 
 
@@ -277,142 +203,109 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
 # Scheduler
 # ---------------------------------------------------------------------------
 
+# 改写: 设备切换的 context-switch 固定罚分 (DMA 重映射 + TLB flush)
+_DEVICE_SWITCH_PENALTY_US: float = 5.0
+
+
 class QueryPipelineScheduler:
-    """Segment a query into operator stages and pipeline them across devices.
-
-    The scheduler reuses CostModelEngine.recommend per stage. For a single
-    query it reports the full critical-path latency (compute + all transfers),
-    with no intra-query speedup, because a query's stages form a strict
-    dependency chain. Cross-query pipelining — where speedup actually comes
-    from — is handled by schedule_pipeline() using the Megatron-LM pipeline
-    bubble fraction (p-1)/(m+p-1) for m queries over p stages.
-
-    Lifecycle:
-        1. decompose      → stage graph (operator dependency chain).
-        2. assign         → per-stage device via cost model (ncclTopoCompute).
-        3. compute phases → warmup / steady / cooldown critical path.
-    """
+    """Segment a query into stages and pipeline across devices."""
 
     def __init__(self, engine: CostModelEngine,
                  max_pipeline_depth: Optional[int] = None):
         self.engine = engine
-        # Pipeline depth is bounded by the number of distinct compute devices,
-        # exactly as Megatron caps in-flight microbatches at the pipeline size.
         n_devices = sum(
             1 for n in engine.topology.nodes.values()
             if n.kind in (HardwareKind.GPU, HardwareKind.CPU)
         )
         self.max_pipeline_depth = max_pipeline_depth or max(1, n_devices)
-
-    # -- per-stage routing -------------------------------------------------
+        _dbg(_T, f"PipelineScheduler: max_depth={self.max_pipeline_depth}, "
+             f"n_devices={n_devices}")
 
     def assign_stages(self, stages: List[QueryStage],
                       data_location: str = "cpu0"
                       ) -> List[StageAssignment]:
-        """Route each stage to its lowest-cost device.
-
-        The data_location for a stage is the device the *previous* stage
-        landed on — intermediate results live where they were produced, so
-        the cost model correctly charges a transfer only on a device switch.
-        """
         assignments: List[StageAssignment] = []
         current_location = data_location
         for st in stages:
-            # [PORT·PIP] 循环迭代: st
-            device_id, cost = self.engine.recommend(
-                st.descriptor, data_location=current_location
-            )
+            with _Timer(f"assign:{st.kind.name}") as t:
+                device_id, cost = self.engine.recommend(
+                    st.descriptor, data_location=current_location
+                )
             assignments.append(StageAssignment(
                 stage_id=st.stage_id,
                 kind=st.kind,
                 device_id=device_id,
                 cost=cost,
             ))
+            _dbg(_T, f"  {st.kind.name}: {current_location} → {device_id}, "
+                 f"cost={cost.total_us:.2f}us")
             current_location = device_id
         return assignments
-
-    # -- critical path (single query) -------------------------------------
 
     @staticmethod
     def _critical_path(assignments: List[StageAssignment]
                        ) -> Tuple[float, float, float]:
-        """End-to-end latency of one query as a strict dependency chain.
+        """改写: 加 context-switch 罚分.
 
-        The stages of a single query cannot overlap (each consumes the
-        previous one's output). The latency is therefore the FULL critical
-        path: every stage's compute plus every handoff on the path. Each
-        StageAssignment.cost already includes the transfer the cost model
-        charged to move that stage's input to its device — that is exactly
-        the initial load for the first stage and the device-switch handoff
-        for later stages. We must NOT subtract it; doing so was the bug that
-        made a 15 ms PCIe load vanish and produced a fake 246x speedup.
-
-        Returns (compute_us, transfer_us, latency_us) with
-        latency_us == compute_us + transfer_us.
+        原版只算 transfer_cost_us + compute, 但真实系统里设备切换
+        还有 DMA context 重建、TLB flush、PCIe BAR 重映射等固定开销,
+        不纯粹是带宽×数据量。每次设备切换加一个固定罚分。
         """
         compute_us = 0.0
         transfer_us = 0.0
+        prev_device = None
+        switch_count = 0
         for a in assignments:
             transfer_us += a.cost.transfer_cost_us
             compute_us += (a.cost.total_us - a.cost.transfer_cost_us)
-        # [PORT·PIP] 断点: 返回值检查
-        return compute_us, transfer_us, compute_us + transfer_us
+            # 改写: 设备切换罚分
+            if prev_device is not None and a.device_id != prev_device:
+                transfer_us += _DEVICE_SWITCH_PENALTY_US
+                switch_count += 1
+            prev_device = a.device_id
 
-    # -- public API --------------------------------------------------------
+        total = compute_us + transfer_us
+        _dbg(_T, f"critical_path: compute={compute_us:.2f} "
+             f"transfer={transfer_us:.2f} switches={switch_count} "
+             f"total={total:.2f}us")
+        return compute_us, transfer_us, total
 
     def schedule(self, query: QueryDescriptor,
                  data_location: str = "cpu0") -> PipelineSchedule:
-        """Build the schedule for one query.
+        with _Timer(f"schedule:{query.query_id}") as t:
+            stages = decompose_query(query)
+            assignments = self.assign_stages(stages, data_location)
+            compute, transfer, latency = self._critical_path(assignments)
 
-        latency_us is the full critical path (compute + all transfers). There
-        is deliberately no intra-query speedup: a single query's stages are a
-        dependency chain. For cross-query pipelining use schedule_pipeline().
-        """
-        from ._debug import dbg
-        dbg('Pipeline.schedule_start', query_id=query.query_id)
-        stages = decompose_query(query)
-        assignments = self.assign_stages(stages, data_location)
-        compute, transfer, latency = self._critical_path(assignments)
-        from ._debug import dbg
-        dbg('Pipeline.schedule_done', query_id=query.query_id, n_stages=len(assignments),
-            total_us=latency)
-        # [PORT·PIP] 断点: 返回值检查
-        return PipelineSchedule(
+        sched = PipelineSchedule(
             query_id=query.query_id,
             assignments=assignments,
             compute_cost_us=compute,
             transfer_cost_us=transfer,
             latency_us=latency,
         )
+        _dbg(_T, f"schedule result: {sched.dump_state()}")
+        return sched
 
     def schedule_batch(self, queries: List[QueryDescriptor],
                        data_location: str = "cpu0"
                        ) -> List[PipelineSchedule]:
-        """Schedule a batch of queries independently (one schedule each)."""
         return [self.schedule(q, data_location) for q in queries]
-
-    # -- cross-query pipelining (the real speedup) ------------------------
 
     def schedule_pipeline(self, queries: List[QueryDescriptor],
                           data_location: str = "cpu0"
                           ) -> PipelineBatchSchedule:
-        """Estimate makespan with heterogeneity-corrected pipeline model.
+        """改写: 非均匀 stage 的加权 bubble 公式.
 
-        PORT改写: Megatron的bubble公式假设所有stage耗时相等, 但异构系统里
-        GPU stage和CPU stage耗时差异巨大. 改用"最慢stage主导"模型:
+        原版 Megatron 公式 bubble = (p-1)/(m+p-1) 假设所有 stage 耗时
+        相等。实际上异构设备 + 不同 operator 导致 stage 时间差异很大,
+        瓶颈 stage 决定吞吐。
 
-        改写公式:
-            t_stage_max = max(stage耗时) across all queries  (瓶颈stage)
-            t_stage_avg = mean(stage耗时)
-            heterogeneity_ratio = t_stage_max / t_stage_avg
-            effective_bubble = raw_bubble * heterogeneity_ratio
-            (异构度越高, bubble越大, 因为快stage等慢stage)
-
-        这比原始 (p-1)/(m+p-1) 更准确: 当GPU stage花0.1ms而CPU stage花10ms时,
-        pipeline几乎没有加速, 但原公式会乐观地预测p倍加速.
+        修正: 设 t_max 为所有 query 中最慢 stage 的时间,
+        t_avg 为平均 stage 时间, imbalance = t_max / t_avg。
+        t_pipe = t_serial * (m + p - 1) / (m * p) * imbalance
+        当所有 stage 等长时 imbalance=1 退化为原公式。
         """
-        from ._debug import dbg, runtime_stats
-
         if not queries:
             return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
 
@@ -424,45 +317,26 @@ class QueryPipelineScheduler:
         p = min(max_stages, self.max_pipeline_depth)
         p = max(1, p)
 
-        # PORT: 收集所有stage的individual耗时, 计算异构度
+        bubble = (p - 1) / (m + p - 1)
+
+        # 改写: 计算 stage imbalance factor
         all_stage_times = []
-        for sched in schedules:
-            for a in sched.assignments:
-                stage_time = a.cost.total_us - a.cost.transfer_cost_us
-                all_stage_times.append(max(0.001, stage_time))
-
+        for s in schedules:
+            for a in s.assignments:
+                all_stage_times.append(a.cost.total_us)
         if all_stage_times:
-            t_stage_max = max(all_stage_times)
-            t_stage_avg = sum(all_stage_times) / len(all_stage_times)
-            heterogeneity_ratio = t_stage_max / max(0.001, t_stage_avg)
+            t_max = max(all_stage_times)
+            t_avg = sum(all_stage_times) / len(all_stage_times)
+            imbalance = t_max / t_avg if t_avg > 0 else 1.0
         else:
-            heterogeneity_ratio = 1.0
+            imbalance = 1.0
 
-        # PORT: 异构修正的bubble
-        raw_bubble = (p - 1) / (m + p - 1)
-        # 异构度>1时bubble膨胀, 限制在[0, 0.95]
-        corrected_bubble = min(raw_bubble * heterogeneity_ratio, 0.95)
-        # 同步开销: 每个stage边界需要一次barrier
-        sync_tax = 0.015 * (p - 1)
-        bubble = min(corrected_bubble + sync_tax, 0.97)
+        t_pipe = t_serial * (m + p - 1) / (m * p) * imbalance
 
-        # makespan: 考虑瓶颈stage的主导效应
-        if heterogeneity_ratio > 2.0:
-            # 高度异构: 瓶颈stage主导, pipeline加速有限
-            # t_pipe ≈ m * t_stage_max + (p-1) * t_stage_max
-            t_pipe = (m + p - 1) * (t_serial / max(1, m * p)) * heterogeneity_ratio
-        else:
-            # 低异构: 标准Megatron公式仍然适用
-            t_pipe = t_serial * (m + p - 1) / (m * p)
-
-        # PORT: 打印调度诊断
-        dbg("PIP·pipeline_schedule",
-            n_queries=m, n_stages=p,
-            t_serial_us=t_serial, t_pipe_us=t_pipe,
-            bubble=bubble, heterogeneity=heterogeneity_ratio,
-            speedup=t_serial / max(0.001, t_pipe))
-        runtime_stats.record_time("pipeline.makespan", t_pipe)
-        runtime_stats.set_gauge("pipeline.bubble", bubble)
+        _dbg(_T, f"pipeline: m={m} p={p} bubble={bubble:.4f} "
+             f"imbalance={imbalance:.3f} serial={t_serial:.1f}us "
+             f"pipelined={t_pipe:.1f}us "
+             f"speedup={t_serial/t_pipe if t_pipe > 0 else 1:.2f}x")
 
         return PipelineBatchSchedule(
             num_queries=m,

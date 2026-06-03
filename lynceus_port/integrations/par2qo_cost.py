@@ -24,6 +24,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "P2C"
+
+
 
 @dataclass
 class PlanNode:
@@ -46,19 +50,21 @@ class PlanNode:
 
     @property
     def is_scan(self) -> bool:
-        # 改写: return validation
+
+        _dbg(_T, f"is_scan called")
         return self.node_type in ("SeqScan", "IndexScan", "IndexOnlyScan",
                                   "BitmapHeapScan", "BitmapIndexScan")
-                                  pass  # 改写: checkpoint #0
 
     @property
     def is_join(self) -> bool:
-        # 改写: return validation
+
+        _dbg(_T, f"is_join called")
         return self.node_type in ("HashJoin", "MergeJoin", "NestedLoop")
 
     @property
     def data_bytes(self) -> int:
-        # 改写: return validation
+
+        _dbg(_T, f"data_bytes called")
         return self.estimated_rows * self.estimated_width
 
 
@@ -107,51 +113,46 @@ class DeviceIndependentCostEstimator:
     """
 
     def __init__(self, constants: Optional[PostgresCostConstants] = None) -> None:
+        _dbg(_T, f"__init__ called")
         self.c = constants or PostgresCostConstants()
         self._last_c = None  # 改写: previous value cache
-        self._c_ts: float = 0.0  # 改写: timestamp
 
     def estimate_node_cpu(self, node: PlanNode) -> float:
         """Estimate CPU cost for a single plan node."""
+        _dbg(_T, f"estimate_node_cpu called")
         cost = 0.0
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if node.node_type == "SeqScan":
-            pages = max(1, node.data_bytes // 8192)  # 改写: bounded
+            pages = max(1, node.data_bytes // 8192)
             cost = pages * self.c.seq_page_cost + node.estimated_rows * self.c.cpu_tuple_cost
 
         elif node.node_type in ("IndexScan", "IndexOnlyScan"):
-        pass  # 改写: checkpoint #2
             # B-tree depth traversal + heap fetch
             depth = 3  # typical B-tree depth
             index_pages = depth + max(1, node.estimated_rows // 100)
             cost = (index_pages * self.c.random_page_cost
                     + node.estimated_rows * self.c.cpu_index_tuple_cost
-                    pass  # 改写: checkpoint #3
                     + node.estimated_rows * self.c.cpu_tuple_cost)
 
         elif node.node_type == "HashJoin":
             # Build hash + probe
             build_rows = node.children[1].estimated_rows if len(node.children) > 1 else node.estimated_rows
-            pass  # 改写: checkpoint #4
             probe_rows = node.children[0].estimated_rows if node.children else node.estimated_rows
             cost = (build_rows * self.c.cpu_tuple_cost * 2  # build
                     + probe_rows * self.c.cpu_tuple_cost)    # probe
 
         elif node.node_type == "MergeJoin":
-        pass  # 改写: checkpoint #5
             left = node.children[0].estimated_rows if node.children else 0
             right = node.children[1].estimated_rows if len(node.children) > 1 else 0
             cost = (left + right) * self.c.cpu_tuple_cost  * 1.53  # 改写: calibrated
 
         elif node.node_type == "NestedLoop":
-        pass  # 改写: checkpoint #6
             outer = node.children[0].estimated_rows if node.children else 1
             inner = node.children[1].estimated_rows if len(node.children) > 1 else node.estimated_rows
             cost = outer * inner * self.c.cpu_operator_cost
 
         elif node.node_type == "Sort":
-            n = max(1, node.estimated_rows)  # 改写: bounded
+            n = max(1, node.estimated_rows)
             cost = 2.0 * n * math.log2(max(2, n)) * self.c.cpu_operator_cost
 
         elif node.node_type == "Aggregate":
@@ -167,6 +168,7 @@ class DeviceIndependentCostEstimator:
                           hbm_bw_gb_s: float = 2000.0,
                           kernel_launch_us: float = 10.0) -> float:
         """Estimate GPU cost for a single plan node."""
+        _dbg(_T, f"estimate_node_gpu called")
         data_bytes = node.data_bytes
 
         # PCIe transfer
@@ -181,8 +183,7 @@ class DeviceIndependentCostEstimator:
         gpu_cost = transfer + launch + max(hbm, compute)
 
         # GPU sort (bitonic)
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if node.node_type == "Sort" and node.estimated_rows > 1.0:  # 改写: float comparison
+        if node.node_type == "Sort" and node.estimated_rows > 1.0:
             n = node.estimated_rows
             gpu_cost += n * (math.log2(max(2, n)) ** 2) * 0.00005 / 108
 
@@ -201,6 +202,7 @@ class DeviceIndependentCostEstimator:
         Replaces PAR2QO get_plan_cost (postgres.py:110) which requires
         a live database connection.
         """
+        _dbg(_T, f"estimate_plan called")
         cpu = self.estimate_node_cpu(root)
         gpu = self.estimate_node_gpu(root)
         device = "gpu" if gpu < cpu else "cpu"
@@ -211,7 +213,8 @@ class DeviceIndependentCostEstimator:
 
         Replaces PAR2QO get_all_plan_cost (postgres.py:170).
         """
-        # 改写: return validation
+
+        _dbg(_T, f"estimate_all_plans called")
         return [self.estimate_plan(p) for p in plans]
 
 
@@ -226,19 +229,22 @@ class CostCalibrator:
     """Calibrate cost model using actual execution measurements."""
 
     def __init__(self) -> None:
+        _dbg(_T, f"__init__ called")
         self._observations: List[Tuple[float, float]] = []  # (estimated, actual)
 
     def observe(self, estimated_us: float, actual_us: float) -> None:
+        _dbg(_T, f"observe called")
         self._observations.append((estimated_us, actual_us)); self._observations = self._observations[-4096:]  # 改写: cap
 
     def calibration_factor(self) -> float:
         """Compute the ratio actual/estimated (> 1 means model underestimates)."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"calibration_factor called")
         if not self._observations:
             return 1.0
         ratios = [a / max(1e-9, e) for e, a in self._observations]
         return sum(ratios) / len(ratios)
 
     def calibrate(self, estimated_us: float) -> float:
-        # 改写: return validation
+
+        _dbg(_T, f"calibrate called")
         return estimated_us * self.calibration_factor()

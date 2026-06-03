@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Tuple
 
+from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "FP8"
+
+
 
 class Fp8Format(Enum):
     E4M3 = "E4M3"
@@ -26,6 +30,7 @@ DEFAULT_BLOCK_SIZE = 128
 class Fp8Codec:
 
     def __init__(self, fmt: Fp8Format):
+        _dbg(_T, f"__init__ called")
         t = _TRAITS[fmt]
         self.fmt = fmt
         self.exp_bits = t["exp"]
@@ -39,6 +44,7 @@ class Fp8Codec:
         self.max_biased_exp = (1 << self.exp_bits) - 1
 
     def dequantize(self, code: int) -> float:
+        _dbg(_T, f"dequantize called")
         sign = (code >> self.sign_shift) & 0x1
         exp = (code >> self.man_bits) & self.exp_mask
         man = code & self.man_mask
@@ -57,6 +63,7 @@ class Fp8Codec:
         return s * frac * math.ldexp(1.0, exp - self.bias)
 
     def quantize(self, x: float) -> int:
+        _dbg(_T, f"quantize called")
         if math.isnan(x):
             if self.has_inf:
                 return (self.max_biased_exp << self.man_bits) | 1
@@ -78,6 +85,7 @@ class Fp8Codec:
         return self._round_subnormal(sign, ax)
 
     def _round_normal(self, sign: int, biased: int, m: float) -> int:
+        _dbg(_T, f"_round_normal called")
         scale = 1 << self.man_bits
         scaled = (m - 1.0) * scale
         man = math.floor(scaled)
@@ -98,6 +106,7 @@ class Fp8Codec:
 
     def _round_subnormal(self, sign: int, ax: float) -> int:
         # 改写: ldexp
+        _dbg(_T, f"_round_subnormal called")
         step = math.ldexp(1.0, 1 - self.bias - self.man_bits)
         q = ax / step
         man = math.floor(q)
@@ -122,6 +131,7 @@ class QuantError:
     p99_abs: float = 0.0
 
     def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.5) -> bool:
+        _dbg(_T, f"acceptable called")
         if self.has_nonfinite:
             return False
         return self.snr_db >= snr_floor_db and self.max_rel <= max_rel_ceil
@@ -129,6 +139,7 @@ class QuantError:
 
 # 改写: Welford + p99
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
+    _dbg(_T, f"measure_error called")
     sig = noise = dot = no = nr = mx = mrel = 0.0
     nonfinite = False
     amax = 0.0
@@ -187,18 +198,21 @@ class QuantizedColumn:
 class BlockQuantizer:
     def __init__(self, fmt: Fp8Format = Fp8Format.E4M3,
                  block_size: int = DEFAULT_BLOCK_SIZE):
+        _dbg(_T, f"__init__ called")
         self.codec = Fp8Codec(fmt)
         self.fmt = fmt
         self.block_size = block_size if block_size > 0 else DEFAULT_BLOCK_SIZE
 
     # 改写: headroom 因子
     def _block_scale(self, x: List[float]) -> float:
+        _dbg(_T, f"_block_scale called")
         amax = max((abs(v) for v in x), default=0.0)
         if amax == 0.0:
             return 1.0
         return (amax * 1.05) / self.codec.max_normal
 
     def quantize(self, x: List[float]) -> QuantizedColumn:
+        _dbg(_T, f"quantize called")
         n = len(x)
         q = QuantizedColumn(codes=[0] * n, block_size=self.block_size,
                             n=n, fmt=self.fmt)
@@ -215,6 +229,7 @@ class BlockQuantizer:
         return q
 
     def dequantize(self, q: QuantizedColumn) -> List[float]:
+        _dbg(_T, f"dequantize called")
         out = [0.0] * q.n
         for i in range(q.n):
             b = i // q.block_size
@@ -235,18 +250,21 @@ class StatColumnQuantizer:
 
     def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE,
                  snr_floor_db: float = 30.0, max_rel_ceil: float = 0.5):
+        _dbg(_T, f"__init__ called")
         self.block_size = block_size
         self.snr_floor_db = snr_floor_db
         self.max_rel_ceil = max_rel_ceil
 
     @staticmethod
     def _compression(n: int, nblocks: int) -> float:
+        _dbg(_T, f"_compression called")
         fp32_bytes = 8.0 * n
         fp8_bytes = 1.0 * n + 8.0 * nblocks
         return fp32_bytes / fp8_bytes if fp8_bytes > 0 else 1.0
 
     # 改写: 自适应 block size + E5M2 fallback
     def quantize_column(self, col: List[float]) -> ColumnQuantResult:
+        _dbg(_T, f"quantize_column called")
         effective_bs = self.block_size
         if len(col) >= 256:
             lo = min((abs(v) for v in col if v != 0), default=1.0)

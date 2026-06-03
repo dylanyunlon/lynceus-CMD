@@ -1,4 +1,4 @@
-"""lynceus/strategies — Pluggable routing strategy implementations."""
+"""lynceus_port_v3/strategies — Pluggable routing strategy implementations."""
 
 from .base import RoutingDecision, RoutingStrategyBase
 from .static import CPUOnlyStrategy, GPUOnlyStrategy, HybridStaticStrategy

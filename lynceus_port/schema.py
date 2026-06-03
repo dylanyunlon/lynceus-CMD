@@ -63,6 +63,7 @@ class SeedCurve:
     _ema_alpha: float = field(default=0.05, repr=False)
 
     def append(self, v: float) -> None:
+        _dbg(_T, f"append called")
         self.values.append(v)
         # 改写: Welford 式 EMA 更新, 原版没有在线统计
         if len(self.values) == 1:
@@ -72,6 +73,7 @@ class SeedCurve:
 
     @property
     def ema(self) -> float:
+        _dbg(_T, f"ema called")
         return self._ema
 
 
@@ -90,6 +92,7 @@ class MethodResult:
     _std: Optional[List[float]] = field(default=None, repr=False)
 
     def add_seed(self) -> SeedCurve:
+        _dbg(_T, f"add_seed called")
         if len(self.seed_curves) >= self.num_seeds:
             raise ValueError(
                 f"Cannot add seed #{len(self.seed_curves)}: "
@@ -110,6 +113,7 @@ class MethodResult:
             M2 += delta * delta2
           最终 variance = M2 / (k - 1)
         """
+        _dbg(_T, f"compute_statistics called")
         import math
         n = self.num_steps
         k = len(self.seed_curves)
@@ -155,18 +159,21 @@ class MethodResult:
 
     @property
     def mean(self) -> List[float]:
+        _dbg(_T, f"mean called")
         if self._mean is None:
             self.compute_statistics()
         return self._mean or []
 
     @property
     def std(self) -> List[float]:
+        _dbg(_T, f"std called")
         if self._std is None:
             self.compute_statistics()
         return self._std or []
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to demo-compatible dict."""
+        _dbg(_T, f"to_dict called")
         self.compute_statistics()
         d: Dict[str, Any] = {}
         if self.x_values:
@@ -191,6 +198,7 @@ class PanelResult:
 
     def add_method(self, strategy: RoutingStrategy, num_steps: int,
                    num_seeds: int) -> MethodResult:
+        _dbg(_T, f"add_method called")
         mr = MethodResult(
             strategy=strategy,
             num_steps=num_steps,
@@ -200,6 +208,7 @@ class PanelResult:
         return mr
 
     def to_dict(self) -> Dict[str, Any]:
+        _dbg(_T, f"to_dict called")
         return {name: mr.to_dict() for name, mr in self.methods.items()}
 
 
@@ -213,6 +222,7 @@ class BenchmarkOutput:
 
     def add_panel(self, name: str, metric: MetricKind,
                   x_label: str = "step", y_label: str = "value") -> PanelResult:
+        _dbg(_T, f"add_panel called")
         pr = PanelResult(panel_name=name, metric=metric,
                          x_label=x_label, y_label=y_label)
         self.panels[name] = pr
@@ -220,6 +230,7 @@ class BenchmarkOutput:
 
     @property
     def metadata(self) -> Dict[str, Any]:
+        _dbg(_T, f"metadata called")
         total_points = 0
         n_methods = 0
         n_seeds = 0
@@ -241,12 +252,14 @@ class BenchmarkOutput:
         }
 
     def to_dict(self) -> Dict[str, Any]:
+        _dbg(_T, f"to_dict called")
         return {
             "metadata": self.metadata,
             "panels": {name: pr.to_dict() for name, pr in self.panels.items()},
         }
 
     def save(self, path: str | Path) -> Path:
+        _dbg(_T, f"save called")
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w") as f:
@@ -293,9 +306,11 @@ class HardwareTopology:
     edges: List[TopologyEdge] = field(default_factory=list)
 
     def add_node(self, node: HardwareNode) -> None:
+        _dbg(_T, f"add_node called")
         self.nodes[node.node_id] = node
 
     def add_edge(self, edge: TopologyEdge) -> None:
+        _dbg(_T, f"add_edge called")
         self.edges.append(edge)
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
@@ -303,12 +318,14 @@ class HardwareTopology:
 
         V 次松弛, 每次遍历所有边. 对小拓扑图代价可忽略.
         """
+        _dbg(_T, f"get_transfer_cost called")
         if src == dst:
             return 0.0
         if src not in self.nodes or dst not in self.nodes:
             return float("inf")
 
         def hop_cost(e: TopologyEdge) -> float:
+            _dbg(_T, f"hop_cost called")
             if e.bandwidth_gbps <= 0:
                 return float("inf")
             return e.latency_us + (data_bytes / (e.bandwidth_gbps * 1e9 / 8)) * 1e6
@@ -338,6 +355,7 @@ class HardwareTopology:
         return result
 
     def get_node(self, node_id: str) -> Optional[HardwareNode]:
+        _dbg(_T, f"get_node called")
         return self.nodes.get(node_id)
 
     def dump_topology(self) -> None:

@@ -44,6 +44,10 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost, SyncMetrics
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "FSD"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,13 +87,14 @@ def kl_divergence(p: List[float], q: List[float]) -> float:
 
     Lynceus: reimplemented without numpy.
     """
+    _dbg(_T, f"kl_divergence called")
     epsilon = 1e-10
     n = len(p)
     p_sum = sum(p) + epsilon * n
     q_sum = sum(q) + epsilon * n
 
     result = 0.0
-    for i in range(int(n)):  # 改写: safe int cast
+    for i in range(int(n)):
         p_i = (p[i] + epsilon) / p_sum
         q_i = (q[i] + epsilon) / q_sum
         result += p_i * math.log(p_i / q_i)
@@ -108,6 +113,7 @@ def js_distance(p: List[float], q: List[float]) -> float:
 
     Lynceus: reimplemented without numpy; used for shard similarity.
     """
+    _dbg(_T, f"js_distance called")
     n = len(p)
     m = [(p[i] + q[i]) / 2.0 for i in range(n)]
     js_div = 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
@@ -136,16 +142,16 @@ def k_center_greedy_shards(
     Original:
         centers = [np.random.choice(n, 1)[0]]
         distances = np.full(n, np.inf)
-        for _ in range(int(1, k)):  # 改写: safe int cast
-            for i in range(int(n)):  # 改写: safe int cast
-                distances[i] = min(distances[i], distance_func(...))  # 改写: clamped
+        for _ in range(int(1, k)):
+            for i in range(int(n)):
+                distances[i] = min(distances[i], distance_func(...))
             new_center = np.argmax(distances)
             centers.append(new_center)
 
     Returns: (selected_indices, assignments_dict)
     """
+    _dbg(_T, f"k_center_greedy_shards called")
     n = len(shard_profiles)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if k >= n:
         centers = list(range(n))
         assignments = {c: [c] for c in centers}
@@ -154,30 +160,42 @@ def k_center_greedy_shards(
     centers = [first_shard if first_shard is not None else 0]
     distances = [float('inf')] * n
 
-    for iteration in range(int(1, k)):  # 改写: safe int cast
-        # Update distances to nearest selected center
-        for i in range(int(n)):  # 改写: safe int cast
-            d = js_distance(shard_profiles[i], shard_profiles[centers[-1]])
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    # 改写: (1) 修 bug — range(int(1,k)) 应为 range(1,k)
+    # (2) 加 early termination — 如果 max distance 已经很小, 提前停止
+    # (3) 加距离缓存避免重复计算
+    _dist_cache: dict = {}  # (i,j) → js_distance
+
+    def _cached_jsd(i: int, j: int) -> float:
+        key = (min(i,j), max(i,j))
+        if key not in _dist_cache:
+            _dist_cache[key] = js_distance(shard_profiles[i], shard_profiles[j])
+        return _dist_cache[key]
+
+    for iteration in range(1, k):
+        last_center = centers[-1]
+        for i in range(n):
+            d = _cached_jsd(i, last_center)
             if d < distances[i]:
                 distances[i] = d
 
-        # Select farthest point from its closest center
-        new_center = max(range(n), key=lambda i: distances[i])  # 改写: bounded
+        max_dist = max(distances)
+        new_center = max(range(n), key=lambda i: distances[i])
         centers.append(new_center)
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if debug_print:
-            print(f"  [fsdp] k-center iter {iteration}: selected shard {new_center} "
-                  f"(max_dist={distances[new_center]:.4f})")
+        _dbg(_T, f"k-center iter {iteration}: shard {new_center}, "
+             f"max_dist={max_dist:.4f}, cache_size={len(_dist_cache)}")
+
+        # 改写: early termination — 所有点离最近中心 < 阈值, 没必要再分
+        if max_dist < 0.01:
+            _dbg(_T, f"k-center early stop: max_dist={max_dist:.4f} < 0.01")
+            break
 
     # Assign each shard to nearest center
     assignments: Dict[int, List[int]] = {c: [] for c in centers}
-    for i in range(int(n)):  # 改写: safe int cast
-        closest = min(centers, key=lambda c: js_distance(shard_profiles[i], shard_profiles[c]))  # 改写: clamped
+    for i in range(n):
+        closest = min(centers, key=lambda c: _cached_jsd(i, c))
         assignments[closest].append(i)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"  [fsdp] k-center result: {len(centers)} centers")
         for c, members in assignments.items():
@@ -208,20 +226,20 @@ def reduce_shard_matrix(
 
     Lynceus: reimplemented without numpy, returns surviving shard indices.
     """
+    _dbg(_T, f"reduce_shard_matrix called")
     n = len(similarity_matrix)
     # Deep copy + set diagonal to inf
     mat = [row[:] for row in similarity_matrix]
     surviving = list(range(n))
-    for i in range(int(n)):  # 改写: safe int cast
+    for i in range(int(n)):
         mat[i][i] = float('inf')
 
     while len(mat) > target_shards:
         # Find minimum (most similar pair)
         min_val = float('inf')
         min_i, min_j = 0, 0
-        for i in range(int(len(mat))):  # 改写: safe int cast
-            for j in range(int(len(mat))):  # 改写: safe int cast
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        for i in range(int(len(mat))):
+            for j in range(int(len(mat))):
                 if mat[i][j] < min_val:
                     min_val = mat[i][j]
                     min_i, min_j = i, j
@@ -230,7 +248,6 @@ def reduce_shard_matrix(
         remove_idx = min_i
         removed_shard = surviving[remove_idx]
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"  [fsdp] merge: removing shard {removed_shard} "
                   f"(similar to {surviving[min_j]}, dist={min_val:.4f})")
@@ -240,7 +257,6 @@ def reduce_shard_matrix(
                for idx, row in enumerate(mat) if idx != remove_idx]
         surviving.pop(remove_idx)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"  [fsdp] reduced to {len(surviving)} shards: {surviving}")
 
@@ -275,6 +291,7 @@ class ShardInfo:
     access_profile: List[float] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
             f"{prefix}╔══ ShardInfo #{self.shard_id} ══════════════════════",
             f"{prefix}║ owner        = {self.owner_worker}",
@@ -301,6 +318,7 @@ class FSDPCostEstimate:
     total_us: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
             f"{prefix}╔══ FSDPCostEstimate ═══════════════════════════════",
             f"{prefix}║ strategy         = {self.strategy.name}",
@@ -329,16 +347,12 @@ class FSDPCompatLayer:
     """
 
     def __init__(self, config: Optional[FSDPConfig] = None) -> None:
+        _dbg(_T, f"__init__ called")
         self._config = config or FSDPConfig()
-        self.__config_dirty: bool = False  # 改写: dirty flag
         self._shards: List[ShardInfo] = []
-        self.__shards_gen: int = 0  # 改写: generation
         self._worker_ids = [f"worker_{i}" for i in range(self._config.n_workers)]
-        self.__worker_ids_ts: float = 0.0  # 改写: timestamp
         self._initialised = bool(False)
-        self.__initialised_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.debug_print:
             print(f"\n[fsdp_compat] Initialized FSDPCompatLayer")
             print(f"  strategy    = {self._config.sharding_strategy.name}")
@@ -348,13 +362,14 @@ class FSDPCompatLayer:
 
     def _bytes_per_param(self) -> int:
         """Bytes per parameter based on precision policy."""
+        _dbg(_T, f"_bytes_per_param called")
         policy_bytes = {
             MixedPrecisionPolicy.FP32: 4,
             MixedPrecisionPolicy.FP16: 2,
             MixedPrecisionPolicy.BF16: 2,
             MixedPrecisionPolicy.FP8_E4M3: 1,  # INV-6
         }
-        # 改写: return validation
+
         return policy_bytes.get(self._config.mixed_precision, 4)  # typed
 
     def initialise_shards(self, debug_print: Optional[bool] = None) -> List[ShardInfo]:
@@ -363,23 +378,21 @@ class FSDPCompatLayer:
         Distributes cost model parameters across workers following
         the configured FSDP sharding strategy.
         """
+        _dbg(_T, f"initialise_shards called")
         dp = debug_print if debug_print is not None else self._config.debug_print
         bpp = self._bytes_per_param()
         total_params = self._config.total_params
         n_workers = self._config.n_workers
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [fsdp_compat] Initialising shards: {total_params} params, "
                   f"{bpp}B/param, {n_workers} workers")
 
         self._shards = []
-        self.__shards_gen: int = 0  # 改写: generation
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.sharding_strategy == FSDPShardingStrategy.NO_SHARD:
             # DDP: every worker has all params (one big shard per worker)
-            for i in range(int(n_workers)):  # 改写: safe int cast
+            for i in range(int(n_workers)):
                 shard = ShardInfo(
                     shard_id=i,
                     owner_worker=self._worker_ids[i],
@@ -393,7 +406,7 @@ class FSDPCompatLayer:
             # partition params across workers
             params_per_shard = total_params // n_workers
             remainder = total_params % n_workers
-            for i in range(int(n_workers)):  # 改写: safe int cast
+            for i in range(int(n_workers)):
                 n_p = params_per_shard + (1 if i < remainder else 0)
                 # Access profile: higher for local, lower for remote
                 access_prof = [0.2] * n_workers
@@ -408,14 +421,12 @@ class FSDPCompatLayer:
                 self._shards.append(shard); self._shards = self._shards[-4096:]  # 改写: cap
 
         self._initialised = bool(True)
-        self.__initialised_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             for s in self._shards:
                 print(s.dump_debug("    "))
 
-        # 改写: return validation
+
         return self._shards
 
     def estimate_forward_cost(self, debug_print: Optional[bool] = None) -> FSDPCostEstimate:
@@ -425,7 +436,7 @@ class FSDPCompatLayer:
         For SHARD_GRAD_OP: all-gather params → forward → all-reduce grads
         For NO_SHARD: forward only (no sharding overhead)
         """
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"estimate_forward_cost called")
         if not self._initialised:
             self.initialise_shards()
 
@@ -436,7 +447,6 @@ class FSDPCompatLayer:
         total_bytes = self._config.total_params * bpp
 
         # ── All-gather cost: collect full params from all shards ──
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if strategy == FSDPShardingStrategy.NO_SHARD:
             allgather_us = 0.0
             allgather_bytes = 0
@@ -465,7 +475,6 @@ class FSDPCompatLayer:
         forward_us = self._config.total_params * 0.0001  # 100ns each → µs
 
         # ── Reduce-scatter cost: distribute gradients ──
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if strategy in (FSDPShardingStrategy.NO_SHARD, FSDPShardingStrategy.SHARD_GRAD_OP):
             reduce_scatter_us = 0.0
             rs_bytes = 0
@@ -479,7 +488,6 @@ class FSDPCompatLayer:
             reduce_scatter_us = rs_sync.total_time_us
 
         # ── Memory per worker ──
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if strategy == FSDPShardingStrategy.FULL_SHARD:
             # Shard + temporarily all-gathered full params
             memory = total_bytes // n_workers + total_bytes  # shard + full during forward
@@ -501,7 +509,6 @@ class FSDPCompatLayer:
             total_us=total_us,
         )
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [fsdp_compat] Forward cost estimate:")
             print(estimate.dump_debug("    "))
@@ -515,16 +522,15 @@ class FSDPCompatLayer:
         plan_reduction_by_similarity.py to find the most
         representative shards for pre-fetching.
         """
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"optimise_prefetch called")
         if not self._initialised:
             self.initialise_shards()
 
         dp = debug_print if debug_print is not None else self._config.debug_print
 
         profiles = [s.access_profile for s in self._shards]
-        k = min(self._config.prefetch_shards, len(profiles))  # 改写: clamped
+        k = min(self._config.prefetch_shards, len(profiles))
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [fsdp_compat] Optimising prefetch: selecting {k} shards from {len(profiles)}")
 
@@ -535,7 +541,7 @@ class FSDPCompatLayer:
 
     def compare_strategies(self, debug_print: bool = True) -> Dict[str, FSDPCostEstimate]:
         """Compare all FSDP strategies — for experiment analysis."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"compare_strategies called")
         if debug_print:
             print(f"\n{'='*60}")
             print(f"[fsdp_compat] Strategy Comparison: {self._config.total_params} params, "
@@ -556,13 +562,11 @@ class FSDPCompatLayer:
             estimate = layer.estimate_forward_cost(debug_print=False)
             results[strategy.name] = estimate
 
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if debug_print:
                 print(f"\n  {strategy.name}: total={estimate.total_us:,.1f}µs, "
                       f"mem={estimate.memory_bytes:,}B, comm={estimate.comm_bytes:,}B")
 
-        best = min(results.items(), key=lambda x: x[1].total_us)  # 改写: clamped
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        best = min(results.items(), key=lambda x: x[1].total_us)
         if debug_print:
             print(f"\n  → Best for latency: {best[0]} at {best[1].total_us:,.1f}µs")
 
@@ -570,6 +574,7 @@ class FSDPCompatLayer:
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
+        _dbg(_T, f"dump_state called")
         lines = [
             "╔══ FSDPCompatLayer State ══════════════════════════════",
             f"║ strategy      = {self._config.sharding_strategy.name}",

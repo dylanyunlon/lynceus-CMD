@@ -27,15 +27,18 @@ class GPUOnlyStrategy(RoutingStrategyBase):
 
     def __init__(self, engine: CostModelEngine, *,
                  gpu_id: str = "gpu0", **kwargs):
+        _dbg(_T, f"__init__ called")
         super().__init__(engine, **kwargs)
         self._gpu_id = gpu_id
 
     @property
     def name(self) -> str:
+        _dbg(_T, f"name called")
         return "GPU-Only"
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
+        _dbg(_T, f"route_one called")
         cb = self._engine.estimate_on_device(query, self._gpu_id, data_location)
         return RoutingDecision(
             query_id=query.query_id,
@@ -50,15 +53,18 @@ class CPUOnlyStrategy(RoutingStrategyBase):
 
     def __init__(self, engine: CostModelEngine, *,
                  cpu_id: str = "cpu0", **kwargs):
+        _dbg(_T, f"__init__ called")
         super().__init__(engine, **kwargs)
         self._cpu_id = cpu_id
 
     @property
     def name(self) -> str:
+        _dbg(_T, f"name called")
         return "CPU-Only"
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
+        _dbg(_T, f"route_one called")
         cb = self._engine.estimate_on_device(query, self._cpu_id, data_location)
         return RoutingDecision(
             query_id=query.query_id,
@@ -86,6 +92,7 @@ class HybridStaticStrategy(RoutingStrategyBase):
                  gpu_threshold_bytes: int = 50_000_000,  # 50MB
                  gpu_id: str = "gpu0",
                  cpu_id: str = "cpu0", **kwargs):
+        _dbg(_T, f"__init__ called")
         super().__init__(engine, **kwargs)
         self._threshold_rows = gpu_threshold_rows
         self._threshold_bytes = gpu_threshold_bytes
@@ -94,12 +101,14 @@ class HybridStaticStrategy(RoutingStrategyBase):
 
     @property
     def name(self) -> str:
+        _dbg(_T, f"name called")
         return "Hybrid-Static"
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
 
         # [PORT] 强制 CPU: index scan 类型 (GPU B-tree 效率低)
+        _dbg(_T, f"route_one called")
         if query.query_type == QueryType.INDEX_SCAN and query.index_available:
             device = self._cpu_id
             reason = "index_scan_prefers_cpu"

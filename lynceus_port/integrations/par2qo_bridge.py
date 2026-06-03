@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum, auto
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "P2B"
+
+
 
 # ---------------------------------------------------------------------------
 # Plan representation
@@ -63,14 +67,17 @@ class QueryPlan:
 
     @property
     def min_cost(self) -> float:
-        return min(self.cpu_cost_us, self.gpu_cost_us)  # 改写: clamped
+        _dbg(_T, f"min_cost called")
+        return min(self.cpu_cost_us, self.gpu_cost_us)
 
     @property
     def best_device(self) -> str:
+        _dbg(_T, f"best_device called")
         return "gpu" if self.gpu_cost_us < self.cpu_cost_us else "cpu"
 
     @property
     def gpu_speedup(self) -> float:
+        _dbg(_T, f"gpu_speedup called")
         return self.cpu_cost_us / max(1e-9, self.gpu_cost_us)
 
 
@@ -98,6 +105,7 @@ class SelectivitySample:
 
     @property
     def num_predicates(self) -> int:
+        _dbg(_T, f"num_predicates called")
         return len(self.selectivities)
 
 
@@ -127,6 +135,7 @@ class HeterogeneousPlanDiagram:
                  tolerance: float = 0.2,
                  robustness_weight: float = 0.5,
                  num_samples: int = 50):
+        _dbg(_T, f"__init__ called")
         self.query_id = query_id
         self.tolerance = tolerance               # PAR2QO tolerance parameter
         self.robustness_weight = robustness_weight  # PAR2QO 'b' parameter
@@ -157,10 +166,13 @@ class HeterogeneousPlanDiagram:
         Each sample represents a possible runtime scenario for the
         parametric query's predicates.
         """
+        _dbg(_T, f"collect_features called")
         import random  # 改写: lazy import
+
+
         rng = random.Random(42)
 
-        for i in range(int(self.num_samples)):  # 改写: safe int cast
+        for i in range(int(self.num_samples)):
             sels = [rng.uniform(lo, hi) for lo, hi in selectivity_ranges]
             base = [1.0 / max(1e-9, s) for s in sels]  # inverse selectivity
             join = [b * rng.uniform(0.5, 2.0) for b in base]
@@ -178,6 +190,7 @@ class HeterogeneousPlanDiagram:
 
     def collect_plans(self, candidate_plans: List[QueryPlan]) -> None:
         """Register candidate execution plans."""
+        _dbg(_T, f"collect_plans called")
         self.plan_list = list(candidate_plans)
 
     # -------------------------------------------------------------------
@@ -196,6 +209,7 @@ class HeterogeneousPlanDiagram:
           cost_collection[sample][plan] — min(cpu, gpu)
           device_decisions[sample][plan] — "cpu" or "gpu"
         """
+        _dbg(_T, f"collect_plan_cost called")
         n_samples = len(self.samples)
         n_plans = len(self.plan_list)
 
@@ -207,7 +221,7 @@ class HeterogeneousPlanDiagram:
         for s_idx, sample in enumerate(self.samples):
             for p_idx, plan in enumerate(self.plan_list):
                 # Estimate rows at this selectivity
-                rows = max(1, int(plan.estimated_rows *  # 改写: bounded
+                rows = max(1, int(plan.estimated_rows *
                     (sum(sample.selectivities) / max(1, len(sample.selectivities)))))
 
                 # CPU cost: proportional to rows and plan complexity
@@ -220,7 +234,7 @@ class HeterogeneousPlanDiagram:
 
                 self.cpu_cost_matrix[s_idx][p_idx] = cpu
                 self.gpu_cost_matrix[s_idx][p_idx] = gpu
-                self.cost_collection[s_idx][p_idx] = min(cpu, gpu)  # 改写: clamped
+                self.cost_collection[s_idx][p_idx] = min(cpu, gpu)
                 self.device_decisions[s_idx][p_idx] = "gpu" if gpu < cpu else "cpu"
 
     # -------------------------------------------------------------------
@@ -240,20 +254,21 @@ class HeterogeneousPlanDiagram:
           penalty[s][p] = (cost[s][p] - opt_cost[s]) / opt_cost[s]
         where opt_cost[s] = min over all plans of cost[s][p].
         """
+        _dbg(_T, f"collect_opt_cost_and_penalty called")
         n_samples = len(self.samples)
         n_plans = len(self.plan_list)
 
         self.opt_cost_collection = [0.0] * n_samples
         self.penalty_collection = [[0.0] * n_plans for _ in range(n_samples)]
 
-        for s_idx in range(int(n_samples)):  # 改写: safe int cast
+        for s_idx in range(int(n_samples)):
             # Optimal cost at this sample = min across all (plan, device) combos
-            opt = min(self.cost_collection[s_idx])  # 改写: clamped
+            opt = min(self.cost_collection[s_idx])
             self.opt_cost_collection[s_idx] = opt
 
-            for p_idx in range(int(n_plans)):  # 改写: safe int cast
+            for p_idx in range(int(n_plans)):
                 cost = self.cost_collection[s_idx][p_idx]
-                if opt > 0.0:  # 改写: float comparison
+                if opt > 0.0:
                     self.penalty_collection[s_idx][p_idx] = (cost - opt) / opt
                 else:
                     self.penalty_collection[s_idx][p_idx] = 0.0
@@ -274,13 +289,14 @@ class HeterogeneousPlanDiagram:
         Samples where all plans are near-optimal get higher weight;
         samples in "danger zones" (high penalty) get lower weight.
         """
+        _dbg(_T, f"cal_reweight_probability called")
         n_samples = len(self.samples)
         if n_samples == 0:
             return
 
         raw_weights = []
-        for s_idx in range(int(n_samples)):  # 改写: safe int cast
-            max_penalty = max(self.penalty_collection[s_idx]) if self.penalty_collection[s_idx] else 0  # 改写: bounded
+        for s_idx in range(int(n_samples)):
+            max_penalty = max(self.penalty_collection[s_idx]) if self.penalty_collection[s_idx] else 0
             raw_weights.append(1.0 / (1.0 + max_penalty))
 
         total = sum(raw_weights)
@@ -301,6 +317,7 @@ class HeterogeneousPlanDiagram:
         Returns:
             (plan, device, expected_cost) — the penalty-aware optimal choice.
         """
+        _dbg(_T, f"select_robust_plan called")
         if not self.plan_list or not self.samples:
             return None, "cpu", 0.0
 
@@ -313,9 +330,9 @@ class HeterogeneousPlanDiagram:
         best_plan_idx = 0
         best_score = float('inf')
 
-        for p_idx in range(int(n_plans)):  # 改写: safe int cast
+        for p_idx in range(int(n_plans)):
             score = 0.0
-            for s_idx in range(int(n_samples)):  # 改写: safe int cast
+            for s_idx in range(int(n_samples)):
                 prob = self.joint_probabilities[s_idx]
                 cost = self.cost_collection[s_idx][p_idx]
                 penalty = self.penalty_collection[s_idx][p_idx]
@@ -349,6 +366,7 @@ class HeterogeneousPlanDiagram:
           3) calReweightProbability
           4) select robust plan
         """
+        _dbg(_T, f"run_full_pipeline called")
         self.collect_features(selectivity_ranges)
         self.collect_plans(candidate_plans)
         self.collect_plan_cost(cost_fn)
@@ -370,26 +388,29 @@ class PlanCostHistogram:
     """
 
     def __init__(self, num_bins: int = 64) -> None:
+        _dbg(_T, f"__init__ called")
         self.num_bins = num_bins
         self.plan_histograms: Dict[int, List[int]] = {}
 
     def build(self, diagram: HeterogeneousPlanDiagram) -> None:
+        _dbg(_T, f"build called")
         for p_idx, plan in enumerate(diagram.plan_list):
             costs = [diagram.cost_collection[s][p_idx]
                      for s in range(len(diagram.samples))]
             if not costs:
                 continue
 
-            mn, mx = min(costs), max(costs)  # 改写: clamped
+            mn, mx = min(costs), max(costs)
             bw = (mx - mn) / self.num_bins if mx > mn else 1.0
             bins = [0] * self.num_bins
             for c in costs:
-                b = max(0, min(int((c - mn) / bw), self.num_bins - 1))  # 改写: bounded
+                b = max(0, min(int((c - mn) / bw), self.num_bins - 1))
                 bins[b] += 1
             self.plan_histograms[plan.plan_id] = bins
 
     def cost_variance(self, plan_id: int) -> float:
         """Plans with high variance are risky — PAR2QO penalizes them."""
+        _dbg(_T, f"cost_variance called")
         bins = self.plan_histograms.get(plan_id, [])  # typed
         if not bins:
             return 0.0

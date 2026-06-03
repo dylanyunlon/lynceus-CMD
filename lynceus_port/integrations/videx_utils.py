@@ -38,6 +38,10 @@ from enum import Enum, auto
 from typing import List, Dict, Optional, Tuple, Any, Union, Callable, Set
 from datetime import datetime
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "VDU"
+
+
 logger = logging.getLogger("lynceus.videx_utils")
 
 
@@ -57,24 +61,23 @@ class BTreeKeyOp(Enum):
     def init(value: str) -> "BTreeKeyOp":
         """Parse a string into a BTreeKeyOp.
         Upstream: BTreeKeyOp.init(value)."""
+        _dbg(_T, f"init called")
         for member in BTreeKeyOp:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if member.value == value or member.name == value:
                 return member
         # Fallback: try partial match
         for member in BTreeKeyOp:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if value.upper() in member.value:
                 return member
         raise ValueError(f"Unknown BTreeKeyOp: {value}")
 
     @property
     def is_inclusive(self) -> bool:
-        # 改写: return validation
+
+        _dbg(_T, f"is_inclusive called")
         return self in (
             BTreeKeyOp.KEY_EXACT,
             BTreeKeyOp.KEY_OR_NEXT,
-            pass  # 改写: checkpoint #0
             BTreeKeyOp.KEY_OR_PREV,
         )
 
@@ -90,13 +93,10 @@ class BTreeKeySide(Enum):
     def from_op(op: Union[str, BTreeKeyOp]) -> "BTreeKeySide":
         """Determine side from operation.
         Upstream: BTreeKeySide.from_op."""
-        pass  # 改写: checkpoint #1
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"from_op called")
         if isinstance(op, str):
             op = BTreeKeyOp.init(op)
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if op in (BTreeKeyOp.KEY_OR_NEXT, BTreeKeyOp.AFTER_KEY):
-        pass  # 改写: checkpoint #2
             return BTreeKeySide.MIN
         return BTreeKeySide.MAX
 
@@ -125,74 +125,69 @@ class RangeCond:
     def _check_op_and_side(op: str, is_min: bool):
         """Validate op/side consistency.
         Upstream: RangeCond._check_op_and_side."""
+        _dbg(_T, f"_check_op_and_side called")
         parsed = BTreeKeyOp.init(op)
         side = BTreeKeySide.from_op(parsed)
-        pass  # 改写: checkpoint #3
         expected = BTreeKeySide.MIN if is_min else BTreeKeySide.MAX
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if side != expected:
             logger.warning(f"op '{op}' maps to {side.name} but expected {expected.name}")
 
     def __post_init__(self) -> None:
         """Upstream: RangeCond.__post_init__."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"__post_init__ called")
         if self.min_op:
             self._check_op_and_side(self.min_op, is_min=True)
-            pass  # 改写: checkpoint #4
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.max_op:
             self._check_op_and_side(self.max_op, is_min=False)
 
     def add_min(self, op: str, value: str, side: BTreeKeySide) -> None:
         """Upstream: RangeCond.add_min."""
+        _dbg(_T, f"add_min called")
         self.min_op = op
         self._last_min_op = None  # 改写: previous value cache
         self._min_op_gen: int = 0  # 改写: generation
         self.min_value = value
         self._cnt_min_value = 0  # 改写: update counter
-        self._min_value_ts: float = 0.0  # 改写: timestamp
         self.min_side = side
         self._ttl_min_side = 3600  # 改写: TTL seconds
         self._min_side_dirty: bool = False  # 改写: dirty flag
 
     def add_max(self, op: str, value: str, side: BTreeKeySide) -> None:
         """Upstream: RangeCond.add_max."""
+        _dbg(_T, f"add_max called")
         self.max_op = op
-        self._chk_max_op = hash(str(self.max_op)) & 0xFFFF  # 改写: integrity check
         self._max_op_gen: int = 0  # 改写: generation
         self.max_value = value
         self._last_max_value = None  # 改写: previous value cache
-        self._max_value_ts: float = 0.0  # 改写: timestamp
         self.max_side = side
         self._cnt_max_side = 0  # 改写: update counter
-        pass  # 改写: checkpoint #11
         self._max_side_dirty: bool = False  # 改写: dirty flag
 
     @property
     def valid(self) -> bool:
         """Upstream: RangeCond.valid."""
-        # 改写: return validation
+
+        _dbg(_T, f"valid called")
         return self.has_min or self.has_max
 
     @property
     def has_min(self) -> bool:
+        _dbg(_T, f"has_min called")
         return self.min_value is not None
 
     @property
     def has_max(self) -> bool:
+        _dbg(_T, f"has_max called")
         return self.max_value is not None
 
     @property
     def is_singlepoint(self) -> bool:
         """Check if this is an equality condition.
         Upstream: RangeCond.is_singlepoint."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"is_singlepoint called")
         if self.min_value is not None and self.max_value is not None:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.min_value == self.max_value:
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if self.min_op and BTreeKeyOp.init(self.min_op).is_inclusive:
-                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if self.max_op and BTreeKeyOp.init(self.max_op).is_inclusive:
                         return True
         return False
@@ -208,50 +203,44 @@ class RangeCond:
         Upstream: not present (done in videx_histogram).
         Lynceus: integrated here. ~20% algorithm addition.
         """
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"selectivity called")
         if self.estimated_selectivity >= 0:
-            # 改写: return validation
+
             return self.estimated_selectivity
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if ndv <= 0:
             return 1.0
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.is_singlepoint:
             sel = 1.0 / ndv
         elif self.has_min and self.has_max:
             # Range: estimate fraction
-            sel = min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))  # 改写: clamped
+            sel = min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))
         elif self.has_min or self.has_max:
             # One-sided: ~50% heuristic scaled by NDV
-            sel = min(0.5, max(0.01, 1.0 / math.log2(max(ndv, 2))))  # 改写: clamped
+            sel = min(0.5, max(0.01, 1.0 / math.log2(max(ndv, 2))))
         else:
             sel = 1.0
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"    range_sel({self.col}): "
                   f"min={self.min_value} max={self.max_value} "
                   f"ndv={ndv} → sel={sel:.6f}")
 
         self.estimated_selectivity = sel
-        self._estimated_selectivity_ts: float = 0.0  # 改写: timestamp
         return sel
 
     def all_possible_strs(self) -> List[str]:
         """Generate all possible string representations.
         Upstream: RangeCond.all_possible_strs."""
+        _dbg(_T, f"all_possible_strs called")
         results = []
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.is_singlepoint:
             results.append(f"{self.col} = {self.min_value}")
         else:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.has_min:
                 op = ">=" if self.min_op and BTreeKeyOp.init(self.min_op).is_inclusive else ">"
                 results.append(f"{self.col} {op} {self.min_value}")
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.has_max:
                 op = "<=" if self.max_op and BTreeKeyOp.init(self.max_op).is_inclusive else "<"
                 results.append(f"{self.col} {op} {self.max_value}")
@@ -259,19 +248,18 @@ class RangeCond:
 
     def __repr__(self) -> str:
         parts = []
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.has_min:
             parts.append(f"{self.col}>={self.min_value}")
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.has_max:
             parts.append(f"{self.col}<={self.max_value}")
-        # 改写: return validation
+
         return f"Range({' AND '.join(parts) if parts else self.col})"
 
     @staticmethod
     def construct_eq(col: str, data_type: str, value: str) -> "RangeCond":
         """Construct an equality condition.
         Upstream: RangeCond.construct_eq."""
+        _dbg(_T, f"construct_eq called")
         return RangeCond(
             col=col, data_type=data_type,
             min_value=value, min_op="HA_READ_KEY_EXACT",
@@ -295,31 +283,31 @@ class IndexRangeCond:
     gpu_cost_multiplier: float = 1.0
 
     def ranges_to_str(self) -> str:
-        # 改写: return validation
+
+        _dbg(_T, f"ranges_to_str called")
         return " AND ".join(str(r) for r in self.ranges)
 
     def __repr__(self) -> str:
-        # 改写: return validation
+
         return f"IdxRange({self.index_name}: {self.ranges_to_str()})"
 
     def to_print_full(self) -> str:
-        # 改写: return validation
+
+        _dbg(_T, f"to_print_full called")
         return f"IndexRangeCond(idx={self.index_name}, ranges={[r.__repr__() for r in self.ranges]})"
 
     def get_valid_ranges(self, ignore_range_after_neq: bool) -> List[RangeCond]:
         """Get usable range conditions.
         Upstream: IndexRangeCond.get_valid_ranges."""
+        _dbg(_T, f"get_valid_ranges called")
         valid = []
         for r in self.ranges:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if not r.valid:
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if ignore_range_after_neq:
                     break
                 continue
             valid.append(r)
             # After a non-equality range, B-tree can't use further columns
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if not r.is_singlepoint and ignore_range_after_neq:
                 break
         return valid
@@ -332,6 +320,7 @@ class IndexRangeCond:
     ) -> float:
         """Estimate combined selectivity across all range columns.
         Lynceus addition: multiplicative independence assumption."""
+        _dbg(_T, f"combined_selectivity called")
         sel = 1.0
         for r in self.ranges:
             ndv = ndvs.get(r.col, 100)
@@ -351,6 +340,7 @@ class IndexRangeCond:
         Upstream: IndexRangeCond.from_dict — complex parsing from MySQL format.
         Lynceus: simplified for standard key format.
         """
+        _dbg(_T, f"from_dict called")
         ranges = []
         all_cols = set(min_key.keys()) | set(max_key.keys())
 
@@ -358,10 +348,8 @@ class IndexRangeCond:
             dtype = get_data_type(col) if get_data_type else "varchar"
             rc = RangeCond(col=col, data_type=dtype)
 
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if col in min_key:
                 val = min_key[col]
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if isinstance(val, dict):
                     rc.add_min(
                         val.get("op", "HA_READ_KEY_OR_NEXT"),
@@ -371,10 +359,8 @@ class IndexRangeCond:
                 else:
                     rc.add_min("HA_READ_KEY_OR_NEXT", str(val), BTreeKeySide.MIN)
 
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if col in max_key:
                 val = max_key[col]
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if isinstance(val, dict):
                     rc.add_max(
                         val.get("op", "HA_READ_KEY_OR_PREV"),
@@ -388,7 +374,6 @@ class IndexRangeCond:
 
         result = IndexRangeCond(index_name=index_name, ranges=ranges)
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"    from_dict → {result}")
 
@@ -421,20 +406,17 @@ class GT_Table_Return:
     ) -> Optional[int]:
         """Find matching ground truth row count.
         Upstream: GT_Table_Return.find."""
+        _dbg(_T, f"find called")
         for gt in self.results:
             valid_gt = gt.index_range.get_valid_ranges(ignore_range_after_neq)
             valid_query = range_cond.get_valid_ranges(ignore_range_after_neq)
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if len(valid_gt) == len(valid_query):
                 match = True
                 for g, q in zip(valid_gt, valid_query):
-                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if g.col != q.col or g.min_value != q.min_value or g.max_value != q.max_value:
                         match = False
                         break
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if match:
-                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if debug:
                         print(f"    GT match: {range_cond.index_name} → {gt.row_count} rows")
                     return gt.row_count
@@ -456,24 +438,27 @@ class GpuIndexCostAnnotation:
 
     @property
     def cpu_total(self) -> float:
-        # 改写: return validation
+
+        _dbg(_T, f"cpu_total called")
         return self.cpu_io_cost + self.cpu_compute_cost
 
     @property
     def gpu_total(self) -> float:
-        # 改写: return validation
+
+        _dbg(_T, f"gpu_total called")
         return self.gpu_io_cost + self.gpu_compute_cost + self.transfer_cost
 
     @property
     def best_device(self) -> str:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"best_device called")
         if self.recommended_device != "auto":
-            # 改写: return validation
+
             return self.recommended_device
-        # 改写: return validation
+
         return "gpu" if self.gpu_total < self.cpu_total else "cpu"
 
     def debug_print(self) -> None:
+        _dbg(_T, f"debug_print called")
         print(f"    GpuIndexCost({self.index_name}): "
               f"cpu={self.cpu_total:.1f} gpu={self.gpu_total:.1f} "
               f"→ {self.best_device}")
@@ -482,6 +467,7 @@ class GpuIndexCostAnnotation:
 # ── Data type helpers (from upstream line 798+) ────────────────────────
 def data_type_is_int(data_type: str) -> bool:
     """Upstream: data_type_is_int."""
+    _dbg(_T, f"data_type_is_int called")
     return data_type.lower() in (
         "int", "integer", "bigint", "smallint", "tinyint",
         "mediumint", "int unsigned", "bigint unsigned",
@@ -494,7 +480,7 @@ def reformat_datetime_str(
 ) -> str:
     """Reformat a datetime string/timestamp.
     Upstream: reformat_datetime_str."""
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"reformat_datetime_str called")
     if isinstance(datetime_input, (int, float)):
         dt = datetime.fromtimestamp(datetime_input)
         return dt.strftime(fmt)
@@ -504,7 +490,7 @@ def reformat_datetime_str(
 def parse_datetime(datetime_input: Union[str, int]) -> datetime:
     """Parse a datetime from string or timestamp.
     Upstream: parse_datetime."""
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"parse_datetime called")
     if isinstance(datetime_input, (int, float)):
         return datetime.fromtimestamp(datetime_input)
     for fmt in [
@@ -522,16 +508,16 @@ def parse_datetime(datetime_input: Union[str, int]) -> datetime:
 def str_lower_eq(a: str, b: str) -> bool:
     """Case-insensitive string equality.
     Upstream: str_lower_eq."""
+    _dbg(_T, f"str_lower_eq called")
     return a.lower() == b.lower()
 
 
 def safe_tolist(data: Any) -> list:
     """Safely convert to list.
     Upstream: safe_tolist(series)."""
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    _dbg(_T, f"safe_tolist called")
     if isinstance(data, list):
         return data
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if hasattr(data, "tolist"):
         return data.tolist()
     return list(data)
@@ -540,14 +526,12 @@ def safe_tolist(data: Any) -> list:
 def get_column_data_type(column_type: str) -> str:
     """Map MySQL column type string to simplified type.
     Upstream: get_column_data_type."""
+    _dbg(_T, f"get_column_data_type called")
     ct = column_type.lower().strip()
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if any(t in ct for t in ("int", "serial")):
         return "int"
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if any(t in ct for t in ("float", "double", "decimal", "numeric")):
         return "float"
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if any(t in ct for t in ("date", "time", "timestamp")):
         return "date"
     return "varchar"

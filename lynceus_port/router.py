@@ -38,6 +38,7 @@ class Router:
     """策略注册表 + 查询分发器."""
 
     def __init__(self, engine: CostModelEngine):
+        _dbg(_T, f"__init__ called")
         self._engine = engine
         self._registry: Dict[str, RoutingStrategyBase] = {}
         self._active: Optional[RoutingStrategyBase] = None
@@ -48,6 +49,7 @@ class Router:
     # --- Registry ---
 
     def register(self, strategy: RoutingStrategyBase) -> None:
+        _dbg(_T, f"register called")
         if strategy.name in self._registry:
             raise ValueError(
                 f"Strategy '{strategy.name}' already registered. "
@@ -57,9 +59,11 @@ class Router:
         _dbg(_T, f"register({strategy.name})")
 
     def replace(self, strategy: RoutingStrategyBase) -> None:
+        _dbg(_T, f"replace called")
         self._registry[strategy.name] = strategy
 
     def unregister(self, name: str) -> None:
+        _dbg(_T, f"unregister called")
         if name not in self._registry:
             raise KeyError(f"Strategy '{name}' not found in registry")
         if self._active is not None and self._active.name == name:
@@ -68,9 +72,11 @@ class Router:
 
     @property
     def registered_names(self) -> List[str]:
+        _dbg(_T, f"registered_names called")
         return list(self._registry.keys())
 
     def get(self, name: str) -> RoutingStrategyBase:
+        _dbg(_T, f"get called")
         if name not in self._registry:
             raise KeyError(
                 f"Strategy '{name}' not found. "
@@ -86,18 +92,21 @@ class Router:
 
     @property
     def active(self) -> RoutingStrategyBase:
+        _dbg(_T, f"active called")
         if self._active is None:
             raise RuntimeError("No active strategy set. Call set_active() first.")
         return self._active
 
     @property
     def active_name(self) -> Optional[str]:
+        _dbg(_T, f"active_name called")
         return self._active.name if self._active else None
 
     # --- Routing ---
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
+        _dbg(_T, f"route_one called")
         dec = self.active.route_one(query, data_location)
         self._history.append(dec)
         return dec
@@ -112,6 +121,7 @@ class Router:
         作为 batch_hint 传给 strategy (如果它支持的话).
         这让 adaptive 策略能做全局决策而非逐条贪心.
         """
+        _dbg(_T, f"route_batch called")
         strategy = self.active
 
         # [PORT] 构建批量前瞻 hint
@@ -143,6 +153,7 @@ class Router:
 
     @classmethod
     def create_default(cls, engine: CostModelEngine, **kwargs) -> "Router":
+        _dbg(_T, f"create_default called")
         router = cls(engine)
         router.register(GPUOnlyStrategy(engine, **kwargs))
         router.register(CPUOnlyStrategy(engine, **kwargs))
@@ -166,6 +177,7 @@ class Router:
         最低得 0 分, 最高得 len(strategies)-1 分.
         最终 Borda 得分最低的策略全局最优.
         """
+        _dbg(_T, f"run_all_strategies called")
         names = strategy_names or self.registered_names
         results: Dict[str, List[RoutingDecision]] = {}
         for name in names:
@@ -195,6 +207,7 @@ class Router:
     # [PORT] 路由历史分析
     def dump_history_summary(self) -> Dict[str, int]:
         """断点辅助: 按 device_id 统计路由历史."""
+        _dbg(_T, f"dump_history_summary called")
         counts: Dict[str, int] = defaultdict(int)
         for dec in self._history:
             counts[dec.device_id] += 1

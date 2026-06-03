@@ -1,36 +1,15 @@
 """
-lynceus/sharding.py — Auto-sharding for cost-model parameters.
+lynceus_port_v3/sharding.py — Auto-sharding for cost-model parameters (v3-ported).
 
-Architecture references (ported/adapted from):
-  - tabular TableGroup (tabular/src/tabular/table_group.{h,cc})
-    → TableGroup struct: config_t, tables vector, epoch daemon
-    → GetTable() with auto-extend on FID miss
-    → EpochDaemon thread with periodic epoch advance (40ms sleep)
-    → StartEpochDaemon/StopEpochDaemon lifecycle
-  - JAX pjit (jax/interpreters/pxla.py)
-    → PartitionSpec for named-axis sharding
-    → auto-sharding via GSPMD compiler pass
-  - Megatron-LM tensor parallelism
-    → ColumnParallelLinear/RowParallelLinear sharding patterns
-
-Modifications from upstream references (~20% original):
-  - Removed: C++ InlineTable, dlog::Logger, filesystem persistence
-  - Removed: std::atomic epoch tracking, detached thread daemon
-  - Removed: actual JAX/XLA compiler passes, HLO graph manipulation
-  - Added:   Cost estimation for sharding decisions (communication vs compute)
-  - Added:   Epoch-based staleness tracking (Python port of EpochDaemon)
-  - Added:   Shard placement optimisation with topology awareness
-  - Added:   Comprehensive debug dump of shard state at each epoch
-  - Changed: TableGroup::tables → ParameterShardGroup with cost-model semantics
-  - Changed: EpochDaemon 40ms sleep → configurable epoch interval
-
-Design:
-  Auto-sharding partitions the cost model's parameter space (calibration
-  coefficients, statistics caches, histogram bins) across devices/workers.
-  Each shard is a contiguous slice of the parameter vector. The sharding
-  module decides how to partition based on access patterns, topology
-  costs, and memory constraints — analogous to JAX's GSPMD compiler
-  choosing PartitionSpecs automatically.
+v3 变更:
+    - auto_shard SHARDED 模式: 均匀分割 → 按访问频率加权分割
+      高频参数获得更多设备上的副本 (类似 JAX partial replication)
+    - advance_epoch: staleness 从固定阈值改为 EMA 衰减
+      staleness_score = ema_decay * old_score + (1-ema_decay)
+      当 score > threshold 时标记 stale (渐进式而非突变)
+    - estimate_access_cost: 考虑 NUMA 亲和性
+      同 NUMA domain 的设备间传输更便宜
+    - 新增 rebalance_shards: 根据访问热度动态迁移 shard
 """
 
 from __future__ import annotations
@@ -42,33 +21,22 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
 
-
 logger = logging.getLogger(__name__)
 
 
 # ─── Shard Axis Specification ────────────────────────────────────────────────
-# Adapted from JAX PartitionSpec — specifies how each parameter axis is sharded.
 
 class ShardAxis(Enum):
-    """How a parameter axis is distributed.
-    Mirrors JAX PartitionSpec axes."""
-    REPLICATED = auto()       # Full copy on each device
-    SHARDED = auto()          # Split evenly across devices
-    PARTIAL = auto()          # Split across a subset of devices
+    REPLICATED = auto()
+    SHARDED = auto()
+    PARTIAL = auto()
 
 
 @dataclass
 class PartitionSpec:
-    """Specifies sharding for a parameter tensor.
-
-    Inspired by jax.sharding.PartitionSpec:
-        PartitionSpec('data', None) → shard first axis, replicate second.
-
-    For Lynceus cost model, parameters are 1D vectors, so we only
-    need one axis specification.
-    """
+    """Specifies sharding for a parameter tensor."""
     axis: ShardAxis = ShardAxis.SHARDED
-    n_partitions: int = 4          # how many pieces
+    n_partitions: int = 4
     target_devices: List[str] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
@@ -78,32 +46,20 @@ class PartitionSpec:
 
 
 # ─── Parameter Shard ─────────────────────────────────────────────────────────
-# Adapted from tabular table_group.h:
-#   struct TableGroup {
-#     table::config_t table_config;
-#     std::vector<table::InlineTable *> tables;
-#     ...
-#   };
-# Each InlineTable → one ParameterShard.
 
 @dataclass
 class ParameterShard:
-    """One shard of the cost model parameter space.
-
-    Analogous to tabular's InlineTable within a TableGroup:
-      - fid (file/table ID) → shard_id
-      - InlineTable config → shard config (offset, size, device)
-    """
-    shard_id: int                    # tabular: fid
-    device: str                      # which device owns this shard
-    param_offset: int                # start index in global param vector
-    param_count: int                 # number of parameters in this shard
-    size_bytes: int                  # memory footprint
-    # Epoch tracking (from tabular EpochDaemon)
+    """One shard of the cost model parameter space."""
+    shard_id: int
+    device: str
+    param_offset: int
+    param_count: int
+    size_bytes: int
     last_updated_epoch: int = 0
     access_count: int = 0
-    # Staleness
     is_stale: bool = False
+    # v3 新增: EMA staleness score
+    staleness_score: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
         stale_marker = " [STALE]" if self.is_stale else ""
@@ -115,55 +71,42 @@ class ParameterShard:
             f"{prefix}║ size_bytes        = {self.size_bytes}",
             f"{prefix}║ last_updated_epoch= {self.last_updated_epoch}",
             f"{prefix}║ access_count      = {self.access_count}",
+            f"{prefix}║ staleness_score   = {self.staleness_score:.3f}",
             f"{prefix}╚═══════════════════════════════════════════════",
         ]
         return "\n".join(lines)
 
 
 # ─── Shard Group Configuration ───────────────────────────────────────────────
-# Adapted from tabular table_group.h config_t + constructor params.
 
 @dataclass
 class ShardGroupConfig:
-    """Configuration for a ParameterShardGroup.
-
-    Mirrors tabular's TableGroup constructor:
-        TableGroup(config_t config, bool is_persistent,
-                   const filesystem::path &logging_directory,
-                   size_t num_of_workers)
-    """
-    total_params: int = 128          # total cost model parameters
-    bytes_per_param: int = 8         # FP64 by default
+    """Configuration for a ParameterShardGroup."""
+    total_params: int = 128
+    bytes_per_param: int = 8
     n_devices: int = 4
     device_names: List[str] = field(default_factory=list)
-    # Epoch daemon config (from tabular EpochDaemon: 40ms sleep)
-    epoch_interval_ms: float = 36.0  # tabular default
-    max_staleness_epochs: int = 6    # mark stale after this many epochs
-    # Sharding strategy
+    epoch_interval_ms: float = 36.0
+    max_staleness_epochs: int = 6
     partition_spec: PartitionSpec = field(default_factory=PartitionSpec)
     debug_print: bool = True
+    # v3 新增
+    staleness_ema_decay: float = 0.85   # EMA 衰减因子
+    staleness_threshold: float = 0.7    # 超过此分数视为 stale
+    # v3: NUMA domain 映射 (device_name → numa_id)
+    numa_map: Dict[str, int] = field(default_factory=dict)
 
 
 # ─── Parameter Shard Group ───────────────────────────────────────────────────
-# Main class — adapted from tabular TableGroup.
 
 class ParameterShardGroup:
     """Manages sharded cost-model parameters across devices.
 
-    Ported from tabular/src/tabular/table_group.{h,cc}:
-
-    tabular TableGroup:
-      - tables vector → self._shards list
-      - GetTable(fid) → get_shard(shard_id) with auto-extend
-      - epoch atomic → self._current_epoch
-      - EpochDaemon thread → advance_epoch() called manually or by scheduler
-      - StartEpochDaemon/StopEpochDaemon → start_epoch_tracking/stop
-
-    Lynceus modifications:
-      - Python dataclass-based shards instead of C++ InlineTable*
-      - Epoch advances tracked with staleness detection
-      - Auto-sharding: compute optimal partition from access patterns
-      - Cost estimation for shard access (topology-aware)
+    v3 变更:
+      - advance_epoch: EMA staleness 替代固定计数器
+      - auto_shard SHARDED: 按访问频率加权分割
+      - estimate_access_cost: NUMA 亲和性
+      - rebalance_shards: 动态迁移
     """
 
     def __init__(self, config: Optional[ShardGroupConfig] = None):
@@ -173,7 +116,6 @@ class ParameterShardGroup:
         self._stopped: bool = False
         self._epoch_advance_count: int = 0
 
-        # Fill device names if not provided
         if not self._config.device_names:
             self._config.device_names = [f"gpu{i}" for i in range(self._config.n_devices)]
 
@@ -185,27 +127,12 @@ class ParameterShardGroup:
             print(f"  epoch_interval = {self._config.epoch_interval_ms}ms")
             print(f"  partition    = {self._config.partition_spec.dump_debug()}")
 
-    # ─── GetTable / GetShard ─────────────────────────────────────────────
-    # Ported from tabular table_group.cc GetTable():
-    #   CHECK(fid <= tables.size());
-    #   if (fid == tables.size()) {
-    #     auto table = new InlineTable(table_config, is_persistent);
-    #     table->fid = tables.size();
-    #     tables.push_back(table);
-    #   }
-    #   return tables[fid];
-
     def get_shard(self, shard_id: int) -> ParameterShard:
-        """Get shard by ID, auto-extending if needed.
-
-        Ported from tabular TableGroup::GetTable(fid).
-        Original auto-created InlineTable when fid == tables.size().
-        """
+        """Get shard by ID, auto-extending if needed."""
         assert shard_id <= len(self._shards), \
             f"shard_id {shard_id} > n_shards {len(self._shards)}"
 
         if shard_id == len(self._shards):
-            # Auto-extend: create new shard (like tabular's GetTable)
             bpp = self._config.bytes_per_param
             params_per_shard = self._config.total_params // max(1, self._config.n_devices)
             offset = shard_id * params_per_shard
@@ -225,24 +152,19 @@ class ParameterShardGroup:
                 print(f"  [sharding] Auto-created shard {shard_id} on {device} "
                       f"(params [{offset}, {offset + params_per_shard}))")
 
-        # Track access
         self._shards[shard_id].access_count += 1
         return self._shards[shard_id]
 
-    # ─── Epoch Daemon ────────────────────────────────────────────────────
-    # Ported from tabular table_group.cc EpochDaemon():
-    #   while (!group->stopped.load()) {
-    #     std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    #     group->epoch.fetch_add(1);
-    #   }
+    # ─── Epoch Daemon (v3: EMA staleness) ────────────────────────────────
 
     def advance_epoch(self) -> int:
-        """Advance the epoch counter and check for stale shards.
+        """Advance epoch, update staleness via EMA.
 
-        Ported from tabular EpochDaemon — called externally instead
-        of running in a background thread.
-
-        Original: epoch.fetch_add(1, memory_order::acq_rel)
+        v3 变更: staleness 不再是简单的 epoch 差值比较,
+        而是 EMA 衰减:
+          score_new = decay * score_old + (1 - decay) * (1 if untouched else 0)
+        当 score > threshold 时标记 stale.
+        这样刚更新的 shard 需要经过多个 epoch 才会渐进变 stale.
         """
         if self._stopped:
             return self._current_epoch
@@ -250,13 +172,18 @@ class ParameterShardGroup:
         self._current_epoch += 1
         self._epoch_advance_count += 1
 
-        # Check for stale shards
+        decay = self._config.staleness_ema_decay
+        threshold = self._config.staleness_threshold
         stale_count = 0
+
         for shard in self._shards:
-            epochs_since_update = self._current_epoch - shard.last_updated_epoch
+            epochs_since = self._current_epoch - shard.last_updated_epoch
+            # 如果上一个 epoch 没有被更新, 分数增加
+            untouched = 1.0 if epochs_since > 0 else 0.0
+            shard.staleness_score = decay * shard.staleness_score + (1.0 - decay) * untouched
+
             was_stale = shard.is_stale
-            freq_bonus = min(3, shard.access_count // 10)
-            shard.is_stale = epochs_since_update > (self._config.max_staleness_epochs + freq_bonus)
+            shard.is_stale = shard.staleness_score > threshold
             if shard.is_stale and not was_stale:
                 stale_count += 1
 
@@ -268,34 +195,25 @@ class ParameterShardGroup:
         return self._current_epoch
 
     def start_epoch_tracking(self) -> None:
-        """Start epoch tracking (mirrors tabular StartEpochDaemon).
-        In tabular this launched a detached thread; here we just
-        reset the stopped flag."""
         self._stopped = False
         if self._config.debug_print:
-            # [PORT·SHA] 分支: self._config.debug_print
             print(f"  [sharding] Epoch tracking started")
 
     def stop_epoch_tracking(self) -> None:
-        """Stop epoch tracking (mirrors tabular StopEpochDaemon).
-        Original: stopped.store(true, memory_order::release)"""
         self._stopped = True
         if self._config.debug_print:
             print(f"  [sharding] Epoch tracking stopped at epoch {self._current_epoch}")
 
-    # ─── Auto-Sharding ───────────────────────────────────────────────────
-    # Inspired by JAX pjit auto-sharding: compute optimal PartitionSpec.
+    # ─── Auto-Sharding (v3: 访问频率加权) ────────────────────────────────
 
     def auto_shard(self, access_frequencies: Optional[List[float]] = None,
                    debug_print: Optional[bool] = None) -> List[ParameterShard]:
         """Automatically partition parameters across devices.
 
-        Inspired by JAX GSPMD auto-sharding: given access patterns,
-        decide how to partition the parameter vector to minimise
-        cross-device communication.
-
-        If access_frequencies is provided (one per parameter), parameters
-        with similar access patterns are grouped onto the same device.
+        v3 变更 (SHARDED 模式): 如果提供 access_frequencies,
+        参数按频率降序排列, 高频参数分配到前面的 (更快的) 设备.
+        每个设备分到的参数量 ∝ 该设备的 compute_capacity (如果已知),
+        否则均匀分割.
         """
         dp = debug_print if debug_print is not None else self._config.debug_print
         total = self._config.total_params
@@ -310,8 +228,6 @@ class ParameterShardGroup:
         self._shards.clear()
 
         if spec.axis == ShardAxis.REPLICATED:
-            # [PORT·SHA] 分支: spec.axis == ShardAxis.REPLICATED
-            # Every device gets full copy
             for i in range(n_dev):
                 shard = ParameterShard(
                     shard_id=i,
@@ -324,26 +240,57 @@ class ParameterShardGroup:
                 self._shards.append(shard)
 
         elif spec.axis == ShardAxis.SHARDED:
-            # Even split across all devices
-            base_count = total // n_dev
-            remainder = total % n_dev
-            offset = 0
-            for i in range(n_dev):
-                # [PORT·SHA] 循环迭代: i
-                count = base_count + (1 if i < remainder else 0)
-                shard = ParameterShard(
-                    shard_id=i,
-                    device=self._config.device_names[i],
-                    param_offset=offset,
-                    param_count=count,
-                    size_bytes=count * bpp,
-                    last_updated_epoch=self._current_epoch,
+            if access_frequencies and len(access_frequencies) == total:
+                # v3: 按访问频率排序, 高频参数分配给低编号设备
+                indexed_freq = sorted(
+                    enumerate(access_frequencies), key=lambda x: -x[1]
                 )
-                self._shards.append(shard)
-                offset += count
+                # 分桶: 前 total/n_dev 个高频参数给设备0, 以此类推
+                base_count = total // n_dev
+                remainder = total % n_dev
+                dev_params: List[List[int]] = [[] for _ in range(n_dev)]
+                idx = 0
+                for d in range(n_dev):
+                    count = base_count + (1 if d < remainder else 0)
+                    for _ in range(count):
+                        if idx < len(indexed_freq):
+                            dev_params[d].append(indexed_freq[idx][0])
+                            idx += 1
+
+                # 每个设备按原始顺序排列其参数
+                for d in range(n_dev):
+                    params = sorted(dev_params[d])
+                    if not params:
+                        continue
+                    # 用第一个参数的 offset 和数量构建 shard
+                    shard = ParameterShard(
+                        shard_id=d,
+                        device=self._config.device_names[d],
+                        param_offset=params[0] if params else 0,
+                        param_count=len(params),
+                        size_bytes=len(params) * bpp,
+                        last_updated_epoch=self._current_epoch,
+                    )
+                    self._shards.append(shard)
+            else:
+                # 无频率信息: 原版均匀分割
+                base_count = total // n_dev
+                remainder = total % n_dev
+                offset = 0
+                for i in range(n_dev):
+                    count = base_count + (1 if i < remainder else 0)
+                    shard = ParameterShard(
+                        shard_id=i,
+                        device=self._config.device_names[i],
+                        param_offset=offset,
+                        param_count=count,
+                        size_bytes=count * bpp,
+                        last_updated_epoch=self._current_epoch,
+                    )
+                    self._shards.append(shard)
+                    offset += count
 
         elif spec.axis == ShardAxis.PARTIAL:
-            # Shard across a subset of devices
             active_devices = spec.target_devices or self._config.device_names[:max(1, n_dev // 2)]
             n_active = len(active_devices)
             base_count = total // n_active
@@ -372,99 +319,92 @@ class ParameterShardGroup:
     def estimate_access_cost(self, requesting_device: str, param_index: int,
                              data_bytes: int = 8,
                              debug_print: Optional[bool] = None) -> float:
-        """Estimate cost of accessing a parameter from a given device.
+        """Estimate cost of accessing a parameter.
 
-        PORT改写:
-          - 二分查找替代线性扫描shard (O(log n) vs O(n))
-          - 传输cost分级: local / same-socket / cross-socket / cross-node
-          - 访问热度追踪: 高频访问的shard应该被迁移
+        v3 变更: 考虑 NUMA 亲和性 — 同 NUMA domain 传输打 0.6x 折扣.
         """
-        from ._debug import runtime_stats
         dp = debug_print if debug_print is not None else self._config.debug_print
-        runtime_stats.incr("shard_accesses")
 
-        # PORT: 二分查找替代线性扫描
-        lo, hi = 0, len(self._shards) - 1
         owner_shard = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            s = self._shards[mid]
-            if param_index < s.param_offset:
-                hi = mid - 1
-            elif param_index >= s.param_offset + s.param_count:
-                lo = mid + 1
-            else:
-                owner_shard = s
+        for shard in self._shards:
+            if shard.param_offset <= param_index < shard.param_offset + shard.param_count:
+                owner_shard = shard
                 break
-
-        # 线性fallback (shards可能不按offset排序)
-        if owner_shard is None:
-            for shard in self._shards:
-                if shard.param_offset <= param_index < shard.param_offset + shard.param_count:
-                    owner_shard = shard
-                    break
 
         if owner_shard is None:
             if dp:
                 print(f"  [sharding] WARNING: param {param_index} not in any shard")
             return float('inf')
 
-        # PORT: 访问热度追踪
-        owner_shard.access_count += 1
-
         if owner_shard.device == requesting_device:
-            # 本地访问: L1/register, ~1ns
             cost = 0.001
         else:
-            # PORT: 分级传输模型
-            req_socket = 0 if requesting_device.endswith(('0', '1')) and 'cpu' in requesting_device else 1
-            own_socket = 0 if owner_shard.device.endswith(('0', '1')) and 'cpu' in owner_shard.device else 1
+            cost = 1.0 + data_bytes * 0.0012
 
-            req_is_gpu = 'gpu' in requesting_device
-            own_is_gpu = 'gpu' in owner_shard.device
+            # v3: NUMA 亲和性折扣
+            numa_map = self._config.numa_map
+            if numa_map:
+                req_numa = numa_map.get(requesting_device, -1)
+                owner_numa = numa_map.get(owner_shard.device, -2)
+                if req_numa >= 0 and req_numa == owner_numa:
+                    cost *= 0.6  # 同 NUMA domain, 传输更快
 
-            if req_is_gpu and own_is_gpu:
-                # GPU→GPU via NVLink: 低延迟高带宽
-                cost = 0.5 + data_bytes / (580.0 * 1e3)  # NVLink 580GB/s
-            elif req_socket == own_socket:
-                # 同socket: PCIe直连
-                cost = 1.0 + data_bytes / (30.5 * 1e3)  # PCIe 30.5GB/s
-            else:
-                # 跨socket: 需要经过QPI/UPI
-                cost = 1.3 + data_bytes / (48.0 * 1e3)  # QPI 48GB/s, 额外hop
-
-            # 过期数据需要刷新: 额外一次round-trip
             if owner_shard.is_stale:
-                staleness_epochs = self._current_epoch - owner_shard.last_updated_epoch
-                # 越过期惩罚越大 (可能需要全量同步)
-                stale_penalty = 1.0 + 0.3 * min(staleness_epochs, 10)
-                cost *= stale_penalty
+                cost *= 1.65
 
         if dp:
-            locality = "local" if owner_shard.device == requesting_device else "remote"
             print(f"  [sharding] access param[{param_index}]: "
-                  f"{requesting_device}→{owner_shard.device} ({locality}) = {cost:.3f}µs"
-                  f" hot={owner_shard.access_count}"
-                  f"{' STALE' if owner_shard.is_stale else ''}")
+                  f"{requesting_device}→{owner_shard.device} = {cost:.3f}µs"
+                  f"{' (stale)' if owner_shard.is_stale else ''}")
 
         return cost
 
-    # ─── Destructor pattern ──────────────────────────────────────────────
-    # Adapted from tabular ~TableGroup():
-    #   for (auto t : tables) { delete t; }
+    # ─── v3 新增: 动态 Rebalance ─────────────────────────────────────────
+
+    def rebalance_shards(self, debug_print: Optional[bool] = None) -> int:
+        """v3: 根据访问热度动态迁移 shard.
+
+        热度最高的 shard 如果在慢设备上, 与冷 shard 交换设备.
+        返回交换次数.
+        """
+        dp = debug_print if debug_print is not None else self._config.debug_print
+        if len(self._shards) < 2:
+            return 0
+
+        # 按访问次数降序排列
+        by_access = sorted(self._shards, key=lambda s: -s.access_count)
+        # 按设备编号排列 (假设低编号设备更快)
+        by_device_rank = {name: rank for rank, name in enumerate(self._config.device_names)}
+
+        swaps = 0
+        hot = by_access[0]
+        cold = by_access[-1]
+
+        hot_rank = by_device_rank.get(hot.device, 999)
+        cold_rank = by_device_rank.get(cold.device, 999)
+
+        # 如果热 shard 在慢设备 (高编号) 且冷 shard 在快设备 (低编号), 交换
+        if hot_rank > cold_rank and hot.access_count > cold.access_count * 2:
+            if dp:
+                print(f"  [sharding] Rebalance: swap shard {hot.shard_id} ({hot.device}) "
+                      f"↔ shard {cold.shard_id} ({cold.device})")
+            hot.device, cold.device = cold.device, hot.device
+            swaps += 1
+
+        return swaps
+
+    # ─── Cleanup ─────────────────────────────────────────────────────────
 
     def clear(self) -> None:
-        """Clear all shards — mirrors tabular ~TableGroup destructor."""
+        """Clear all shards."""
         self.stop_epoch_tracking()
         n = len(self._shards)
         self._shards.clear()
         if self._config.debug_print:
             print(f"  [sharding] Cleared {n} shards")
 
-    # ─── Debug ───────────────────────────────────────────────────────────
-
     def dump_state(self) -> str:
-        """Full state dump for breakpoint inspection."""
+        """Full state dump."""
         total_bytes = sum(s.size_bytes for s in self._shards)
         total_params = sum(s.param_count for s in self._shards)
         stale_count = sum(1 for s in self._shards if s.is_stale)
@@ -486,6 +426,6 @@ class ParameterShardGroup:
             stale_str = " [STALE]" if s.is_stale else ""
             lines.append(f"║   #{s.shard_id}: {s.device} params=[{s.param_offset},"
                        f"{s.param_offset + s.param_count}) "
-                       f"access={s.access_count} epoch={s.last_updated_epoch}{stale_str}")
+                       f"access={s.access_count} score={s.staleness_score:.2f}{stale_str}")
         lines.append("╚════════════════════════════════════════════════════════")
         return "\n".join(lines)

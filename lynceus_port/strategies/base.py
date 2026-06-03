@@ -42,6 +42,7 @@ class RoutingDecision:
 class RoutingStrategyBase(ABC):
 
     def __init__(self, engine: CostModelEngine, **kwargs):
+        _dbg(_T, f"__init__ called")
         self._engine = engine
         self._query_count = 0
         # [PORT] batch hint 钩子
@@ -66,6 +67,7 @@ class RoutingStrategyBase(ABC):
         原版是纯 for 循环. 移植版记录每条决策耗时,
         批次结束后计算 throughput 和 P99, 输出到调试.
         """
+        _dbg(_T, f"route_batch called")
         t0 = time.monotonic()
         per_query_ns = []
         results = []
@@ -89,9 +91,11 @@ class RoutingStrategyBase(ABC):
 
     def observe(self, query_id: str, device_id: str,
                 actual_latency_us: float) -> None:
+        _dbg(_T, f"observe called")
         pass
 
     def reset(self) -> None:
+        _dbg(_T, f"reset called")
         self._query_count = 0
         self._batch_hint = None
 
@@ -102,6 +106,7 @@ class RoutingStrategyBase(ABC):
         _dbg(_T, f"set_batch_hint: {hint.get('batch_size', '?')} queries")
 
     def get_batch_hint(self) -> Optional[Dict[str, Any]]:
+        _dbg(_T, f"get_batch_hint called")
         return self._batch_hint
 
     @staticmethod
@@ -111,6 +116,7 @@ class RoutingStrategyBase(ABC):
         [PORT] IQR 异常值检测: 不剔除, 只在 metadata 里标记
         is_outlier=True, 供 benchmark 分析. 阈值 = Q3 + 1.5*IQR.
         """
+        _dbg(_T, f"decisions_to_latencies called")
         latencies = [d.cost.total_ms for d in decisions]
 
         if len(latencies) >= 4:

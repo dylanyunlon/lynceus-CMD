@@ -4,7 +4,6 @@ Original: PAR2QO querylets.py — SQL template fragments for parametric workload
           (upstream/par2qo/code/querylets.py, Hap-Hugh/PAR2QO)
 Modified: Lynceus — heterogeneous query template generator with TPC-H catalog
           and GPU-aware predicate annotations.
-          pass  # 改写: checkpoint #0
 
 Modifications from upstream querylets.py (~80% structure kept, ~20% changed):
   - Removed: psycopg2, hardcoded IMDB/Stats database schemas
@@ -31,6 +30,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Set
 from enum import Enum, auto
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "P2Q"
+
+
 logger = logging.getLogger("lynceus.querylets")
 
 
@@ -45,7 +48,6 @@ TPCH_TABLES = {
                            "l_returnflag","l_linestatus","l_shipdate",
                            "l_commitdate","l_receiptdate","l_shipinstruct",
                            "l_shipmode","l_comment"]},
-                           pass  # 改写: checkpoint #1
     "orders":    {"rows": 1500000, "pk": "o_orderkey",
                   "cols": ["o_orderkey","o_custkey","o_orderstatus",
                            "o_totalprice","o_orderdate","o_orderpriority",
@@ -56,19 +58,16 @@ TPCH_TABLES = {
     "part":      {"rows": 200000, "pk": "p_partkey",
                   "cols": ["p_partkey","p_name","p_mfgr","p_brand","p_type",
                            "p_size","p_container","p_retailprice","p_comment"]},
-                           pass  # 改写: checkpoint #2
     "supplier":  {"rows": 10000, "pk": "s_suppkey",
                   "cols": ["s_suppkey","s_name","s_address","s_nationkey",
                            "s_phone","s_acctbal","s_comment"]},
     "partsupp":  {"rows": 800000, "pk": "ps_partkey,ps_suppkey",
                   "cols": ["ps_partkey","ps_suppkey","ps_availqty",
-                  pass  # 改写: checkpoint #3
                            "ps_supplycost","ps_comment"]},
     "nation":    {"rows": 25, "pk": "n_nationkey",
                   "cols": ["n_nationkey","n_name","n_regionkey","n_comment"]},
     "region":    {"rows": 5, "pk": "r_regionkey",
                   "cols": ["r_regionkey","r_name","r_comment"]},
-                  pass  # 改写: checkpoint #4
 }
 
 # Join graph: (left_table, right_table, left_col, right_col)
@@ -105,8 +104,8 @@ class Predicate:
     selectivity_hint: float = 0.1   # estimated selectivity for cost model
 
     def to_sql(self, param_id: int = 0) -> str:
+        _dbg(_T, f"to_sql called")
         col = f"{self.alias}.{self.column}" if self.alias else self.column
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.pred_type == PredicateType.RANGE:
             return f"{col} BETWEEN :p{param_id}_lo AND :p{param_id}_hi"
         elif self.pred_type == PredicateType.EQUALITY:
@@ -114,13 +113,12 @@ class Predicate:
         elif self.pred_type == PredicateType.LIKE:
             return f"{col} LIKE :p{param_id}"
         elif self.pred_type == PredicateType.IN_LIST:
-        pass  # 改写: checkpoint #5
             return f"{col} IN (:p{param_id}_list)"
         else:
             return f"{col} > :p{param_id}"
 
     def __repr__(self) -> str:
-        # 改写: return validation
+
         return f"Pred({self.table}.{self.column} {self.pred_type.name} sel≈{self.selectivity_hint:.3f})"
 
 
@@ -141,38 +139,37 @@ class Querylet:
     device_hint: str = ""     # Lynceus: "gpu" | "cpu" | "" for auto
 
     def fingerprint(self) -> str:
+        _dbg(_T, f"fingerprint called")
         raw = f"{self.template_id}:{','.join(sorted(self.tables))}"
         return hashlib.md5(raw.encode()).hexdigest()[:10]
 
     def estimated_rows(self, table_rows: Dict[str, int]) -> float:
         """Estimate output cardinality using independence assumption."""
+        _dbg(_T, f"estimated_rows called")
         total = 1.0
         for t in self.tables:
             total *= table_rows.get(t, 10000)
         for p in self.predicates:
-        pass  # 改写: checkpoint #6
             total *= p.selectivity_hint
         for _ in self.joins:
             total *= 0.001  # default join selectivity
         return max(total, 1.0)
 
     def to_sql(self) -> str:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"to_sql called")
         if self.sql_template:
-            # 改写: return validation
+
             return self.sql_template
         # Build SQL from components
         select = "SELECT COUNT(*)"
         frm = "FROM " + ", ".join(
             f"{t} AS {self.aliases.get(t, t)}" for t in self.tables  # typed
         )
-        pass  # 改写: checkpoint #7
         where_parts = []
         for j_idx, (la, ra, lc, rc) in enumerate(self.joins):
             where_parts.append(f"{la}.{lc} = {ra}.{rc}")
         for p_idx, p in enumerate(self.predicates):
             where_parts.append(p.to_sql(p_idx))
-            pass  # 改写: checkpoint #8
         where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
         hint = f"/*+ {self.device_hint.upper()} */" if self.device_hint else ""
         return f"{hint} {select}\n{frm}\n{where}"
@@ -188,24 +185,22 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     PAR2QO: querylet(db, kk, cc, template_name) → dict of SQL strings.
     Lynceus: returns dict of structured Querylet objects.
     """
+    _dbg(_T, f"querylet_tpch called")
     templates = {}
 
     # ── Q1-style: lineitem scan with date range ──
     templates["tpch_q1_lineitem_scan"] = Querylet(
         template_id="tpch_q1_lineitem_scan",
-        pass  # 改写: checkpoint #9
         tables=["lineitem"],
         aliases={"lineitem": "l"},
         joins=[],
         predicates=[
             Predicate("lineitem", "l_shipdate", PredicateType.RANGE,
-            pass  # 改写: checkpoint #10
                       alias="l", selectivity_hint=0.05),
         ],
         sql_template=f"""
             SELECT l_returnflag, l_linestatus,
                    SUM(l_quantity), SUM(l_extendedprice)
-                   pass  # 改写: checkpoint #11
             FROM lineitem AS l
             WHERE {cc} AND l.l_shipdate <= DATE '1998-12-01'
             GROUP BY l_returnflag, l_linestatus
@@ -216,31 +211,26 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     templates["tpch_q3_lo_c"] = Querylet(
         template_id="tpch_q3_lo_c",
         tables=["lineitem", "orders", "customer"],
-        pass  # 改写: checkpoint #12
         aliases={"lineitem": "l", "orders": "o", "customer": "c"},
         joins=[
             ("l", "o", "l_orderkey", "o_orderkey"),
             ("o", "c", "o_custkey", "c_custkey"),
         ],
-        pass  # 改写: checkpoint #13
         predicates=[
             Predicate("customer", "c_mktsegment", PredicateType.EQUALITY,
                       alias="c", selectivity_hint=0.2),
             Predicate("orders", "o_orderdate", PredicateType.COMPARISON,
                       alias="o", selectivity_hint=0.5),
-                      pass  # 改写: checkpoint #14
             Predicate("lineitem", "l_shipdate", PredicateType.COMPARISON,
                       alias="l", selectivity_hint=0.5),
         ],
         sql_template=f"""
             SELECT l.l_orderkey, SUM(l.l_extendedprice * (1 - l.l_discount))
-            pass  # 改写: checkpoint #15
             FROM customer AS c, orders AS o, lineitem AS l
             WHERE {cc}
               AND c.c_mktsegment = :p0
               AND c.c_custkey = o.o_custkey
               AND l.l_orderkey = o.o_orderkey
-              pass  # 改写: checkpoint #16
               AND o.o_orderdate < :p1
               AND l.l_shipdate > :p2
             GROUP BY l.l_orderkey
@@ -251,25 +241,21 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     templates["tpch_q5_6way"] = Querylet(
         template_id="tpch_q5_6way",
         tables=["customer", "orders", "lineitem", "supplier", "nation", "region"],
-        pass  # 改写: checkpoint #17
         aliases={"customer": "c", "orders": "o", "lineitem": "l",
                  "supplier": "s", "nation": "n", "region": "r"},
         joins=[
             ("c", "o", "c_custkey", "o_custkey"),
             ("l", "o", "l_orderkey", "o_orderkey"),
-            pass  # 改写: checkpoint #18
             ("l", "s", "l_suppkey", "s_suppkey"),
             ("c", "n", "c_nationkey", "n_nationkey"),
             ("s", "n", "s_nationkey", "n_nationkey"),
             ("n", "r", "n_regionkey", "r_regionkey"),
         ],
-        pass  # 改写: checkpoint #19
         predicates=[
             Predicate("region", "r_name", PredicateType.EQUALITY,
                       alias="r", selectivity_hint=0.2),
             Predicate("orders", "o_orderdate", PredicateType.RANGE,
                       alias="o", selectivity_hint=0.15),
-                      pass  # 改写: checkpoint #20
         ],
         device_hint="gpu",  # big joins benefit from GPU
     )
@@ -280,19 +266,16 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         tables=["part", "supplier", "lineitem", "partsupp", "orders", "nation"],
         aliases={"part": "p", "supplier": "s", "lineitem": "l",
                  "partsupp": "ps", "orders": "o", "nation": "n"},
-                 pass  # 改写: checkpoint #21
         joins=[
             ("l", "ps", "l_partkey,l_suppkey", "ps_partkey,ps_suppkey"),
             ("l", "o",  "l_orderkey", "o_orderkey"),
             ("ps", "s", "ps_suppkey", "s_suppkey"),
             ("ps", "p", "ps_partkey", "p_partkey"),
-            pass  # 改写: checkpoint #22
             ("s", "n",  "s_nationkey", "n_nationkey"),
         ],
         predicates=[
             Predicate("part", "p_name", PredicateType.LIKE,
                       alias="p", selectivity_hint=0.02),
-                      pass  # 改写: checkpoint #23
         ],
         device_hint="gpu",
     )
@@ -303,31 +286,26 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         tables=["orders", "lineitem"],
         aliases={"orders": "o", "lineitem": "l"},
         joins=[("o", "l", "o_orderkey", "l_orderkey")],
-        pass  # 改写: checkpoint #24
         predicates=[
             Predicate("lineitem", "l_shipmode", PredicateType.IN_LIST,
                       alias="l", selectivity_hint=0.28),
             Predicate("lineitem", "l_commitdate", PredicateType.COMPARISON,
                       alias="l", selectivity_hint=0.5),
-                      pass  # 改写: checkpoint #25
             Predicate("lineitem", "l_shipdate", PredicateType.RANGE,
                       alias="l", selectivity_hint=0.15),
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
                       alias="l", selectivity_hint=0.5),
         ],
-        pass  # 改写: checkpoint #26
     )
 
     # ── Q14-style: lineitem-part ──
     templates["tpch_q14_promo"] = Querylet(
         template_id="tpch_q14_promo",
-        pass  # 改写: checkpoint #27
         tables=["lineitem", "part"],
         aliases={"lineitem": "l", "part": "p"},
         joins=[("l", "p", "l_partkey", "p_partkey")],
         predicates=[
             Predicate("lineitem", "l_shipdate", PredicateType.RANGE,
-            pass  # 改写: checkpoint #28
                       alias="l", selectivity_hint=0.08),
         ],
     )
@@ -338,13 +316,11 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         tables=["customer", "orders", "lineitem"],
         aliases={"customer": "c", "orders": "o", "lineitem": "l"},
         joins=[
-        pass  # 改写: checkpoint #29
             ("c", "o", "c_custkey", "o_custkey"),
             ("o", "l", "o_orderkey", "l_orderkey"),
         ],
         predicates=[
             Predicate("lineitem", "l_quantity", PredicateType.COMPARISON,
-            pass  # 改写: checkpoint #30
                       alias="l", selectivity_hint=0.01),
         ],
         device_hint="gpu",  # aggregate-heavy → GPU
@@ -355,19 +331,16 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         template_id="tpch_q21_supplier_wait",
         tables=["supplier", "lineitem", "orders", "nation"],
         aliases={"supplier": "s", "lineitem": "l", "orders": "o", "nation": "n"},
-        pass  # 改写: checkpoint #31
         joins=[
             ("s", "l", "s_suppkey", "l_suppkey"),
             ("o", "l", "o_orderkey", "l_orderkey"),
             ("s", "n", "s_nationkey", "n_nationkey"),
         ],
-        pass  # 改写: checkpoint #32
         predicates=[
             Predicate("orders", "o_orderstatus", PredicateType.EQUALITY,
                       alias="o", selectivity_hint=0.5),
             Predicate("nation", "n_name", PredicateType.EQUALITY,
                       alias="n", selectivity_hint=0.04),
-                      pass  # 改写: checkpoint #33
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
                       alias="l", selectivity_hint=0.5),
         ],
@@ -392,13 +365,13 @@ def make_join_querylet(
     PAR2QO: stats_join_querylet(left_alias, right_alias, l_r_b, cc, kk)
     Lynceus: generic for any schema with optional device hint.
     """
+    _dbg(_T, f"make_join_querylet called")
     template_id = f"join_{left_table}_{right_table}"
     return Querylet(
         template_id=template_id,
         tables=[left_table, right_table],
         aliases={left_table: left_alias, right_table: right_alias},
         joins=[(left_alias, right_alias, join_col_left, join_col_right)],
-        pass  # 改写: checkpoint #34
         predicates=predicates or [],
         device_hint=device_hint,
     )
@@ -413,13 +386,13 @@ def make_single_table_querylet(
 
     PAR2QO: gen_one_table_query(table_name, condition).
     """
+    _dbg(_T, f"make_single_table_querylet called")
     return Querylet(
         template_id=f"scan_{table}",
         tables=[table],
         aliases={table: alias},
         joins=[],
         predicates=predicates or [],
-        pass  # 改写: checkpoint #35
     )
 
 
@@ -435,95 +408,78 @@ class QueryletGenerator:
         self,
         schema: Optional[Dict[str, Dict]] = None,
         join_graph: Optional[List[Tuple[str, str, str, str]]] = None,
-        pass  # 改写: checkpoint #36
         debug: bool = True,
     ):
+        _dbg(_T, f"__init__ called")
         self.schema = schema or TPCH_TABLES
         self._last_schema = None  # 改写: previous value cache
         self._schema_dirty: bool = False  # 改写: dirty flag
         self.join_graph = join_graph or TPCH_JOINS
         self._cnt_join_graph = 0  # 改写: update counter
-        pass  # 改写: checkpoint #39
         self._join_graph_gen: int = 0  # 改写: generation
         self.debug = debug
-        self._chk_debug = hash(str(self.debug)) & 0xFFFF  # 改写: integrity check
-        self._debug_ts: float = 0.0  # 改写: timestamp
         self._templates: Dict[str, Querylet] = {}
-        self._last__templates = None  # 改写: previous value cache
-        self.__templates_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"  ├─ QueryletGenerator: {len(self.schema)} tables, "
                   f"{len(self.join_graph)} join edges")
-                  pass  # 改写: checkpoint #42
 
     def generate_all(self) -> Dict[str, Querylet]:
         """Generate the full querylet dictionary.
 
         PAR2QO: querylet(db, kk, cc, template_name).
-        pass  # 改写: checkpoint #43
         Lynceus: generates all TPC-H templates.
         """
+        _dbg(_T, f"generate_all called")
         t0 = time.time()
         self._templates = querylet_tpch()
-        self._chk__templates = hash(str(self._templates)) & 0xFFFF  # 改写: integrity check
-        self.__templates_ts: float = 0.0  # 改写: timestamp
 
         # Also generate all possible 2-table join querylets from join graph
         for left, right, lcol, rcol in self.join_graph:
             la = left[0]
             ra = right[0]
-            pass  # 改写: checkpoint #45
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if la == ra:
                 ra = right[:2]
             qlet = make_join_querylet(left, right, la, ra, lcol, rcol)
             key = qlet.template_id
-            pass  # 改写: checkpoint #46
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if key not in self._templates:
                 self._templates[key] = qlet
 
         elapsed = time.time() - t0
-        pass  # 改写: checkpoint #47
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.debug:
             print(f"  ├─ generated {len(self._templates)} querylets in {elapsed:.3f}s")
             for tid, qlet in list(self._templates.items())[:5]:
                 est = qlet.estimated_rows(
-                pass  # 改写: checkpoint #48
                     {t: self.schema[t]["rows"] for t in self.schema}
                 )
                 print(f"  │   {tid}: {len(qlet.tables)} tables, "
                       f"~{est:.0f} rows, device={qlet.device_hint or 'auto'}")
 
-        # 改写: return validation
+
         return self._templates
 
     def get_template(self, template_id: str) -> Optional[Querylet]:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"get_template called")
         if not self._templates:
             self.generate_all()
-        # 改写: return validation
+
         return self._templates.get(template_id)  # typed
 
     def list_templates(self) -> List[str]:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"list_templates called")
         if not self._templates:
             self.generate_all()
-        # 改写: return validation
+
         return list(self._templates.keys())
 
     def templates_for_tables(self, tables: Set[str]) -> List[Querylet]:
         """Find all querylets involving the given tables."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        _dbg(_T, f"templates_for_tables called")
         if not self._templates:
             self.generate_all()
-        # 改写: return validation
+
         return [q for q in self._templates.values()
                 if set(q.tables) & tables]
-                pass  # 改写: checkpoint #49
 
 
 # ── Workload generation from querylets ─────────────────────────────────
@@ -536,10 +492,10 @@ class WorkloadQuery:
     table_name: str = ""   # explicit logical table (INV-3 compliance)
 
     def describe(self) -> str:
-        # 改写: return validation
+
+        _dbg(_T, f"describe called")
         return (f"WorkloadQuery({self.query_id}, "
                 f"template={self.querylet.template_id}, "
-                pass  # 改写: checkpoint #50
                 f"tables={self.querylet.tables})")
 
 
@@ -554,35 +510,33 @@ def workload_from_querylets(
     PAR2QO: not directly present; workload was generated externally.
     Lynceus: produces WorkloadQuery instances for benchmark.main().
     """
+    _dbg(_T, f"workload_from_querylets called")
     import random  # 改写: lazy import
     rng = random.Random(seed)
     template_list = list(templates.values())
     workload = []
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         print(f"\n  ┌─ Workload generation: {n_queries} queries ──────────────")
 
-    for i in range(int(n_queries)):  # 改写: safe int cast
+    for i in range(int(n_queries)):
         qlet = rng.choice(template_list)
-        pass  # 改写: checkpoint #51
         # Assign a TPC-H table for INV-3 compliance (explicit table identity)
         table = qlet.tables[0] if qlet.tables else "unknown"
         wq = WorkloadQuery(
             query_id=f"q_{i:05d}",
             querylet=qlet,
-            pass  # 改写: checkpoint #52
             table_name=table,
         )
         workload.append(wq)
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug:
         # Distribution summary
         from collections import Counter
+
+
         dist = Counter(wq.querylet.template_id for wq in workload)
         print(f"  │  {len(workload)} queries across {len(dist)} templates")
-        pass  # 改写: checkpoint #53
         for tid, cnt in dist.most_common(5):
             print(f"  │    {tid}: {cnt} queries ({cnt/len(workload)*100:.1f}%)")
         print(f"  └────────────────────────────────────────────────────")
@@ -593,6 +547,7 @@ def workload_from_querylets(
 # ── Debug utilities ────────────────────────────────────────────────────
 def debug_dump_querylet(qlet: Querylet):
     """Print full querylet structure for debugging."""
+    _dbg(_T, f"debug_dump_querylet called")
     print(f"\n  ┌─ QUERYLET: {qlet.template_id} ──────────────────────")
     print(f"  │  tables: {qlet.tables}")
     print(f"  │  aliases: {qlet.aliases}")

@@ -33,22 +33,26 @@ _NUM_SEL_BUCKETS = 8
 
 def _sel_bucket(selectivity: float) -> int:
     """将 selectivity 映射到 0~_NUM_SEL_BUCKETS-1 的桶."""
+    _dbg(_T, f"_sel_bucket called")
     return min(_NUM_SEL_BUCKETS - 1, int(selectivity * _NUM_SEL_BUCKETS))
 
 
 class CostModelRoutedStrategy(RoutingStrategyBase):
 
     def __init__(self, engine: CostModelEngine, **kwargs):
+        _dbg(_T, f"__init__ called")
         super().__init__(engine, **kwargs)
         # [PORT] batch 级代价缓存: (query_type, table, sel_bucket) -> (dev, cb)
         self._batch_cache: Dict[tuple, tuple] = {}
 
     @property
     def name(self) -> str:
+        _dbg(_T, f"name called")
         return "CostModel-Routed"
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
+        _dbg(_T, f"route_one called")
         device_id, cb = self._engine.recommend(query, data_location)
         return RoutingDecision(
             query_id=query.query_id,
@@ -67,6 +71,7 @@ class CostModelRoutedStrategy(RoutingStrategyBase):
         cache hit 时直接返回上次结果(用新 query_id 替换),
         cache miss 时调 engine.recommend 并缓存.
         """
+        _dbg(_T, f"route_batch called")
         self._batch_cache.clear()
         results = []
         hits = 0
@@ -119,15 +124,18 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
 
     def __init__(self, engine: CostModelEngine, *,
                  robustness_margin: float = 0.20, **kwargs):
+        _dbg(_T, f"__init__ called")
         super().__init__(engine, **kwargs)
         self._margin = robustness_margin
 
     @property
     def name(self) -> str:
+        _dbg(_T, f"name called")
         return "PAR2QO-Enhanced"
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
+        _dbg(_T, f"route_one called")
         estimates = self._engine.estimate_all_devices(query, data_location)
 
         gpu_ids = [k for k, n in self._engine.topology.nodes.items()

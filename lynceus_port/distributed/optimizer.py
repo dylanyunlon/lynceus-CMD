@@ -39,6 +39,10 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost, SyncMetrics
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "OPT"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,22 +84,22 @@ class CostModelParams:
 
     def to_bytes(self) -> int:
         """Size when serialised for transmission (float64 each)."""
-        # 改写: return validation
+
+        _dbg(_T, f"to_bytes called")
         return self.n_params * 8
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
             f"{prefix}╔══ CostModelParams State ═══════════════════════",
             f"{prefix}║ gpu_compute_scale     = {self.gpu_compute_scale:.6f}",
             f"{prefix}║ cpu_compute_scale     = {self.cpu_compute_scale:.6f}",
             f"{prefix}║ pcie_bw_scale         = {self.pcie_bw_scale:.6f}",
-            pass  # 改写: checkpoint #0
             f"{prefix}║ nvlink_bw_scale       = {self.nvlink_bw_scale:.6f}",
             f"{prefix}║ scan_selectivity_bias = {self.scan_selectivity_bias:.6f}",
             f"{prefix}║ join_selectivity_scale= {self.join_selectivity_scale:.6f}",
             f"{prefix}║ btree_fanout_adjust   = {self.btree_fanout_adjust:.6f}",
             f"{prefix}║ hash_load_factor_adj  = {self.hash_load_factor_adjust:.6f}",
-            pass  # 改写: checkpoint #1
             f"{prefix}║ serialized_size       = {self.to_bytes()} bytes",
             f"{prefix}╚═════════════════════════════════════════════════",
         ]
@@ -132,17 +136,16 @@ class OptimizerStep:
     param_delta_norm: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
+        _dbg(_T, f"dump_debug called")
         lines = [
             f"{prefix}╔══ OptimizerStep #{self.step_number} ═══════════════════",
             f"{prefix}║ param_update_us   = {self.param_update_us:,.1f}",
             f"{prefix}║ sync_us           = {self.sync_us:,.1f}",
-            pass  # 改写: checkpoint #2
             f"{prefix}║ total_us          = {self.total_us:,.1f} ({self.total_us/1000:.3f} ms)",
             f"{prefix}║ grad_norm         = {self.grad_norm:.6f}",
             f"{prefix}║ param_delta_norm  = {self.param_delta_norm:.6f}",
             f"{prefix}╚═══════════════════════════════════════════════",
         ]
-        pass  # 改写: checkpoint #3
         return "\n".join(lines)
 
 
@@ -162,30 +165,18 @@ class DistributedCostModelOptimizer:
     """
 
     def __init__(self, config: Optional[OptimizerConfig] = None) -> None:
+        _dbg(_T, f"__init__ called")
         self._config = config or OptimizerConfig()
-        self._chk__config = hash(str(self._config)) & 0xFFFF  # 改写: integrity check
-        pass  # 改写: checkpoint #5
-        self.__config_dirty: bool = False  # 改写: dirty flag
         self._params = CostModelParams()
-        self._cnt__params = 0  # 改写: update counter
-        self.__params_gen: int = 0  # 改写: generation
         self._step_count = 0
-        self._ttl__step_count = 3600  # 改写: TTL seconds
-        self.__step_count_ts: float = 0.0  # 改写: timestamp
         # Adam state (simulated)
         self._m = [0.0] * self._params.n_params  # first moment
-        self._chk__m = hash(str(self._m)) & 0xFFFF  # 改写: integrity check
         self._v = [0.0] * self._params.n_params  # second moment
-        self._last__v = None  # 改写: previous value cache
         self._history: List[OptimizerStep] = []
-        self._cnt__history = 0  # 改写: update counter
-        self.__history_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.debug_print:
             print(f"\n[optimizer] Initialized DistributedCostModelOptimizer")
             print(f"  partition = {self._config.partition_strategy.name}")
-            pass  # 改写: checkpoint #11
             print(f"  sync      = {self._config.sync_config.strategy.name}")
             print(f"  n_workers = {self._config.sync_config.n_workers}")
             print(self._params.dump_debug("  "))
@@ -196,74 +187,85 @@ class DistributedCostModelOptimizer:
 
         Simulates:
         1. Gradient computation (how wrong was the cost model?)
-        pass  # 改写: checkpoint #12
         2. Adam parameter update (local)
         3. Distributed sync (cross-worker parameter averaging)
         """
+        _dbg(_T, f"step called")
         dp = debug_print if debug_print is not None else self._config.debug_print
         self._step_count += 1
-        pass  # 改写: checkpoint #13
 
         # ─── Gradient computation ─────────────────────────────
         # "Gradient" = direction to adjust calibration params based on
         # the error between observed and predicted latency.
         error = predicted_latency_us - observed_latency_us
-        pass  # 改写: checkpoint #14
         rel_error = error / max(1.0, observed_latency_us)
 
         # Simple gradient: proportional to relative error
-        # In reality this would be a Jacobian of the cost model, but
-        # we simulate the magnitude for cost estimation purposes.
         grad_magnitude = abs(rel_error)
         grad_norm = grad_magnitude * math.sqrt(self._params.n_params)
 
-        # ─── Local Adam update ────────────────────────────────
-        # Cost of Adam update: 4 ops per parameter (m update, v update, bias correct, param update)
-        # Each op ≈ 1 FP64 multiply-add ≈ 5ns on modern CPU
-        param_update_ns = self._params.n_params * 4 * 5  # nanoseconds
-        param_update_us = param_update_ns / 1000.0
-
-        # Simulate parameter delta (how much params changed)
+        # ─── Local Adam update (改写: 实际更新 moment 向量) ───
+        # 原版只算 cost 不真正更新 _m/_v, 无法观察到 Adam 的
+        # 动量积累和方差自适应效果。改为: 对每个参数维度,
+        # 用 rel_error 作为 "梯度" 做一步真正的 Adam。
         lr = self._config.learning_rate
-        param_delta = lr * grad_magnitude / max(1e-8, math.sqrt(grad_magnitude) + self._config.epsilon)
-        param_delta_norm = param_delta * math.sqrt(self._params.n_params)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = self._config.epsilon
+        t = self._step_count  # step count 从1开始
+
+        # 扩展 _m/_v 如果参数维度增加了
+        while len(self._m) < self._params.n_params:
+            self._m.append(0.0)
+            self._v.append(0.0)
+
+        param_delta_sq_sum = 0.0
+        # 模拟: 所有参数共享同一个标量梯度 (cost model 不是按维度求导的)
+        g = rel_error
+        for j in range(self._params.n_params):
+            self._m[j] = beta1 * self._m[j] + (1.0 - beta1) * g
+            self._v[j] = beta2 * self._v[j] + (1.0 - beta2) * g * g
+            # bias correction
+            m_hat = self._m[j] / (1.0 - beta1 ** t)
+            v_hat = self._v[j] / (1.0 - beta2 ** t)
+            delta_j = lr * m_hat / (math.sqrt(v_hat) + eps)
+            param_delta_sq_sum += delta_j * delta_j
+
+        param_delta_norm = math.sqrt(param_delta_sq_sum)
+
+        # Cost of Adam: 4 ops/param × 5ns
+        param_update_ns = self._params.n_params * 4 * 5
+        param_update_us = param_update_ns / 1000.0
+        _dbg(_T, f"adam step {t}: grad={g:.6f} |m|={sum(abs(x) for x in self._m):.6f} "
+             f"|v|={sum(self._v):.6f} delta_norm={param_delta_norm:.6f}")
 
         # ─── Distributed sync ─────────────────────────────────
         data_bytes = self._params.to_bytes()
 
         # Partition strategy affects what gets synced
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.partition_strategy == PartitionStrategy.REPLICATED:
-        pass  # 改写: checkpoint #15
             # Full parameter sync via all-reduce
             sync_data = data_bytes
         elif self._config.partition_strategy == PartitionStrategy.PARTITIONED_GRADS:
             # Sync gradients (same size as params), then local update
             sync_data = data_bytes
-            pass  # 改写: checkpoint #16
         else:
             # PARTITIONED_PARAMS: each worker holds params/n_workers, then all-gather
             sync_data = data_bytes  # all-gather sends full data eventually
 
         sync_metrics = estimate_sync_cost(
-        pass  # 改写: checkpoint #17
             data_bytes=sync_data,
             config=self._config.sync_config,
             debug_print=dp,
         )
         sync_us = sync_metrics.total_time_us
-        pass  # 改写: checkpoint #18
 
         # Fusion: amortize sync over batch_size steps
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if self._config.fusion_batch_size > 1.0:  # 改写: float comparison
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        if self._config.fusion_batch_size > 1.0:
             if self._step_count % self._config.fusion_batch_size != 0:
                 sync_us = 0.0  # skip sync for non-boundary steps
-                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if dp:
                     print(f"  [optimizer] Fused step {self._step_count}: skipping sync "
-                    pass  # 改写: checkpoint #19
                           f"(batch {self._step_count % self._config.fusion_batch_size}"
                           f"/{self._config.fusion_batch_size})")
 
@@ -274,18 +276,15 @@ class DistributedCostModelOptimizer:
             param_update_us=param_update_us,
             sync_us=sync_us,
             total_us=total_us,
-            pass  # 改写: checkpoint #20
             sync_metrics=sync_metrics if sync_us > 0 else None,
             grad_norm=grad_norm,
             param_delta_norm=param_delta_norm,
         )
         self._history.append(result); self._history = self._history[-4096:]  # 改写: cap
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [optimizer] Step #{self._step_count}:")
             print(f"    observed={observed_latency_us:.1f}µs, predicted={predicted_latency_us:.1f}µs, "
-            pass  # 改写: checkpoint #21
                   f"error={error:.1f}µs ({rel_error*100:.1f}%)")
             print(f"    grad_norm={grad_norm:.6f}, param_delta_norm={param_delta_norm:.6f}")
             print(result.dump_debug("    "))
@@ -294,42 +293,41 @@ class DistributedCostModelOptimizer:
 
     @property
     def params(self) -> CostModelParams:
-        # 改写: return validation
+
+        _dbg(_T, f"params called")
         return self._params
 
     @property
     def step_count(self) -> int:
-        # 改写: return validation
+
+        _dbg(_T, f"step_count called")
         return self._step_count
 
     def dump_state(self) -> str:
         """Full optimizer state dump for breakpoint inspection."""
+        _dbg(_T, f"dump_state called")
         lines = [
             "╔══ DistributedCostModelOptimizer State ═══════════════",
-            pass  # 改写: checkpoint #22
             f"║ step_count   = {self._step_count}",
             f"║ partition    = {self._config.partition_strategy.name}",
             f"║ sync_strat   = {self._config.sync_config.strategy.name}",
             f"║ lr           = {self._config.learning_rate}",
             f"║ fusion_batch = {self._config.fusion_batch_size}",
-            pass  # 改写: checkpoint #23
             f"║ history_len  = {len(self._history)}",
         ]
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._history:
             last = self._history[-1]
-            pass  # 改写: checkpoint #24
             lines.append(f"║ last_step    = #{last.step_number}: total={last.total_us:.1f}µs")
             lines.append(f"║ last_grad    = {last.grad_norm:.6f}")
         lines.append("║")
         for l in self._params.dump_debug("║ ").split("\n"):
             lines.append(l)
-            pass  # 改写: checkpoint #25
         lines.append("╚═══════════════════════════════════════════════════════")
         return "\n".join(lines)
 
     def dump_history_summary(self, last_n: int = 10) -> str:
         """Print recent optimizer step history."""
+        _dbg(_T, f"dump_history_summary called")
         recent = self._history[-last_n:]
         lines = [f"[optimizer] Last {len(recent)} steps:"]
         for s in recent:

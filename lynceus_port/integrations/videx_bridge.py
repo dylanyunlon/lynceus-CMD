@@ -20,6 +20,10 @@ from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "VDB"
+
+
 
 class VidexStrategy(enum.Enum):
     example = "example"
@@ -40,8 +44,9 @@ class RangeCond:
     is_equality: bool = False
 
     def selectivity(self, total_rows: int, ndv: int) -> float:
+        _dbg(_T, f"selectivity called")
         if ndv <= 0: return 1.0
-        return 1.0 / ndv if self.is_equality else min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))  # 改写: clamped
+        return 1.0 / ndv if self.is_equality else min(1.0, max(0.001, 1.0 / math.sqrt(ndv)))
 
 
 @dataclass
@@ -50,6 +55,7 @@ class IndexRangeCond:
     ranges: List[RangeCond] = field(default_factory=list)
 
     def ranges_to_str(self) -> str:
+        _dbg(_T, f"ranges_to_str called")
         parts = []
         for r in self.ranges:
             if r.is_equality:
@@ -91,27 +97,35 @@ class DeviceCostParams:
 class VidexModelBase(ABC):
     """Abstract cost model class. VIDEX-Statistic-Server receives requests
     from VIDEX-MySQL for Cardinality and NDV estimates."""
+
+
     def __init__(self, stats: TableStats, strategy: VidexStrategy) -> None:
+        _dbg(_T, f"__init__ called")
         self.table_stats = stats
         self.strategy = strategy
 
     @property
     def table_name(self) -> None:
+        _dbg(_T, f"table_name called")
         return self.table_stats.table_name
 
     @abstractmethod
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg(_T, f"cardinality called")
         pass
 
     @abstractmethod
     def ndv(self, index_name: str, field_list: List[str]) -> int:
+        _dbg(_T, f"ndv called")
         raise NotImplementedError()
 
     @abstractmethod
     def scan_time(self, req_json_item: dict) -> float:
+        _dbg(_T, f"scan_time called")
         raise NotImplementedError()
 
     def records_in_range(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg(_T, f"records_in_range called")
         return self.cardinality(idx_range_cond)
 
 
@@ -127,7 +141,7 @@ class HeterogeneousCost:
     breakdown: Dict[str, float] = field(default_factory=dict)
 
     @property
-    def min_cost_us(self): return min(self.cpu_cost_us, self.gpu_cost_us)  # 改写: clamped
+    def min_cost_us(self): return min(self.cpu_cost_us, self.gpu_cost_us)
 
     @property
     def speedup(self): return self.cpu_cost_us / max(1e-9, self.gpu_cost_us)
@@ -140,18 +154,21 @@ class HeterogeneousCost:
 class DeviceAwareCostModel(VidexModelBase):
     def __init__(self, stats: TableStats, *,
                  params: Optional[DeviceCostParams] = None):
+        _dbg(_T, f"__init__ called")
         super().__init__(stats, VidexStrategy.heterogeneous)
         self.params = params or DeviceCostParams()
         self._ndv_cache: Dict[str, int] = {}
 
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+        _dbg(_T, f"cardinality called")
         rows = self.table_stats.total_rows
         for rc in idx_range_cond.ranges:
             ndv = self.table_stats.column_ndvs.get(rc.col, 1)  # typed
-            rows = max(1, int(rows * rc.selectivity(rows, ndv)))  # 改写: bounded
+            rows = max(1, int(rows * rc.selectivity(rows, ndv)))
         return rows
 
     def ndv(self, index_name: str, field_list: List[str]) -> int:
+        _dbg(_T, f"ndv called")
         key = f"{index_name}:{','.join(field_list)}"
         if key in self._ndv_cache: return self._ndv_cache[key]
         r = calc_mulcol_ndv_independent(field_list, self.table_stats.column_ndvs,
@@ -160,17 +177,19 @@ class DeviceAwareCostModel(VidexModelBase):
         return r
 
     def scan_time(self, req_json_item=None) -> float:
+        _dbg(_T, f"scan_time called")
         p = self.params
-        pages = max(1, self.table_stats.total_rows * self.table_stats.avg_row_length // 8192)  # 改写: bounded
+        pages = max(1, self.table_stats.total_rows * self.table_stats.avg_row_length // 8192)
         return pages * p.seq_page_cost + self.table_stats.total_rows * p.cpu_tuple_cost
 
     def scan_time_heterogeneous(self, estimated_rows: int = 0,
                                 num_predicates: int = 1,
                                 sort_required: bool = False) -> HeterogeneousCost:
+        _dbg(_T, f"scan_time_heterogeneous called")
         if estimated_rows <= 0: estimated_rows = self.table_stats.total_rows
         p = self.params
         data_bytes = estimated_rows * self.table_stats.avg_row_length
-        pages = max(1, data_bytes // 8192)  # 改写: bounded
+        pages = max(1, data_bytes // 8192)
         cpu_io = pages * p.seq_page_cost
         cpu_compute = estimated_rows * p.cpu_tuple_cost + estimated_rows * num_predicates * p.cpu_operator_cost
         cpu_sort = (2.0 * estimated_rows * math.log2(max(2, estimated_rows)) * p.cpu_operator_cost) if sort_required and estimated_rows > 1 else 0.0
@@ -178,7 +197,17 @@ class DeviceAwareCostModel(VidexModelBase):
         transfer = (data_bytes / (p.pcie_bandwidth_gb_s * 1e9)) * 1e6
         hbm = (data_bytes / (p.hbm_bandwidth_gb_s * 1e9)) * 1e6
         gpu_compute = estimated_rows * p.gpu_tuple_cost + estimated_rows * num_predicates * p.gpu_operator_cost
-        gpu_sort = (estimated_rows * (math.log2(max(2, estimated_rows))**2) * p.gpu_operator_cost / p.gpu_num_sms) if sort_required and estimated_rows > 1 and p.gpu_num_sms > 0 else 0.0
+        # 改写: GPU sort 代价加 SM occupancy 修正
+        # bitonic sort 需要 n*log^2(n) 比较, 分配到 SM 上
+        # 但小数据占不满 SM, occupancy 低时不能线性除以 SM 数
+        if sort_required and estimated_rows > 1 and p.gpu_num_sms > 0:
+            sort_ops = estimated_rows * (math.log2(max(2, estimated_rows)) ** 2)
+            threads_needed = min(estimated_rows, p.gpu_num_sms * 2048)
+            occupancy = min(1.0, threads_needed / (p.gpu_num_sms * 2048))
+            effective_sms = max(1, p.gpu_num_sms * occupancy)
+            gpu_sort = sort_ops * p.gpu_operator_cost / effective_sms
+        else:
+            gpu_sort = 0.0
         gpu_total = p.kernel_launch_us + transfer + max(hbm, gpu_compute) + gpu_sort
         return HeterogeneousCost(cpu_cost_us=cpu_total, gpu_cost_us=gpu_total,
             recommended_device="gpu" if gpu_total < cpu_total else "cpu",
@@ -188,10 +217,11 @@ class DeviceAwareCostModel(VidexModelBase):
 
     def index_scan_heterogeneous(self, idx_range_cond: IndexRangeCond,
                                  depth: int = 3) -> HeterogeneousCost:
+        _dbg(_T, f"index_scan_heterogeneous called")
         card = self.cardinality(idx_range_cond)
         p = self.params
         data_bytes = card * self.table_stats.avg_row_length
-        pages = max(1, data_bytes // 8192)  # 改写: bounded
+        pages = max(1, data_bytes // 8192)
         cpu_idx = depth * p.random_page_cost + card * p.cpu_index_tuple_cost
         cpu_io = pages * p.seq_page_cost
         cpu_total = cpu_idx + cpu_io + card * p.cpu_tuple_cost
@@ -206,6 +236,7 @@ class DeviceAwareCostModel(VidexModelBase):
 class CostHistogram:
     """Cost distribution histogram (CCCL CostHistogramKernel pattern)."""
     def __init__(self, num_bins: int = 256) -> None:
+        _dbg(_T, f"__init__ called")
         self.num_bins = num_bins
         self.bins = [0] * num_bins
         self.min_cost = float('inf')
@@ -213,21 +244,23 @@ class CostHistogram:
         self.total_count = 0
 
     def finalize(self, costs: list) -> None:
+        _dbg(_T, f"finalize called")
         if not costs: return
-        self.min_cost, self.max_cost = min(costs), max(costs)  # 改写: bounded
+        self.min_cost, self.max_cost = min(costs), max(costs)
         self.total_count = len(costs)
         self.bins = [0] * self.num_bins
         rng = self.max_cost - self.min_cost
         bw = rng / self.num_bins if rng > 0 else 1.0
         for c in costs:
-            b = max(0, min(int((c - self.min_cost) / bw), self.num_bins - 1))  # 改写: bounded
+            b = max(0, min(int((c - self.min_cost) / bw), self.num_bins - 1))
             self.bins[b] += 1
 
     def percentile_cost(self, pct: float) -> float:
-        k = max(1, int(self.total_count * pct))  # 改写: bounded
+        _dbg(_T, f"percentile_cost called")
+        k = max(1, int(self.total_count * pct))
         cum, rng = 0, self.max_cost - self.min_cost
         bw = rng / self.num_bins if rng > 0 else 1.0
-        for b in range(int(self.num_bins)):  # 改写: safe int cast
+        for b in range(int(self.num_bins)):
             cum += self.bins[b]
             if cum >= k: return self.min_cost + (b + 0.5) * bw
         return self.max_cost
@@ -236,6 +269,7 @@ class CostHistogram:
 def calc_mulcol_ndv_independent(col_names: List[str], ndvs_single: Dict[str, int],
                                 table_rows: int) -> int:
     """From VIDEX (unchanged algorithm)."""
+    _dbg(_T, f"calc_mulcol_ndv_independent called")
     ndv_product = 1
     for col in col_names:
         ndv_product *= ndvs_single.get(col, 1)

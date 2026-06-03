@@ -1,332 +1,304 @@
 """
-_debug.py — 增强型断点调试 / 状态快照 / 运行时诊断基础设施
+lynceus_port_v3/_debug.py — 增强型断点调试 / 状态快照 / 运行时检查点
 
-移植改写 (~40% 新增):
-  - 原有: DebugPrinter, snapshot 基本功能
-  - 新增: 计时器装饰器 @timed, 调用链追踪 CallTracer,
-          结构体差分 diff_snapshot, 断言守卫 guard,
-          运行时统计仪表盘 RuntimeStats, checkpoint/restore 机制
+与原始 _debug.py 相比, 本版本增加:
+  1. checkpoint_to_file(): 把当前所有状态写入 JSON 文件,
+     可在崩溃后从文件恢复查看
+  2. timing_ctx(): 上下文管理器, 测量代码块耗时
+  3. inspect_struct(): 递归打印结构体的每一层嵌套
+  4. assertion_hook(): 带详细dump的assert,失败时自动snapshot
 
-在任何模块中:
-    from ._debug import dbg, snapshot, timed, tracer, guard
+用法:
+    from ._debug import dbg, snapshot, timing, checkpoint, inspect_struct
 
-    dbg("tag", var1=x, var2=y)        # 打印到 stderr
-    snapshot(obj)                       # dump 对象所有属性
-    @timed("label")                    # 函数耗时统计
-    guard(cond, "msg", ctx={...})      # 条件断言 + 上下文转储
-    tracer.enter("func"); tracer.exit()# 调用链追踪
+    with timing("route_batch"):
+        decisions = router.route_batch(queries)
 
-在运行实验时:
-    LYNCEUS_DBG=0 python -m benchmark   # 环境变量控制
-    LYNCEUS_DBG=2 ...                   # 级别2: 含计时+调用链
+    checkpoint("after_routing", engine=engine, decisions=decisions)
+
+    inspect_struct(cost_breakdown, depth=3)
+
+环境变量:
+    LYNCEUS_DBG=0        静默关闭所有调试输出
+    LYNCEUS_DBG_FILE=path  调试输出写入文件而非stderr
+    LYNCEUS_CHECKPOINT_DIR=path  checkpoint文件输出目录
 """
 
 import sys
 import os
 import time
-import functools
-import threading
+import json
+import traceback
+from contextlib import contextmanager
 from dataclasses import fields, asdict
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from collections import defaultdict
-
-
-# ─── 调试级别 ────────────────────────────────────────────────────────────────
-# 0=静默  1=基本dbg  2=含计时+调用链  3=全量(含diff)
-_DBG_LEVEL = int(os.environ.get("LYNCEUS_DBG", "1"))
-
-
-class CallTracer:
-    """调用链追踪器 — 记录函数进入/退出, 构建实时调用栈.
-
-    用法:
-        tracer.enter("CostModel.estimate", query_id="q_001")
-        ... 执行逻辑 ...
-        tracer.exit(result_summary="cost=42.5µs")
-
-    输出:
-        ┌─ CostModel.estimate (query_id=q_001)
-        │  ┌─ CPUCostModel.calc_io
-        │  └─ CPUCostModel.calc_io → 12.3µs
-        └─ CostModel.estimate → cost=42.5µs
-    """
-
-    def __init__(self):
-        self._stack: List[Tuple[str, float, Dict]] = []  # (name, t0, kwargs)
-        self._depth = 0
-        self._log: List[str] = []
-        self._lock = threading.Lock()
-
-    def enter(self, name: str, **ctx) -> None:
-        if _DBG_LEVEL < 2:
-            return
-        with self._lock:
-            indent = "│  " * self._depth
-            ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items()) if ctx else ""
-            msg = f"{indent}┌─ {name}" + (f" ({ctx_str})" if ctx_str else "")
-            print(msg, file=sys.stderr)
-            self._log.append(msg)
-            self._stack.append((name, time.perf_counter(), ctx))
-            self._depth += 1
-
-    def exit(self, result_summary: str = "") -> float:
-        if _DBG_LEVEL < 2:
-            return 0.0
-        with self._lock:
-            if not self._stack:
-                return 0.0
-            name, t0, _ = self._stack.pop()
-            elapsed_us = (time.perf_counter() - t0) * 1e6
-            self._depth = max(0, self._depth - 1)
-            indent = "│  " * self._depth
-            suffix = f" → {result_summary}" if result_summary else ""
-            msg = f"{indent}└─ {name}{suffix} [{elapsed_us:.1f}µs]"
-            print(msg, file=sys.stderr)
-            self._log.append(msg)
-            return elapsed_us
-
-    @property
-    def call_log(self) -> List[str]:
-        return list(self._log)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._stack.clear()
-            self._log.clear()
-            self._depth = 0
-
-
-class RuntimeStats:
-    """运行时统计仪表盘 — 跨模块汇聚的计数器/直方图/计时."""
-
-    def __init__(self):
-        self.counters: Dict[str, int] = defaultdict(int)
-        self.timers: Dict[str, List[float]] = defaultdict(list)  # µs
-        self.gauges: Dict[str, float] = {}
-
-    def incr(self, key: str, n: int = 1) -> None:
-        self.counters[key] += n
-
-    def record_time(self, key: str, us: float) -> None:
-        self.timers[key].append(us)
-
-    def set_gauge(self, key: str, val: float) -> None:
-        self.gauges[key] = val
-
-    def report(self) -> str:
-        lines = ["╔══ RuntimeStats Dashboard ════════════════════════════"]
-        if self.counters:
-            lines.append("║ ── Counters ──")
-            for k, v in sorted(self.counters.items()):
-                lines.append(f"║   {k:30s} = {v:>10,}")
-        if self.timers:
-            lines.append("║ ── Timers (µs) ──")
-            for k, vs in sorted(self.timers.items()):
-                if not vs:
-                    continue
-                avg = sum(vs) / len(vs)
-                mn, mx = min(vs), max(vs)
-                lines.append(f"║   {k:30s}  n={len(vs):>5}  "
-                             f"avg={avg:>10.1f}  min={mn:>10.1f}  max={mx:>10.1f}")
-        if self.gauges:
-            lines.append("║ ── Gauges ──")
-            for k, v in sorted(self.gauges.items()):
-                lines.append(f"║   {k:30s} = {v:.4f}")
-        lines.append("╚══════════════════════════════════════════════════════")
-        return "\n".join(lines)
+from pathlib import Path
+from typing import Any, Optional
 
 
 class DebugPrinter:
-    """可开关的调试打印器, 像现实世界开发中的 log/trace 系统.
-
-    改写: 增加了级别控制、计数阈值报警、自动截断深层嵌套.
-    """
+    """可开关的调试打印器, 支持文件输出和计数统计."""
 
     def __init__(self):
-        self.enabled = _DBG_LEVEL >= 1
-        self._counts: Dict[str, int] = defaultdict(int)
-        self._file = sys.stderr
-        self._alert_threshold = int(os.environ.get("LYNCEUS_ALERT_AFTER", "500"))
+        self.enabled = os.environ.get("LYNCEUS_DBG", "1") != "0"
+        self._call_counts = {}
+        self._timing_stack = []
+        self._accumulated_timings = {}
 
-    def __call__(self, tag: str, **kwargs) -> None:
-        """打印带 tag 的调试快照.
+        # 输出目标: stderr 或指定文件
+        dbg_file = os.environ.get("LYNCEUS_DBG_FILE")
+        if dbg_file:
+            self._file = open(dbg_file, "a", buffering=1)
+        else:
+            self._file = sys.stderr
 
-        用法:
-            dbg("CostModel.estimate", query=q, device_id=dev, result=cb)
+        # checkpoint目录
+        self._ckpt_dir = Path(
+            os.environ.get("LYNCEUS_CHECKPOINT_DIR", "/tmp/lynceus_checkpoints")
+        )
+        if self.enabled:
+            self._ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        输出到 stderr, 不干扰正常 stdout 数据流.
-        可以在这里 set breakpoint() 进入 pdb.
+    def __call__(self, tag: str, **kwargs):
+        """带标签的调试快照打印.
+
+        每次调用自动编号, 方便追踪调用序列.
+        可以在这里设置 breakpoint() 进入 pdb 交互式调试.
         """
         if not self.enabled:
             return
 
-        self._counts[tag] += 1
-        n = self._counts[tag]
-        runtime_stats.incr(f"dbg.{tag}")
+        self._call_counts[tag] = self._call_counts.get(tag, 0) + 1
+        seq = self._call_counts[tag]
+        ts = time.strftime("%H:%M:%S")
 
-        # 高频标签降采样: 超过阈值后每100次才打印一次
-        if n > self._alert_threshold and n % 100 != 0:
-            return
-
-        print(f"\n{'─'*60}", file=self._file)
-        hdr = f"[DBG #{n:04d}] {tag}"
-        if n == self._alert_threshold:
-            hdr += f"  ⚠ HIGH-FREQ: {n}+ calls"
-        print(hdr, file=self._file)
+        print(f"\n{'━'*60}", file=self._file)
+        print(f"[DBG #{seq:05d}] {tag}  @ {ts}", file=self._file)
 
         for k, v in kwargs.items():
-            self._print_value(k, v, indent=2)
+            self._render_value(k, v, indent=2)
 
-        print(f"{'─'*60}", file=self._file)
+        print(f"{'━'*60}", file=self._file)
+        self._file.flush()
 
-    def _print_value(self, name: str, val: Any, indent: int = 2) -> None:
+    def _render_value(self, name: str, val: Any, indent: int = 2):
         pad = " " * indent
         if val is None:
             print(f"{pad}{name} = None", file=self._file)
         elif hasattr(val, '__dataclass_fields__'):
-            print(f"{pad}{name}: {type(val).__name__}", file=self._file)
-            for f in fields(val):
-                fval = getattr(val, f.name)
-                s = repr(fval)
-                if len(s) > 120:
-                    s = s[:117] + "..."
-                print(f"{pad}  .{f.name} = {s}", file=self._file)
+            print(f"{pad}{name}: <{type(val).__name__}>", file=self._file)
+            for fld in fields(val):
+                fval = getattr(val, fld.name)
+                truncated = repr(fval)
+                if len(truncated) > 120:
+                    truncated = truncated[:117] + "..."
+                print(f"{pad}  .{fld.name} = {truncated}", file=self._file)
         elif isinstance(val, dict):
-            print(f"{pad}{name}: dict[{len(val)}]", file=self._file)
+            print(f"{pad}{name}: dict[{len(val)} entries]", file=self._file)
             for i, (dk, dv) in enumerate(val.items()):
                 if i >= 8:
-                    print(f"{pad}  ... +{len(val)-8} more", file=self._file)
+                    print(f"{pad}  ... +{len(val)-8} more entries", file=self._file)
                     break
-                print(f"{pad}  [{dk}] = {repr(dv)[:80]}", file=self._file)
+                print(f"{pad}  [{dk}] = {repr(dv)[:90]}", file=self._file)
         elif isinstance(val, (list, tuple)):
-            print(f"{pad}{name}: {type(val).__name__}[{len(val)}]", file=self._file)
-            for item in val[:5]:
-                print(f"{pad}  - {repr(item)[:80]}", file=self._file)
-            if len(val) > 5:
-                print(f"{pad}  ... +{len(val)-5} more", file=self._file)
+            container_type = "list" if isinstance(val, list) else "tuple"
+            print(f"{pad}{name}: {container_type}[{len(val)}]", file=self._file)
+            for i, item in enumerate(val):
+                if i >= 5:
+                    print(f"{pad}  ... +{len(val)-5} more items", file=self._file)
+                    break
+                print(f"{pad}  [{i}] {repr(item)[:90]}", file=self._file)
         else:
             s = repr(val)
             if len(s) > 160:
                 s = s[:157] + "..."
             print(f"{pad}{name} = {s}", file=self._file)
 
+    def dump_call_stats(self):
+        """打印所有调试点的调用次数统计 — 用于确认代码路径覆盖."""
+        if not self.enabled:
+            return
+        print(f"\n{'='*60}", file=self._file)
+        print("[DBG CALL STATISTICS]", file=self._file)
+        for tag in sorted(self._call_counts, key=self._call_counts.get, reverse=True):
+            print(f"  {self._call_counts[tag]:6d}x  {tag}", file=self._file)
+        print(f"{'='*60}", file=self._file)
 
-def snapshot(obj: Any, label: str = "") -> None:
-    """打印对象完整状态 — 用于断点调试时快速查看.
+    def dump_timing_stats(self):
+        """打印所有计时区间的累积耗时 — 发现性能瓶颈."""
+        if not self.enabled or not self._accumulated_timings:
+            return
+        print(f"\n{'='*60}", file=self._file)
+        print("[DBG TIMING STATISTICS]", file=self._file)
+        for label, (total_s, count) in sorted(
+            self._accumulated_timings.items(),
+            key=lambda kv: kv[1][0], reverse=True
+        ):
+            avg_ms = (total_s / count) * 1000.0 if count else 0
+            print(f"  {label:40s}  total={total_s*1000:.1f}ms  "
+                  f"calls={count}  avg={avg_ms:.2f}ms", file=self._file)
+        print(f"{'='*60}", file=self._file)
 
-    改写: 增加了时间戳和内存地址, 便于追踪对象生命周期.
-    """
+
+def snapshot(obj: Any, label: str = ""):
+    """完整状态快照 — 用于pdb中或关键路径上查看对象全貌."""
     if not dbg.enabled:
         return
     tag = label or type(obj).__name__
-    ts = time.strftime("%H:%M:%S")
-    addr = f"0x{id(obj):x}"
-    print(f"\n[SNAPSHOT {ts}] {tag} @ {addr}", file=sys.stderr)
-
     if hasattr(obj, 'dump_state'):
-        print(obj.dump_state(), file=sys.stderr)
+        print(f"\n[SNAPSHOT] {tag}:", file=dbg._file)
+        state_str = str(obj.dump_state())
+        # 截断过长的状态
+        if len(state_str) > 2000:
+            state_str = state_str[:2000] + "\n  ... (truncated)"
+        print(state_str, file=dbg._file)
     elif hasattr(obj, '__dataclass_fields__'):
-        dbg(f"snapshot:{tag}", **{f.name: getattr(obj, f.name) for f in fields(obj)})
+        dbg(f"snapshot:{tag}",
+            **{fld.name: getattr(obj, fld.name) for fld in fields(obj)})
     elif hasattr(obj, '__dict__'):
-        public = {k: v for k, v in vars(obj).items() if not k.startswith('_')}
+        public = {k: v for k, v in vars(obj).items() if not k.startswith('__')}
         dbg(f"snapshot:{tag}", **public)
     else:
-        print(f"  = {repr(obj)[:400]}", file=sys.stderr)
+        print(f"[SNAPSHOT] {tag} = {repr(obj)[:500]}", file=dbg._file)
 
 
-def diff_snapshot(label: str, before: Dict[str, Any], after: Dict[str, Any]) -> None:
-    """对比两个状态字典的差异 — 用于追踪状态突变.
+@contextmanager
+def timing(label: str):
+    """计时上下文管理器 — 测量代码块执行时间.
 
-    新增函数: 在修改前后分别capture状态, 然后diff.
-    """
-    if _DBG_LEVEL < 3:
-        return
-    all_keys = set(before) | set(after)
-    diffs = []
-    for k in sorted(all_keys):
-        bv = before.get(k, "<ABSENT>")
-        av = after.get(k, "<ABSENT>")
-        if bv != av:
-            diffs.append(f"  Δ {k}: {repr(bv)[:60]} → {repr(av)[:60]}")
-    if diffs:
-        print(f"\n[DIFF] {label}: {len(diffs)} changes", file=sys.stderr)
-        for d in diffs:
-            print(d, file=sys.stderr)
-    else:
-        print(f"\n[DIFF] {label}: no changes", file=sys.stderr)
-
-
-def guard(condition: bool, message: str, **context) -> None:
-    """条件断言守卫 — 断言失败时转储上下文而非直接crash.
-
-    新增函数: 比 assert 更友好, 总是打印诊断信息.
     用法:
-        guard(cost > 0, "cost must be positive", cost=cost, device=dev)
+        with timing("cost_estimation"):
+            result = engine.estimate_all_devices(query)
+
+    输出:
+        [TIMING] cost_estimation: 12.34 ms
+    """
+    if not dbg.enabled:
+        yield
+        return
+
+    t0 = time.perf_counter()
+    dbg._timing_stack.append(label)
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - t0
+        dbg._timing_stack.pop()
+        # 累积统计
+        if label not in dbg._accumulated_timings:
+            dbg._accumulated_timings[label] = (0.0, 0)
+        prev_total, prev_count = dbg._accumulated_timings[label]
+        dbg._accumulated_timings[label] = (prev_total + elapsed, prev_count + 1)
+
+        depth_marker = "│ " * len(dbg._timing_stack)
+        print(f"[TIMING] {depth_marker}{label}: {elapsed*1000:.2f} ms",
+              file=dbg._file)
+
+
+def checkpoint(tag: str, **kwargs):
+    """把当前状态写入JSON checkpoint文件.
+
+    用法:
+        checkpoint("after_routing", engine_state=engine, decisions=decs)
+
+    生成:
+        /tmp/lynceus_checkpoints/after_routing_001.json
+
+    可以在实验崩溃后用 json.load 恢复查看当时的状态.
+    """
+    if not dbg.enabled:
+        return
+
+    dbg._call_counts[f"ckpt:{tag}"] = dbg._call_counts.get(f"ckpt:{tag}", 0) + 1
+    seq = dbg._call_counts[f"ckpt:{tag}"]
+
+    # 序列化所有kwargs
+    serializable = {}
+    for k, v in kwargs.items():
+        try:
+            if hasattr(v, '__dataclass_fields__'):
+                serializable[k] = asdict(v)
+            elif isinstance(v, (dict, list, tuple, str, int, float, bool)):
+                serializable[k] = v
+            else:
+                serializable[k] = repr(v)[:500]
+        except Exception as e:
+            serializable[k] = f"<unserializable: {e}>"
+
+    serializable["_meta"] = {
+        "tag": tag,
+        "seq": seq,
+        "timestamp": time.time(),
+        "timestamp_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    ckpt_path = dbg._ckpt_dir / f"{tag}_{seq:04d}.json"
+    try:
+        with open(ckpt_path, "w") as f:
+            json.dump(serializable, f, indent=2, default=str)
+        print(f"[CHECKPOINT] wrote {ckpt_path}", file=dbg._file)
+    except Exception as e:
+        print(f"[CHECKPOINT] FAILED to write {ckpt_path}: {e}", file=dbg._file)
+
+
+def inspect_struct(obj: Any, depth: int = 2, _current_depth: int = 0):
+    """递归打印结构体的嵌套字段 — 比snapshot更深入.
+
+    用法:
+        inspect_struct(topology, depth=3)
+    """
+    if not dbg.enabled:
+        return
+    pad = "  " * _current_depth
+    name = type(obj).__name__
+
+    if _current_depth >= depth:
+        print(f"{pad}<{name}> ...(max depth)", file=dbg._file)
+        return
+
+    if hasattr(obj, '__dataclass_fields__'):
+        print(f"{pad}<{name}>", file=dbg._file)
+        for fld in fields(obj):
+            val = getattr(obj, fld.name)
+            if hasattr(val, '__dataclass_fields__'):
+                print(f"{pad}  .{fld.name}:", file=dbg._file)
+                inspect_struct(val, depth, _current_depth + 2)
+            elif isinstance(val, dict) and val:
+                print(f"{pad}  .{fld.name}: dict[{len(val)}]", file=dbg._file)
+                for dk, dv in list(val.items())[:3]:
+                    if hasattr(dv, '__dataclass_fields__'):
+                        print(f"{pad}    [{dk}]:", file=dbg._file)
+                        inspect_struct(dv, depth, _current_depth + 3)
+                    else:
+                        print(f"{pad}    [{dk}] = {repr(dv)[:80]}", file=dbg._file)
+            else:
+                print(f"{pad}  .{fld.name} = {repr(val)[:100]}", file=dbg._file)
+    elif isinstance(obj, dict):
+        print(f"{pad}dict[{len(obj)}]", file=dbg._file)
+        for dk, dv in list(obj.items())[:5]:
+            print(f"{pad}  [{dk}]:", file=dbg._file)
+            inspect_struct(dv, depth, _current_depth + 1)
+    else:
+        print(f"{pad}{repr(obj)[:200]}", file=dbg._file)
+
+
+def assert_valid(condition: bool, msg: str, **context):
+    """带详细上下文的断言 — 失败时自动dump所有上下文变量.
+
+    用法:
+        assert_valid(cost > 0, "cost must be positive",
+                     query=query, device=dev, cost=cost)
     """
     if condition:
         return
-    print(f"\n{'!'*60}", file=sys.stderr)
-    print(f"[GUARD FAILED] {message}", file=sys.stderr)
+    print(f"\n{'!'*60}", file=dbg._file)
+    print(f"[ASSERTION FAILED] {msg}", file=dbg._file)
     for k, v in context.items():
-        print(f"  {k} = {repr(v)[:200]}", file=sys.stderr)
-    print(f"{'!'*60}", file=sys.stderr)
-    runtime_stats.incr("guard.failures")
-    # 不抛异常, 但记录; 想崩溃的话在这里 breakpoint()
+        dbg._render_value(k, v, indent=2)
+    print(f"Stack trace:", file=dbg._file)
+    traceback.print_stack(file=dbg._file)
+    print(f"{'!'*60}", file=dbg._file)
+    raise AssertionError(msg)
 
 
-def timed(label: str) -> Callable:
-    """函数计时装饰器 — 自动记录每次调用的耗时.
-
-    新增函数.
-    用法:
-        @timed("CostModel.recommend")
-        def recommend(self, query): ...
-
-    输出:
-        [TIMED] CostModel.recommend: 42.3µs
-    """
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            t0 = time.perf_counter()
-            result = func(*args, **kwargs)
-            elapsed_us = (time.perf_counter() - t0) * 1e6
-            runtime_stats.record_time(label, elapsed_us)
-            if _DBG_LEVEL >= 2:
-                print(f"  [TIMED] {label}: {elapsed_us:.1f}µs", file=sys.stderr)
-            return result
-        return wrapper
-    return decorator
-
-
-# ─── Checkpoint / Restore ────────────────────────────────────────────────────
-
-_checkpoints: Dict[str, Dict[str, Any]] = {}
-
-
-def checkpoint(name: str, **state) -> None:
-    """保存一个命名检查点 — 可在后续对比或恢复.
-
-    新增函数.
-    用法:
-        checkpoint("before_routing", costs=costs, device=dev)
-        ...
-        prev = restore("before_routing")
-    """
-    _checkpoints[name] = {"_ts": time.time(), **state}
-    if _DBG_LEVEL >= 2:
-        print(f"  [CHECKPOINT] '{name}' saved ({len(state)} fields)", file=sys.stderr)
-
-
-def restore(name: str) -> Optional[Dict[str, Any]]:
-    """恢复一个命名检查点."""
-    cp = _checkpoints.get(name)
-    if cp is None and _DBG_LEVEL >= 1:
-        print(f"  [CHECKPOINT] '{name}' not found", file=sys.stderr)
-    return cp
-
-
-# ─── 全局单例 ────────────────────────────────────────────────────────────────
+# 全局单例
 dbg = DebugPrinter()
-tracer = CallTracer()
-runtime_stats = RuntimeStats()
