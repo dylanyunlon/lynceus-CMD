@@ -1,3 +1,14 @@
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[DIS] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
 /*
  * Lynceus — Cost-Model-Driven Query Routing for Heterogeneous GPU-CPU Systems
  *
@@ -234,29 +245,16 @@ inline double estimate_cpu_cost(const QueryBin &q,
     io = pages * c.seq_page_cost;
   }
 
-  // --- 算法改写: 加 NUMA 跨 socket 惩罚
-  //     当数据量超过单 socket LLC 容量(~30MB)时, 假设 30% 概率跨 socket
-  double numa_penalty = 1.0;
-  if (data_bytes > 30 * 1024 * 1024) {
-    numa_penalty = 1.0 + 0.3 * 0.3;  // 30% 概率, 30% 延迟惩罚
-  }
-
   double compute = q.estimated_rows * c.tuple_cost
                  + q.estimated_rows * q.num_predicates * c.operator_cost;
-  compute *= numa_penalty;
 
-  // --- 算法改写: sort 系数从 2.0 降到 1.8 (假设 pdqsort 比 merge sort 稍优)
   double sort = 0.0;
   if (q.sort_required && q.estimated_rows > 1) {
     double n = static_cast<double>(q.estimated_rows);
-    sort = 1.8 * n * std::log2(std::max(2.0, n)) * c.operator_cost;
+    sort = 2.0 * n * std::log2(std::max(2.0, n)) * c.operator_cost;
   }
 
-  double total = io + compute + sort;
-  // 调试: 代价分项
-  fprintf(stderr, "[CPU·COST] rows=%lu io=%.1f comp=%.1f(numa=%.3f) sort=%.1f total=%.1f\n",
-          (unsigned long)q.estimated_rows, io, compute, numa_penalty, sort, total);
-  return total;
+  return io + compute + sort;
 }
 
 inline double estimate_gpu_cost(const QueryBin &q,
@@ -267,6 +265,8 @@ inline double estimate_gpu_cost(const QueryBin &q,
       ? (static_cast<double>(data_bytes) / (c.pcie_bandwidth_gb_s * 1e9)) * 1e6
       : 0.0;
 
+  // Kernel launch: FIXED overhead (not scaled by compute capacity)
+  // This bug was caught in M001-M002 review
   double launch = c.kernel_launch_overhead;
 
   double hbm = (c.hbm_bandwidth_gb_s > 0)
@@ -276,25 +276,14 @@ inline double estimate_gpu_cost(const QueryBin &q,
   double compute = q.estimated_rows * c.gpu_tuple_cost
                  + q.estimated_rows * q.num_predicates * c.gpu_operator_cost;
 
-  // --- 算法改写: sort 从 bitonic (n * log^2(n)) 换成 radix sort 模型 O(n * w)
-  //     w = key width in bits, 这里用 32 bit key 宽度
   double sort = 0.0;
   if (q.sort_required && q.estimated_rows > 1 && c.gpu_num_sms > 0) {
     double n = static_cast<double>(q.estimated_rows);
-    constexpr double radix_key_bits = 32.0;
-    constexpr double radix_digit_bits = 8.0;  // 每轮处理 8 bit
-    double passes = radix_key_bits / radix_digit_bits;  // = 4 passes
-    sort = n * passes * c.gpu_operator_cost / c.gpu_num_sms;
+    double log2n = std::log2(std::max(2.0, n));
+    sort = n * (log2n * log2n) * c.gpu_operator_cost / c.gpu_num_sms;
   }
 
-  // --- 算法改写: 原版 max(hbm, compute) 假设完全overlap,
-  //     port 改为 0.85 比例 overlap (现实中 PCIe DMA 会抢内存带宽)
-  double kernel = hbm * 0.15 + compute * 0.15 + std::max(hbm, compute) * 0.85;
-
-  double total = transfer + launch + kernel + sort;
-  fprintf(stderr, "[GPU·COST] rows=%lu xfer=%.1f launch=%.1f hbm=%.1f comp=%.1f sort=%.1f total=%.1f\n",
-          (unsigned long)q.estimated_rows, transfer, launch, hbm, compute, sort, total);
-  return total;
+  return transfer + launch + std::max(hbm, compute) + sort;
 }
 
 // ---------------------------------------------------------------------------

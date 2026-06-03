@@ -1,18 +1,38 @@
-#pragma once
-#include <cstddef>
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
 #include <cstdio>
-#include <cstdint>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[GEN] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
+/*
+ * Copyright (C) 2024 Data-Intensive Systems Lab, Simon Fraser University.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// table/ia_table.h removed — Lynceus uses own table layer
 
 namespace lynceus {
 namespace index {
 
 struct GenericIndex {
-  // 调试: 操作计数, 不用 atomic — 单线程调试场景够用, 避免引入原版没有的头文件
-  uint64_t _cnt_ins = 0;
-  uint64_t _cnt_search = 0;
-  uint64_t _cnt_scan = 0;
-  uint64_t _cnt_del = 0;
-
   virtual bool Insert(const char *key, size_t key_sz, const char *value, size_t value_sz) = 0;
   virtual bool Search(const char *key, size_t key_sz, char *&value_out) = 0;
   virtual int Scan(const char *start_key, bool start_key_inclusive,
@@ -24,21 +44,13 @@ struct GenericIndex {
   virtual bool Update(const char *key, size_t key_sz, const char *value, size_t value_sz) = 0;
   virtual bool Delete(const char *key, size_t key_sz) = 0;
 
-  // --- 算法改写: 原版没有虚析构, port加上防止基类指针 delete 时内存泄漏
-  virtual ~GenericIndex() = default;
-
   GenericIndex(size_t key_size, size_t value_size)
     : key_size(key_size), value_size(value_size) {}
 
-  // 调试: 打印计数快照
-  void dump_counters(const char *who = "?") const {
-    fprintf(stderr, "[IDX·STAT] %s ins=%lu srch=%lu scan=%lu del=%lu\n",
-            who, _cnt_ins, _cnt_search, _cnt_scan, _cnt_del);
-  }
-
   size_t key_size;
   size_t value_size;
+  
 };
 
-} // namespace index
+} //namespace index
 } // namespace lynceus

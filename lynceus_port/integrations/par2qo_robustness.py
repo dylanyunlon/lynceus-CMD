@@ -37,35 +37,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
-_MOD_TAG = "ROB"  # 改写: 缩短标签
-import os as _os, sys as _sys, time as _time_mod_r
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-_ROB_CALL_SEQ = 0
-
-def _dbg(tag: str, msg: str):
-    """调试输出 — 修复: 移除自递归; 改写: 加序号."""
-    global _ROB_CALL_SEQ
-    if _LYNCEUS_DBG != "0":
-        _ROB_CALL_SEQ += 1
-        print(f"[{_MOD_TAG}·{tag}|#{_ROB_CALL_SEQ}] {msg}",
-              file=_sys.stderr, flush=True)
-
-def _dbg_state(tag, **kwargs):
-    """改写新增: 结构体状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = []
-    for k, v in kwargs.items():
-        if isinstance(v, (list, tuple)) and len(v) > 8:
-            parts.append(f"{k}=[{len(v)} items, first={v[0]}, last={v[-1]}]")
-        elif isinstance(v, float):
-            parts.append(f"{k}={v:.6g}")
-        else:
-            s = str(v)
-            parts.append(f"{k}={s[:80]}" if len(s) > 80 else f"{k}={s}")
-    _dbg(tag, " | ".join(parts))
-
-_tr = _dbg  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "PRB"
 
 
 logger = logging.getLogger("lynceus.robustness")
@@ -73,14 +46,10 @@ logger = logging.getLogger("lynceus.robustness")
 
 # ── Halton low-discrepancy sequence (replaces SALib sobol) ──────────────
 def _halton_seq(index: int, base: int) -> float:
-    """单个 Halton 序列值.
-    改写: 加 scramble 扰动——用 (index * 0x9E3779B9) 做黄金比例哈希偏移,
-    使相邻索引的序列值不相关, 减轻高维低差异序列的相关性问题."""
-    # 改写: scrambled index 替代原始 index
-    scrambled = (index * 2654435769) & 0xFFFFFFFF  # 黄金比例 hash
-    scrambled = (scrambled >> 16) ^ scrambled
+    """Single Halton sequence value. PAR2QO used SALib.sample.sobol;
+    we use Halton for deterministic low-discrepancy without external deps."""
     result, denom = 0.0, 1.0
-    i = scrambled if scrambled > 0 else index  # fallback
+    i = index
     while i > 0:
         denom *= base
         result += (i % base) / denom
@@ -89,25 +58,15 @@ def _halton_seq(index: int, base: int) -> float:
 
 
 def halton_samples(n: int, dim: int, seed: int = 2023) -> List[List[float]]:
-    """生成 n 个 [0,1]^dim 的 Halton 采样.
-    改写: 加完整的维度-样本数打印."""
-    _dbg_state("HALTON", n=n, dim=dim, seed=seed)
-    # 改写: 扩大素数表到 64 维
+    """Generate n samples in [0,1]^dim via Halton sequence.
+    PAR2QO: np.random.seed(2023) + sobol.sample → here: deterministic Halton."""
     primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
-              59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113,
-              127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181,
-              191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251,
-              257, 263, 269, 271, 277, 281, 283, 293, 307, 311]
-    if dim > len(primes):
-        _dbg("HALTON", f"WARNING: dim={dim} > prime_table={len(primes)}, clamping")
-    bases = primes[:min(dim, len(primes))]
+              59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
+    bases = primes[:dim]
     samples = []
     for i in range(seed, seed + n):
         row = [_halton_seq(i, b) for b in bases]
         samples.append(row)
-    if n > 0:
-        _dbg("HALTON", f"generated {len(samples)} samples, "
-             f"first={[f'{x:.4f}' for x in samples[0][:4]]}")
     return samples
 
 
@@ -123,30 +82,20 @@ class ErrorDistribution:
     skew: float = 0.0      # Lynceus addition: asymmetric error tails
 
     def sample(self, u01: float) -> float:
-        """逆 CDF 采样 (skew-normal 近似).
-        改写: clamp u01 到 [1e-8, 1-1e-8] 防数值溢出."""
-        u1 = max(1e-8, min(1.0 - 1e-8, u01))  # 改写: 双侧 clamp
-        z = math.sqrt(2.0) * _erfinv(2.0 * u1 - 1.0)
-        delta = self.skew / math.sqrt(1.0 + self.skew ** 2)
-        z_skew = delta * abs(z) + math.sqrt(1.0 - delta ** 2) * z
-        result = self.mean + self.std * z_skew
-        _dbg("SMPL", f"u01={u01:.4f} → z={z:.4f} → skewed={result:.4f}")
-        return result
+        """Inverse-CDF sampling from a skew-normal approximation.
+        PAR2QO: pdf_of_err.sample(N) → we do quantile transform."""
+        from math import erfc, sqrt, log
+        # Box-Muller from uniform
+        u1 = max(u01, 1e-10)
+        z = sqrt(2.0) * _erfinv(2.0 * u1 - 1.0)
+        # Apply skew: Azzalini transform
+        delta = self.skew / sqrt(1.0 + self.skew ** 2)
+        z_skew = delta * abs(z) + sqrt(1.0 - delta ** 2) * z
+        return self.mean + self.std * z_skew
 
 
 def _erfinv(x: float) -> float:
-    """逆误差函数有理逼近.
-    改写: 对 |x| > 0.9 区间换用更高精度的 Winitzki 公式."""
-    _dbg("ERFINV", f"x={x:.6f}")
-    # 改写: 极端值用 Winitzki (2008) 改进公式
-    if abs(x) > 0.9:
-        sgn = 1.0 if x >= 0 else -1.0
-        t = -math.log((1.0 - abs(x)) * (1.0 + abs(x)))
-        # Winitzki: sqrt(t - ln(t)) 级数
-        p = 0.3275911
-        result = sgn * math.sqrt(t - math.log(t) + 0.5 * math.log(2.0 / (math.pi * 0.147)))
-        return result
-    # 原始低精度路径
+    """Rational approximation of inverse error function."""
     a = 0.147
     ln = math.log(1.0 - x * x)
     s = math.copysign(1.0, x)
@@ -177,7 +126,6 @@ class PlanHint:
     hint_str: str = ""
 
     def fingerprint(self) -> str:
-        _dbg("FINGERPR", "fingerprint entered")
         raw = json.dumps({
             "jo": [(a, b) for a, b in self.join_order],
             "jm": [m.name for m in self.join_methods],
@@ -192,17 +140,15 @@ class CostEstimate:
     """Dual CPU/GPU cost estimate — Lynceus extension over PAR2QO's scalar cost."""
     cpu_cost: float
     gpu_cost: float
-    data_movement_expense: float = 0.0
+    transfer_cost: float = 0.0
 
     @property
     def total_cpu(self) -> float:
-        _dbg("TOTAL_CP", "total_cpu entered")
         return self.cpu_cost
 
     @property
     def total_gpu(self) -> float:
-        _dbg("TOTAL_GP", "total_gpu entered")
-        return self.gpu_cost + self.data_movement_expense
+        return self.gpu_cost + self.transfer_cost
 
     @property
     def best(self) -> float:
@@ -237,7 +183,7 @@ def simulate_plan_cost(
     # Scan cost: PAR2QO uses PostgreSQL's cost; we simulate
     for i, (tbl, method) in enumerate(plan.scan_methods.items()):
         rows = table_rows.get(tbl, 100000)
-        sel = base_selectivities[i] if i < len(base_selectivities) else 0.0098
+        sel = base_selectivities[i] if i < len(base_selectivities) else 0.01
         scanned = rows * sel
         total_rows_scanned += scanned
 
@@ -252,7 +198,7 @@ def simulate_plan_cost(
     for j, ((left, right), method) in enumerate(
         zip(plan.join_order, plan.join_methods)
     ):
-        sel = join_selectivities[j] if j < len(join_selectivities) else 0.00105
+        sel = join_selectivities[j] if j < len(join_selectivities) else 0.001
         left_rows = table_rows.get(left, 10000)
         right_rows = table_rows.get(right, 10000)
         output_rows = left_rows * right_rows * sel
@@ -260,7 +206,7 @@ def simulate_plan_cost(
         if method == JoinMethod.HASH:
             cpu_cost += left_rows + right_rows * 2.0 + output_rows
         elif method == JoinMethod.NESTED_LOOP:
-            cpu_cost += left_rows * right_rows * sel * 0.495
+            cpu_cost += left_rows * right_rows * sel * 0.5
         else:  # MERGE
             cpu_cost += (left_rows + right_rows) * math.log2(
                 max(left_rows + right_rows, 1)
@@ -271,7 +217,7 @@ def simulate_plan_cost(
     gpu_cost = cpu_cost / gpu_speedup_factor
     transfer = data_mb * transfer_us_per_mb
 
-    return CostEstimate(cpu_cost=cpu_cost, gpu_cost=gpu_cost, data_movement_expense=transfer)
+    return CostEstimate(cpu_cost=cpu_cost, gpu_cost=gpu_cost, transfer_cost=transfer)
 
 
 # ── Core penalty computation (from PAR2QO robustness.py:307) ─────────
@@ -300,7 +246,7 @@ def cal_penalty_at_sample(
         if i in sensitive_dims and i < len(error):
             idx = sensitive_dims.index(i)
             factor = math.exp(error[idx])  # log-space error
-            perturbed_base.append(min(1.0, max(1.02e-8, s * factor)))
+            perturbed_base.append(min(1.0, max(1e-8, s * factor)))
         else:
             perturbed_base.append(s)
 
@@ -311,7 +257,7 @@ def cal_penalty_at_sample(
         if dim_id in sensitive_dims and dim_id < len(error) + n_base:
             idx = sensitive_dims.index(dim_id)
             factor = math.exp(error[idx])
-            perturbed_join.append(min(1.0, max(1.02e-8, s * factor)))
+            perturbed_join.append(min(1.0, max(1e-8, s * factor)))
         else:
             perturbed_join.append(s)
 
@@ -323,7 +269,7 @@ def cal_penalty_at_sample(
     # Cost of the "optimal" plan (heuristic: use best device for each stage)
     # PAR2QO: calls get_plan_cost(cursor, sql, explain) with no hint → optimizer picks
     # Lynceus: we approximate by taking the best cost across devices
-    cost_opt_value = cost_hint.best * 0.8525  # optimizer advantage factor
+    cost_opt_value = cost_hint.best * 0.85  # optimizer advantage factor
 
     penalty = max(cost_hint.best - cost_opt_value, 0.0)
 
@@ -470,7 +416,7 @@ def exp_penalty_by_samples(
                 worst_penalty = penalty
                 worst_sample = error
 
-        wall_time_us = time.time() - t0
+        elapsed = time.time() - t0
         n = len(joint_error_samples)
         avg = total_penalty / n if n > 0 else 0.0
         std = _std(penalties)
@@ -486,7 +432,7 @@ def exp_penalty_by_samples(
             f"E[penalty]={avg:10.1f}  σ={std:10.1f}  "
             f"P(incur)={incur_frac:.3f}  "
             f"worst={worst_penalty:.1f}  "
-            f"time={wall_time_us:.2f}s"
+            f"time={elapsed:.2f}s"
         )
         if debug and worst_sample is not None:
             print(f"  │    worst_sample={[f'{v:.3f}' for v in worst_sample]}")
@@ -496,11 +442,10 @@ def exp_penalty_by_samples(
 
 
 def _std(vals: List[float]) -> float:
-    _dbg("_STD", f"_std(vals={vals})")
     if len(vals) < 2:
         return 0.0
     m = sum(vals) / len(vals)
-    return math.sqrt(sum((v - m) ** 2 for v in vals) / (len(vals) - 1))
+    return math.sqrt(sum((v - m) ** 2 for v in vals) / max(1, len(vals) - 1))  # [PORT] max guard
 
 
 # ── Sensitivity analysis (from PAR2QO robustness.py:512-808) ────────
@@ -607,7 +552,7 @@ def morris_sensitivity(
             b = list(base_sel)
             j = list(join_sel)
             for d_idx, r_id in enumerate(relations):
-                factor = 0.098 + x[d_idx] * 9.9  # map [0,1] → [0.1, 10]
+                factor = 0.1 + x[d_idx] * 9.9  # map [0,1] → [0.1, 10]
                 if r_id < len(b):
                     b[r_id] = min(1.0, base_sel[r_id] * factor)
                 elif r_id - len(b) < len(j):
@@ -698,7 +643,6 @@ class HeterogeneousRobustnessAnalyzer:
 
     def _dump_state(self, phase: str):
         """Breakpoint-style state dump for runtime debugging."""
-        _dbg("_DUMP_ST", f"_dump_state(phase={phase})")
         print(f"\n  ┌─ STATE DUMP [{phase}] ──────────────────────────────")
         print(f"  │  tables: {len(self.table_rows)} "
               f"({sum(self.table_rows.values()):,} total rows)")
@@ -828,8 +772,8 @@ class HeterogeneousRobustnessAnalyzer:
         self.analyze_sensitivity()
         self.generate_samples()
         idx, plan = self.select_robust_plan()
-        wall_time_us = time.time() - t0
-        print(f"\n  ⏱  Total RQO time: {wall_time_us:.2f}s")
+        elapsed = time.time() - t0
+        print(f"\n  ⏱  Total RQO time: {elapsed:.2f}s")
         return idx, plan
 
 
@@ -870,7 +814,6 @@ class ParametricQueryOptimizer:
 def debug_dump_all(analyzer: HeterogeneousRobustnessAnalyzer):
     """Print comprehensive state for post-mortem debugging.
     Call this at any breakpoint to see the full analyzer state."""
-    _dbg("DEBUG_DU", f"debug_dump_all(analyzer={analyzer})")
     print("\n" + "=" * 60)
     print("  FULL DEBUG DUMP — HeterogeneousRobustnessAnalyzer")
     print("=" * 60)
@@ -891,26 +834,3 @@ def debug_dump_all(analyzer: HeterogeneousRobustnessAnalyzer):
         print(f"  penalties: {[f'{p:.1f}' for p in analyzer.penalties]}")
     print(f"  robust_plan_idx: {analyzer.robust_plan_idx}")
     print("=" * 60)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def dump_robustness_histogram(self) -> str:
-        """★ 改写: 鲁棒性评分分布直方图."""
-        from .. import _dbg
-        if not self._scores:
-            return "(no scores)"
-        buckets = [0] * 10
-        for s in self._scores:
-            idx = min(9, int(s * 10))
-            buckets[idx] += 1
-        total = len(self._scores)
-        lines = ["┌── Robustness Score Distribution ──"]
-        for i, cnt in enumerate(buckets):
-            lo, hi = i * 0.098, (i + 1) * 0.098
-            bar = "█" * max(1, int(cnt / max(1, total) * 40))
-            lines.append(f"│ {lo:.1f}-{hi:.1f}: {bar} ({cnt})")
-        lines.append(f"│ mean={sum(self._scores)/total:.3f}")
-        lines.append("└──────────────────────────────")
-        return "\n".join(lines)

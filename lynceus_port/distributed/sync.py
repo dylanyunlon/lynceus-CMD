@@ -12,10 +12,10 @@ Architecture references (ported/adapted from):
 Modifications from upstream references (~20% original):
   - Removed: actual NCCL bindings, GPU kernel launches, CUDA streams
   - Removed: BytePS C++ coordinator, MXNet/TensorFlow adapters
-  - Added:   Simulated push-pull wire_delay model for cost-model parameter sync
+  - Added:   Simulated push-pull latency model for cost-model parameter sync
   - Added:   Async staleness tracking for convergence analysis
   - Added:   Comprehensive debug/print instrumentation for experiments
-  - Changed: Uses Lynceus topology graph for link_throughput/wire_delay instead of
+  - Changed: Uses Lynceus topology graph for bandwidth/latency instead of
              hardcoded NCCL topology search
 
 Design:
@@ -34,23 +34,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
-_MOD_TAG = "SYC"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg
-
-def _dbg_state(tag, **kwargs):
-    """键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "SYN"
 
 
 logger = logging.getLogger(__name__)
@@ -71,10 +56,10 @@ class SyncConfig:
     strategy: SyncStrategy = SyncStrategy.ALLREDUCE_RING
     n_workers: int = 4
     # Network parameters (from topology or manual override)
-    inter_node_bw_gbps: float = 99.5   # e.g., 100GbE
+    inter_node_bw_gbps: float = 100.0   # e.g., 100GbE
     inter_node_lat_us: float = 5.0      # typical for RDMA
     intra_node_bw_gbps: float = 600.0   # NVLink
-    intra_node_lat_us: float = 0.495
+    intra_node_lat_us: float = 0.5
     # BytePS-specific: parameter server worker count
     n_ps_servers: int = 1
     # Staleness tolerance (for async sync)
@@ -98,7 +83,7 @@ class SyncMetrics:
     convergence_error: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ SyncMetrics Debug Dump ═════════════════════════",
             f"{prefix}║ strategy          = {self.strategy.name}",
@@ -118,12 +103,14 @@ class SyncMetrics:
 # Ported from NCCL ring all-reduce: each worker sends n/p data in 2(p-1) steps
 
 def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
-    """NCCL ring all-reduce 代价模型.
-    _dbg("ESTIMATE", "ENTER estimate_ring_allreduce")
-    改写: 加流水线重叠——通信与计算可部分重叠(overlap_ratio);
-    加 congestion 模型——多环同时跑时有效带宽下降."""
-    _dbg_state("RING_AR", data_bytes=data_bytes, n_workers=config.n_workers,
-               bw_gbps=config.inter_node_bw_gbps)
+    """Model NCCL ring all-reduce cost.
+
+    From NCCL implementation:
+      Phase 1 (reduce-scatter): (p-1) steps, each sends data_bytes/p
+      Phase 2 (all-gather):     (p-1) steps, each sends data_bytes/p
+      Total comm: 2 * (p-1)/p * data_bytes / bandwidth + 2*(p-1) * latency
+    """
+    _dbg(_T, "estimate_ring_allreduce()")
     p = config.n_workers
     if p <= 1:
         return SyncMetrics(
@@ -133,28 +120,21 @@ def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
         )
 
     chunk_bytes = data_bytes / p
+    chunk_mb = chunk_bytes / (1024 * 1024)
 
-    # 改写: congestion 模型——p>8 时链路争用导致有效带宽衰减
-    if p > 8:
-        congestion_factor = 1.0 + 0.05 * math.log2(p / 8)
-        effective_bw = config.inter_node_bw_gbps / congestion_factor
-        _dbg("RING_AR", f"congestion: p={p}, factor={congestion_factor:.3f}, "
-             f"effective_bw={effective_bw:.1f} Gbps")
-    else:
-        effective_bw = config.inter_node_bw_gbps
+    # Bandwidth term: 2 * (p-1)/p * data / bw
+    bw_term_us = 2.0 * (p - 1) / p * (data_bytes / (1024 * 1024)) * 1000 / config.inter_node_bw_gbps
 
-    bw_term_us = 2.0 * (p - 1) / p * (data_bytes / (1024 * 1024)) * 1000 / effective_bw
+    # Latency term: 2 * (p-1) steps
     lat_term_us = 2.0 * (p - 1) * config.inter_node_lat_us
+
     communication_us = bw_term_us + lat_term_us
 
-    n_elements = data_bytes // 4
-    computation_us = n_elements * 0.001
+    # Local reduction: sum/average across chunks (CPU-bound, ~1ns per float)
+    n_elements = data_bytes // 4  # assume float32
+    computation_us = n_elements * 0.001  # 1ns per element → µs
 
-    # 改写: 流水线重叠——通信和计算可部分重叠(~30%)
-    overlap_ratio = 0.30
-    overlap_savings = min(computation_us, communication_us) * overlap_ratio
-    total = communication_us + computation_us - overlap_savings
-    _dbg("RING_AR", f"overlap savings={overlap_savings:.1f}us, total={total:.1f}us")
+    total = communication_us + computation_us
 
     metrics = SyncMetrics(
         strategy=SyncStrategy.ALLREDUCE_RING,
@@ -167,8 +147,9 @@ def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     if config.debug_print:
         print(f"\n  [SYNC] Ring AllReduce: {p} workers, {data_bytes:,}B")
         print(f"    bw_term={bw_term_us:.1f}µs, lat_term={lat_term_us:.1f}µs, "
-              f"compute={computation_us:.1f}µs, overlap={overlap_savings:.1f}µs "
-              f"→ total={total:.1f}µs")
+              f"compute={computation_us:.1f}µs → total={total:.1f}µs")
+        print(f"    chunk_size={chunk_bytes:,.0f}B/worker, "
+              f"steps=2×{p-1}={2*(p-1)}")
 
     return metrics
 
@@ -180,11 +161,11 @@ def estimate_tree_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     """Model tree all-reduce cost.
 
     Tree depth = ceil(log2(p)), each level: send full data.
-    Lower wire_delay than ring for small messages, worse link_throughput utilization.
+    Lower latency than ring for small messages, worse bandwidth utilization.
       Phase 1 (reduce): depth steps, each sends data_bytes
       Phase 2 (broadcast): depth steps, each sends data_bytes
     """
-    _dbg("ESTIMATE", f"estimate_tree_allreduce(data_bytes={data_bytes}, config={config})")
+    _dbg(_T, "estimate_tree_allreduce()")
     p = config.n_workers
     if p <= 1:
         return SyncMetrics(
@@ -201,7 +182,7 @@ def estimate_tree_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     communication_us = 2 * depth * per_level_us
 
     n_elements = data_bytes // 4
-    computation_us = n_elements * 0.00105 * depth  # reduce at each level
+    computation_us = n_elements * 0.001 * depth  # reduce at each level
 
     total = communication_us + computation_us
 
@@ -227,26 +208,25 @@ def estimate_tree_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
 def estimate_push_pull(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     """Model BytePS push-pull parameter server cost.
 
-    _dbg("ESTIMATE", "ENTER estimate_push_pull")
     Push phase: each worker sends data_bytes to PS (parallel, limited by PS NIC)
     Pull phase: PS broadcasts averaged data back to workers
-    PS throughput critical_stage: min(n_ps * NIC_bw, n_workers * worker_bw)
+    PS throughput bottleneck: min(n_ps * NIC_bw, n_workers * worker_bw)
     """
-    _dbg("ESTIMATE", f"estimate_push_pull(data_bytes={data_bytes}, config={config})")
+    _dbg(_T, "estimate_push_pull()")
     p = config.n_workers
     n_ps = config.n_ps_servers
     data_mb = data_bytes / (1024 * 1024)
 
     # Push: all workers send simultaneously, PS receives with n_ps NICs
-    # Effective link_throughput = min(n_ps * bw, p * bw) — usually PS is critical_stage
+    # Effective bandwidth = min(n_ps * bw, p * bw) — usually PS is bottleneck
     ps_recv_bw = n_ps * config.inter_node_bw_gbps
     push_time_us = data_mb * 1000 / ps_recv_bw + config.inter_node_lat_us
 
     # PS computation: average over p workers
     n_elements = data_bytes // 4
-    ps_compute_us = n_elements * p * 0.00105  # sum all workers' data
+    ps_compute_us = n_elements * p * 0.001  # sum all workers' data
 
-    # Pull: PS broadcasts back (same link_throughput model)
+    # Pull: PS broadcasts back (same bandwidth model)
     pull_time_us = data_mb * 1000 / ps_recv_bw + config.inter_node_lat_us
 
     communication_us = push_time_us + pull_time_us
@@ -278,6 +258,7 @@ def estimate_gossip(data_bytes: int, config: SyncConfig,
     Each round: each worker exchanges with one random peer.
     Convergence: O(log(p)) rounds for ε-convergence.
     """
+    _dbg(_T, "estimate_gossip()")
     p = config.n_workers
     if n_rounds <= 0:
         n_rounds = max(1, math.ceil(math.log2(p)) + 2)  # log(p) + safety margin
@@ -288,7 +269,7 @@ def estimate_gossip(data_bytes: int, config: SyncConfig,
     communication_us = n_rounds * per_round_us
     # Each round: average with peer (n_elements additions)
     n_elements = data_bytes // 4
-    computation_us = n_rounds * n_elements * 0.00105
+    computation_us = n_rounds * n_elements * 0.001
 
     # Convergence error decreases exponentially with rounds
     convergence_error = (1.0 - 1.0 / p) ** n_rounds
@@ -319,6 +300,7 @@ def estimate_sync_cost(
     debug_print: bool = True,
 ) -> SyncMetrics:
     """Top-level API: estimate sync cost using configured strategy."""
+    _dbg(_T, "estimate_sync_cost()")
     if config is None:
         config = SyncConfig(debug_print=debug_print)
 
@@ -344,6 +326,7 @@ def estimate_sync_cost(
 def compare_sync_strategies(data_bytes: int, n_workers: int = 4,
                            debug_print: bool = True) -> Dict[str, SyncMetrics]:
     """Compare all sync strategies — for experiment analysis."""
+    _dbg(_T, "compare_sync_strategies()")
     print(f"\n{'='*60}")
     print(f"[distributed/sync] Strategy Comparison: {data_bytes:,}B across {n_workers} workers")
     print(f"{'='*60}")
@@ -365,41 +348,3 @@ def compare_sync_strategies(data_bytes: int, n_workers: int = 4,
     print(f"\n  → Winner: {best[0]} at {best[1].total_time_us:,.1f}µs")
 
     return results
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-def estimate_gossip_convergence_rounds(n_workers: int,
-                                       target_error: float = 0.0098) -> int:
-    """★ 改写: Gossip 协议收敛轮数估算.
-
-    基于 exponential mixing: error ≤ (1 - 2/n)^rounds
-    → rounds ≥ log(target_error) / log(1 - 2/n)
-    """
-    import math
-    if n_workers < 2:
-        return 0
-    mixing = 1.0 - 2.0 / n_workers
-    if mixing <= 0:
-        return 1
-    rounds = math.ceil(math.log(target_error) / math.log(mixing))
-    from . import _dbg
-    _dbg(f"gossip_convergence: n={n_workers} → {rounds} rounds "
-         f"for err<{target_error}")
-    return max(1, rounds)
-
-
-def dump_sync_comparison(data_bytes: int, n_workers: int = 4) -> str:
-    """断点辅助: 同步策略对比表."""
-    _dbg("DUMP_SYN", f"dump_sync_comparison(data_bytes={data_bytes}, n_workers={n_workers})")
-    results = compare_sync_strategies(data_bytes, n_workers)
-    lines = ["┌── Sync Strategy Comparison ──",
-             f"│ data={data_bytes:,}B, workers={n_workers}"]
-    for name, metrics in sorted(results.items(), key=lambda x: x[1].total_us):
-        lines.append(f"│ {name:>12}: {metrics.total_us:>10.1f}µs "
-                     f"(lat={metrics.latency_us:.1f} "
-                     f"bw={metrics.bandwidth_us:.1f} "
-                     f"eff={metrics.efficiency:.2f})")
-    lines.append("└──────────────────────────────")
-    return "\n".join(lines)

@@ -1,31 +1,33 @@
 """
-lynceus_port/strategies/static.py — 静态路由策略.
+lynceus_port/strategies/static.py — 移植版静态路由策略.
 
-改写: HybridStaticStrategy 增加自适应阈值衰减 —
-      阈值随查询数缓慢降低, 越来越倾向 GPU.
+算法改写:
+  - HybridStaticStrategy: 原版用固定行数阈值 (estimated_rows > threshold).
+    移植版改为数据量阈值 (estimated_data_bytes > byte_threshold),
+    因为宽表和窄表行数相同但数据量差 10x, 按字节更合理.
+  - HybridStaticStrategy: 增加 query_type 感知——index_scan 即使数据量大
+    也倾向 CPU (GPU 的 B-tree 索引遍历效率低于 CPU).
+
+溯源同原版 (NCCL algo ring / Megatron static group).
 """
+
 from __future__ import annotations
+
 from typing import Optional
-from ..cost_model import CostModelEngine, QueryDescriptor
+
+from ..cost_model import CostModelEngine, QueryDescriptor, QueryType
 from ..schema import HardwareKind
 from .base import RoutingDecision, RoutingStrategyBase
-from .. import _dbg
+from .. import _dbg, _snapshot, LYNCEUS_DEBUG
 
-_MOD_TAG = "STC"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg  # 兼容旧调用
-
+_T = "STC"
 
 
 class GPUOnlyStrategy(RoutingStrategyBase):
-    def __init__(self, engine: CostModelEngine, *, gpu_id: str = "gpu0", **kw):
-        super().__init__(engine, **kw)
+
+    def __init__(self, engine: CostModelEngine, *,
+                 gpu_id: str = "gpu0", **kwargs):
+        super().__init__(engine, **kwargs)
         self._gpu_id = gpu_id
 
     @property
@@ -34,18 +36,21 @@ class GPUOnlyStrategy(RoutingStrategyBase):
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
-        self._query_count += 1
         cb = self._engine.estimate_on_device(query, self._gpu_id, data_location)
         return RoutingDecision(
-            query_id=query.query_id, device_id=self._gpu_id, cost=cb,
-            confidence=1.0, metadata={"reason": "fixed_gpu"},
-            trace_log=[f"GPU-Only: always {self._gpu_id}"],
+            query_id=query.query_id,
+            device_id=self._gpu_id,
+            cost=cb,
+            confidence=1.0,
+            metadata={"reason": "fixed_gpu"},
         )
 
 
 class CPUOnlyStrategy(RoutingStrategyBase):
-    def __init__(self, engine: CostModelEngine, *, cpu_id: str = "cpu0", **kw):
-        super().__init__(engine, **kw)
+
+    def __init__(self, engine: CostModelEngine, *,
+                 cpu_id: str = "cpu0", **kwargs):
+        super().__init__(engine, **kwargs)
         self._cpu_id = cpu_id
 
     @property
@@ -54,29 +59,38 @@ class CPUOnlyStrategy(RoutingStrategyBase):
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
-        self._query_count += 1
         cb = self._engine.estimate_on_device(query, self._cpu_id, data_location)
         return RoutingDecision(
-            query_id=query.query_id, device_id=self._cpu_id, cost=cb,
-            confidence=1.0, metadata={"reason": "fixed_cpu"},
-            trace_log=[f"CPU-Only: always {self._cpu_id}"],
+            query_id=query.query_id,
+            device_id=self._cpu_id,
+            cost=cb,
+            confidence=1.0,
+            metadata={"reason": "fixed_cpu"},
         )
 
 
 class HybridStaticStrategy(RoutingStrategyBase):
-    """阈值路由 — ★ 改写: 阈值随查询数衰减 (模拟预热学习)."""
+    """[PORT] 数据量阈值 + query_type 感知.
+
+    原版: estimated_rows > gpu_threshold_rows → GPU.
+    移植版:
+      1. 改按 estimated_data_bytes > gpu_threshold_bytes (字节阈值),
+         因为 10M 行 x 50B/row = 500MB, 而 100K 行 x 5000B/row 也是 500MB,
+         原版会把前者发 GPU、后者发 CPU, 但它们的数据量一样大.
+      2. INDEX_SCAN 强制 CPU: GPU 的 B-tree 遍历需要频繁分支,
+         在 SIMD 架构上效率很差, 不如让 CPU 的分支预测器处理.
+    """
 
     def __init__(self, engine: CostModelEngine, *,
                  gpu_threshold_rows: int = 100_000,
-                 gpu_id: str = "gpu0", cpu_id: str = "cpu0",
-                 threshold_decay: float = 0.9995,  # ★ 新参数
-                 **kw):
-        super().__init__(engine, **kw)
-        self._initial_threshold = gpu_threshold_rows
-        self._threshold = float(gpu_threshold_rows)
+                 gpu_threshold_bytes: int = 50_000_000,  # 50MB
+                 gpu_id: str = "gpu0",
+                 cpu_id: str = "cpu0", **kwargs):
+        super().__init__(engine, **kwargs)
+        self._threshold_rows = gpu_threshold_rows
+        self._threshold_bytes = gpu_threshold_bytes
         self._gpu_id = gpu_id
         self._cpu_id = cpu_id
-        self._decay = threshold_decay
 
     @property
     def name(self) -> str:
@@ -84,39 +98,42 @@ class HybridStaticStrategy(RoutingStrategyBase):
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
-        self._query_count += 1
-        # ★ 改写: 阈值衰减
-        self._threshold *= self._decay
-        effective_threshold = max(1000, self._threshold)  # 下限 1000 行
 
-        if query.estimated_rows > effective_threshold:
+        # [PORT] 强制 CPU: index scan 类型 (GPU B-tree 效率低)
+        if query.query_type == QueryType.INDEX_SCAN and query.index_available:
+            device = self._cpu_id
+            reason = "index_scan_prefers_cpu"
+        # [PORT] 按数据字节量判断而非行数
+        elif query.estimated_data_bytes > self._threshold_bytes:
+            device = self._gpu_id
+            reason = "bytes_above_threshold"
+        elif query.estimated_rows > self._threshold_rows:
+            # 保留行数阈值作为后备
             device = self._gpu_id
             reason = "rows_above_threshold"
         else:
             device = self._cpu_id
-            reason = "rows_below_threshold"
+            reason = "below_thresholds"
 
         cb = self._engine.estimate_on_device(query, device, data_location)
-        trace = [
-            f"threshold={effective_threshold:.0f} (initial={self._initial_threshold})",
-            f"rows={query.estimated_rows} → {reason} → {device}",
-        ]
+
+        _snapshot(_T, "hybrid_route",
+                  query=query.query_id,
+                  device=device,
+                  reason=reason,
+                  est_bytes=query.estimated_data_bytes,
+                  est_rows=query.estimated_rows)
+
         return RoutingDecision(
-            query_id=query.query_id, device_id=device, cost=cb,
+            query_id=query.query_id,
+            device_id=device,
+            cost=cb,
             confidence=1.0,
-            metadata={"reason": reason, "threshold": effective_threshold,
-                      "estimated_rows": query.estimated_rows},
-            trace_log=trace,
+            metadata={
+                "reason": reason,
+                "threshold_rows": self._threshold_rows,
+                "threshold_bytes": self._threshold_bytes,
+                "estimated_rows": query.estimated_rows,
+                "estimated_bytes": query.estimated_data_bytes,
+            },
         )
-
-    def reset(self) -> None:
-        super().reset()
-        self._threshold = float(self._initial_threshold)
-
-
-# ─── 静态策略调试 ────────────────────────────────────────────────
-def _dump_static_strategy(strategy, label=""):
-    """打印静态策略快照."""
-    import sys
-    print(f"[STR·STATIC] {label}: target={getattr(strategy, 'target_device', '?')}", 
-          file=sys.stderr, flush=True)

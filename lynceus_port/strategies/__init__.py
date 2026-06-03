@@ -1,16 +1,13 @@
-"""lynceus_port/strategies — 可插拔路由策略实现 (移植版)."""
-
-import sys as _sys, os as _os
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag, msg):
-    if _LYNCEUS_DBG != "0":
-        print(f"[STR·{tag}] {msg}", file=_sys.stderr, flush=True)
+"""lynceus/strategies — Pluggable routing strategy implementations."""
 
 from .base import RoutingDecision, RoutingStrategyBase
 from .static import CPUOnlyStrategy, GPUOnlyStrategy, HybridStaticStrategy
 from .cost_driven import CostModelRoutedStrategy, PAR2QOEnhancedStrategy
 from .adaptive import AdaptiveStrategy
+
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "__I"
+
 
 __all__ = [
     "RoutingDecision",
@@ -22,5 +19,3 @@ __all__ = [
     "PAR2QOEnhancedStrategy",
     "AdaptiveStrategy",
 ]
-
-_dbg("INIT", f"strategies loaded: {len(__all__)} exports")

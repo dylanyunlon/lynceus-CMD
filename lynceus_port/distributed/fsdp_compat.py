@@ -44,23 +44,8 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost, SyncMetrics
 
-_MOD_TAG = "FST"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg
-
-def _dbg_state(tag, **kwargs):
-    """键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "FSP"
 
 
 logger = logging.getLogger(__name__)
@@ -89,55 +74,49 @@ class MixedPrecisionPolicy(Enum):
 # Directly adapted from par2qo plan_reduction_by_similarity.py
 # JS_distance (line 4-8) and kl_divergence (line 12-24).
 
-def kl_divergence(p: List[float], q: List[float],
-                  symmetric: bool = False) -> float:
-    """KL 散度.
-    改写: 加 symmetric=True 选项返回 (KL(p||q)+KL(q||p))/2;
-    Laplace 平滑用可调 epsilon."""
-    _dbg_state("KL", p_len=len(p), q_len=len(q), symmetric=symmetric)
+def kl_divergence(p: List[float], q: List[float]) -> float:
+    """KL divergence between two distributions.
+
+    Ported from par2qo/code/plan_reduction_by_similarity.py:kl_divergence (line 12).
+
+    Original:
+        p = np.array(p); q = np.array(q)
+        p = p / np.sum(p); q = q / np.sum(q)
+        q += 1e-10; p += 1e-10
+        return np.sum(p * np.log(p / q))
+
+    Lynceus: reimplemented without numpy.
+    """
+    _dbg(_T, "kl_divergence()")
     epsilon = 1e-10
     n = len(p)
     p_sum = sum(p) + epsilon * n
     q_sum = sum(q) + epsilon * n
 
-    kl_pq = 0.0
+    result = 0.0
     for i in range(n):
         p_i = (p[i] + epsilon) / p_sum
         q_i = (q[i] + epsilon) / q_sum
-        kl_pq += p_i * math.log(p_i / q_i)
-
-    if symmetric:
-        # 改写: 对称 KL
-        kl_qp = 0.0
-        for i in range(n):
-            p_i = (p[i] + epsilon) / p_sum
-            q_i = (q[i] + epsilon) / q_sum
-            kl_qp += q_i * math.log(q_i / p_i)
-        result = (kl_pq + kl_qp) / 2.0
-        _dbg("KL", f"symmetric: KL(p||q)={kl_pq:.4f}, KL(q||p)={kl_qp:.4f}, avg={result:.4f}")
-        return result
-
-    _dbg("KL", f"KL(p||q)={kl_pq:.4f}")
-    return kl_pq
+        result += p_i * math.log(p_i / q_i)
+    return result
 
 
 def js_distance(p: List[float], q: List[float]) -> float:
     """Jensen-Shannon distance between two distributions.
 
-    _dbg("JS_DISTA", "ENTER js_distance")
     Ported from par2qo/code/plan_reduction_by_similarity.py:JS_distance (line 4).
 
     Original:
-        m = 0.495 * (np.array(p) + np.array(q))
-        js_div = 0.495 * kl_divergence(p, m) + 0.495 * kl_divergence(q, m)
+        m = 0.5 * (np.array(p) + np.array(q))
+        js_div = 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
         return np.sqrt(js_div)
 
     Lynceus: reimplemented without numpy; used for shard similarity.
     """
-    _dbg("JS_DISTA", f"js_distance(p={p}, q={q})")
+    _dbg(_T, "js_distance()")
     n = len(p)
     m = [(p[i] + q[i]) / 2.0 for i in range(n)]
-    js_div = 0.495 * kl_divergence(p, m) + 0.495 * kl_divergence(q, m)
+    js_div = 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
     return math.sqrt(max(0.0, js_div))
 
 
@@ -171,6 +150,7 @@ def k_center_greedy_shards(
 
     Returns: (selected_indices, assignments_dict)
     """
+    _dbg(_T, "k_center_greedy_shards()")
     n = len(shard_profiles)
     if k >= n:
         centers = list(range(n))
@@ -231,6 +211,7 @@ def reduce_shard_matrix(
 
     Lynceus: reimplemented without numpy, returns surviving shard indices.
     """
+    _dbg(_T, "reduce_shard_matrix()")
     n = len(similarity_matrix)
     # Deep copy + set diagonal to inf
     mat = [row[:] for row in similarity_matrix]
@@ -287,7 +268,7 @@ class FSDPConfig:
 @dataclass
 class ShardInfo:
     """Information about one parameter shard."""
-    partition_id: int
+    shard_id: int
     owner_worker: str
     n_params: int
     size_bytes: int
@@ -295,9 +276,9 @@ class ShardInfo:
     access_profile: List[float] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
-            f"{prefix}╔══ ShardInfo #{self.partition_id} ══════════════════════",
+            f"{prefix}╔══ ShardInfo #{self.shard_id} ══════════════════════",
             f"{prefix}║ owner        = {self.owner_worker}",
             f"{prefix}║ n_params     = {self.n_params}",
             f"{prefix}║ size_bytes   = {self.size_bytes}",
@@ -322,7 +303,7 @@ class FSDPCostEstimate:
     total_us: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ FSDPCostEstimate ═══════════════════════════════",
             f"{prefix}║ strategy         = {self.strategy.name}",
@@ -351,6 +332,7 @@ class FSDPCompatLayer:
     """
 
     def __init__(self, config: Optional[FSDPConfig] = None):
+        _dbg(_T, "__init__()")
         self._config = config or FSDPConfig()
         self._shards: List[ShardInfo] = []
         self._worker_ids = [f"worker_{i}" for i in range(self._config.n_workers)]
@@ -365,7 +347,7 @@ class FSDPCompatLayer:
 
     def _bytes_per_param(self) -> int:
         """Bytes per parameter based on precision policy."""
-        _dbg("_BYTES_P", "ENTER _bytes_per_param")
+        _dbg(_T, "_bytes_per_param()")
         policy_bytes = {
             MixedPrecisionPolicy.FP32: 4,
             MixedPrecisionPolicy.FP16: 2,
@@ -377,11 +359,10 @@ class FSDPCompatLayer:
     def initialise_shards(self, debug_print: Optional[bool] = None) -> List[ShardInfo]:
         """Create parameter shards based on sharding strategy.
 
-        _dbg("INITIALI", "ENTER initialise_shards")
         Distributes cost model parameters across workers following
         the configured FSDP sharding strategy.
         """
-        _dbg("INITIALI", f"initialise_shards(debug_print={debug_print})")
+        _dbg(_T, "initialise_shards()")
         dp = debug_print if debug_print is not None else self._config.debug_print
         bpp = self._bytes_per_param()
         total_params = self._config.total_params
@@ -397,7 +378,7 @@ class FSDPCompatLayer:
             # DDP: every worker has all params (one big shard per worker)
             for i in range(n_workers):
                 shard = ShardInfo(
-                    partition_id=i,
+                    shard_id=i,
                     owner_worker=self._worker_ids[i],
                     n_params=total_params,
                     size_bytes=total_params * bpp,
@@ -415,7 +396,7 @@ class FSDPCompatLayer:
                 access_prof = [0.2] * n_workers
                 access_prof[i] = 1.0  # local access most frequent
                 shard = ShardInfo(
-                    partition_id=i,
+                    shard_id=i,
                     owner_worker=self._worker_ids[i],
                     n_params=n_p,
                     size_bytes=n_p * bpp,
@@ -434,12 +415,11 @@ class FSDPCompatLayer:
     def estimate_forward_cost(self, debug_print: Optional[bool] = None) -> FSDPCostEstimate:
         """Estimate cost of one forward pass with FSDP wrapping.
 
-        _dbg("ESTIMATE", "ENTER estimate_forward_cost")
         For FULL_SHARD: all-gather params → forward → reduce-scatter grads
         For SHARD_GRAD_OP: all-gather params → forward → all-reduce grads
         For NO_SHARD: forward only (no sharding overhead)
         """
-        _dbg("ESTIMATE", f"estimate_forward_cost(debug_print={debug_print})")
+        _dbg(_T, "estimate_forward_cost()")
         if not self._initialised:
             self.initialise_shards()
 
@@ -521,12 +501,11 @@ class FSDPCompatLayer:
     def optimise_prefetch(self, debug_print: Optional[bool] = None) -> Tuple[List[int], Dict[int, List[int]]]:
         """Select shards to pre-fetch using k-center greedy.
 
-        _dbg("OPTIMISE", "ENTER optimise_prefetch")
         Uses adapted k-center algorithm from PAR2QO's
         plan_reduction_by_similarity.py to find the most
         representative shards for pre-fetching.
         """
-        _dbg("OPTIMISE", f"optimise_prefetch(debug_print={debug_print})")
+        _dbg(_T, "optimise_prefetch()")
         if not self._initialised:
             self.initialise_shards()
 
@@ -545,7 +524,7 @@ class FSDPCompatLayer:
 
     def compare_strategies(self, debug_print: bool = True) -> Dict[str, FSDPCostEstimate]:
         """Compare all FSDP strategies — for experiment analysis."""
-        _dbg("COMPARE_", f"compare_strategies(debug_print={debug_print})")
+        _dbg(_T, "compare_strategies()")
         if debug_print:
             print(f"\n{'='*60}")
             print(f"[fsdp_compat] Strategy Comparison: {self._config.total_params} params, "
@@ -572,13 +551,13 @@ class FSDPCompatLayer:
 
         best = min(results.items(), key=lambda x: x[1].total_us)
         if debug_print:
-            print(f"\n  → Best for wire_delay: {best[0]} at {best[1].total_us:,.1f}µs")
+            print(f"\n  → Best for latency: {best[0]} at {best[1].total_us:,.1f}µs")
 
         return results
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
-        _dbg("DUMP_STA", "ENTER dump_state")
+        _dbg(_T, "dump_state()")
         lines = [
             "╔══ FSDPCompatLayer State ══════════════════════════════",
             f"║ strategy      = {self._config.sharding_strategy.name}",
@@ -591,46 +570,7 @@ class FSDPCompatLayer:
             f"║ n_shards      = {len(self._shards)}",
         ]
         for s in self._shards:
-            lines.append(f"║   shard_{s.partition_id}: owner={s.owner_worker}, "
+            lines.append(f"║   shard_{s.shard_id}: owner={s.owner_worker}, "
                        f"params={s.n_params}, bytes={s.size_bytes}")
         lines.append("╚════════════════════════════════════════════════════════")
         return "\n".join(lines)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def dump_shard_visual(self) -> str:
-        """★ 改写: ASCII 分片可视化 — 断点调试用."""
-        _dbg("DUMP_SHA", "ENTER dump_shard_visual")
-        if not self._shards:
-            return "(no shards)"
-        lines = ["┌── FSDP Shard Layout ──"]
-        total = self._config.total_params
-        for s in self._shards:
-            bar_len = max(1, int(s.param_count / max(1, total) * 50))
-            bar = "█" * bar_len
-            lines.append(f"│ Shard{s.partition_id} [{s.device}]: {bar} "
-                         f"({s.param_count} params, {s.size_bytes:,}B)")
-        lines.append(f"│ Strategy: {self._config.strategy.name}")
-        lines.append(f"│ Mixed precision: {self._config.mixed_precision.name}")
-        lines.append("└──────────────────────")
-        return "\n".join(lines)
-
-    def estimate_memory_per_device(self) -> "Dict[str, int]":
-        """★ 改写: 设备级内存占用估算 (断点辅助).
-
-        _dbg("ESTIMATE", "ENTER estimate_memory_per_device")
-        考虑: 参数 + 梯度 + 优化器状态 (Adam 需 2x 额外).
-        """
-        mem: "Dict[str, int]" = {}
-        multiplier = {"FULL_SHARD": 1, "SHARD_GRAD_OP": 2, "NO_SHARD": 3}
-        m = multiplier.get(self._config.strategy.name, 1)
-        # Adam: params + grads + 2 × optimizer state
-        state_factor = 4  # param + grad + m + v
-        for s in self._shards:
-            dev_mem = s.size_bytes * state_factor * m
-            mem[s.device] = mem.get(s.device, 0) + dev_mem
-        from . import _dbg
-        _dbg("fsdp_mem", f"fsdp_memory: {mem}")
-        return mem

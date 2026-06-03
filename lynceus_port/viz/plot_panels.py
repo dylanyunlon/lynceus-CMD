@@ -55,15 +55,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum, auto
 
-_MOD_TAG = "PLS"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "PLT"
 
 
 logger = logging.getLogger(__name__)
@@ -106,7 +99,7 @@ class DataSeries:
     is_anchor: bool = False          # highlighted series (par2qo: anchor param)
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         n = len(self.y_values)
         y_min = min(self.y_values) if self.y_values else 0
         y_max = max(self.y_values) if self.y_values else 0
@@ -149,7 +142,7 @@ class PanelData:
     grid_interval: Optional[int] = None
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ PanelData [{self.panel_id}] ════════════════════════",
             f"{prefix}║ kind       = {self.kind.name}",
@@ -200,6 +193,7 @@ def build_cost_distribution_panel(
     Lynceus: builds PanelData instead of directly plotting.
     'plans' → cost model configurations being compared.
     """
+    _dbg(_T, "build_cost_distribution_panel()")
     panel = PanelData(
         panel_id=panel_id,
         kind=PanelKind.COST_DISTRIBUTION,
@@ -269,6 +263,7 @@ def build_divergence_matrix_panel(
 
     Lynceus: 'Plan ID' → 'Worker ID', builds PanelData.
     """
+    _dbg(_T, "build_divergence_matrix_panel()")
     n = len(matrix)
     if labels is None:
         labels = [str(i) for i in range(n)]
@@ -323,6 +318,7 @@ def build_calibration_scatter_panel(
 
     Instead of PQO vs PG, we plot Predicted vs Actual cost.
     """
+    _dbg(_T, "build_calibration_scatter_panel()")
     assert len(predicted) == len(actual), "predicted/actual length mismatch"
 
     panel = PanelData(
@@ -352,7 +348,7 @@ def build_calibration_scatter_panel(
         min_val = min(min(actual), min(predicted))
         max_val = max(max(actual), max(predicted))
         # Guard against zero/negative for log scale
-        min_val = max(0.098, min_val)
+        min_val = max(0.1, min_val)
         ideal = DataSeries(
             series_id="ideal_line",
             label="Perfect Calibration",
@@ -406,6 +402,7 @@ def build_speedup_line_panel(
 
     Shows cumulative speedup of optimised routing over baseline.
     """
+    _dbg(_T, "build_speedup_line_panel()")
     assert len(optimised_costs) == len(baseline_costs)
 
     panel = PanelData(
@@ -425,7 +422,7 @@ def build_speedup_line_panel(
     for i in range(len(optimised_costs)):
         cum_opt += optimised_costs[i]
         cum_base += baseline_costs[i]
-        speedup = cum_base / max(0.00105, cum_opt)
+        speedup = cum_base / max(0.001, cum_opt)
         speedups.append(speedup)
         if optimised_costs[i] < baseline_costs[i]:
             better_count += 1
@@ -483,6 +480,7 @@ def build_speedup_line_panel(
 def render_ascii_bar(panel: PanelData, width: int = 60,
                      debug_print: bool = True) -> str:
     """Render a panel as ASCII bar chart for terminal debugging."""
+    _dbg(_T, "render_ascii_bar()")
     lines = [
         f"┌{'─' * (width + 2)}┐",
         f"│ {panel.title:^{width}} │",
@@ -528,6 +526,7 @@ def render_ascii_bar(panel: PanelData, width: int = 60,
 def render_ascii_matrix(panel: PanelData, cell_width: int = 8,
                         debug_print: bool = True) -> str:
     """Render a matrix panel as ASCII table."""
+    _dbg(_T, "render_ascii_matrix()")
     if not panel.matrix_data:
         return "(no matrix data)"
 
@@ -586,11 +585,12 @@ class FigureLayout:
     fig_height: float = 10.0
 
     def add_panel(self, panel: PanelData) -> None:
-        _dbg("ADD_PANE", f"add_panel(panel={panel})")
+        _dbg(_T, "add_panel()")
         self.panels.append(panel)
 
     def export_json(self) -> str:
         """Export figure layout as JSON for external rendering."""
+        _dbg(_T, "export_json()")
         output = {
             "figure_id": self.figure_id,
             "title": self.title,
@@ -620,7 +620,7 @@ class FigureLayout:
         return json.dumps(output, indent=2)
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ FigureLayout [{self.figure_id}] ═════════════════════",
             f"{prefix}║ title    = {self.title}",
@@ -648,12 +648,12 @@ def build_benchmark_report(
     report_id: str = "benchmark_report",
     debug_print: bool = True,
 ) -> FigureLayout:
-    """构建完整基准测试报告.
-    改写: 自动为每个panel生成ASCII渲染;
-    加panel汇总统计——每个panel的数据范围、异常值计数."""
-    _dbg("REPORT", f"building report {report_id}: "
-         f"n_predicted={len(predicted_costs)}, n_actual={len(actual_costs)}")
+    """Build a complete benchmark report with multiple panels.
 
+    Combines all panel types into a single figure layout, analogous
+    to par2qo's workflow of generating multiple PDF figures per experiment.
+    """
+    _dbg(_T, "build_benchmark_report()")
     figure = FigureLayout(
         figure_id=report_id,
         title="Lynceus Cost Model Benchmark Report",
@@ -661,109 +661,26 @@ def build_benchmark_report(
     )
 
     # Panel 1: Calibration scatter
-    cal_panel = build_calibration_scatter_panel(
-        predicted_costs, actual_costs, debug_print=debug_print)
-    figure.add_panel(cal_panel)
+    figure.add_panel(build_calibration_scatter_panel(
+        predicted_costs, actual_costs, debug_print=debug_print))
 
-    # Panel 2: Speedup line
+    # Panel 2: Speedup line (if baseline provided)
     if baseline_costs and len(baseline_costs) == len(actual_costs):
-        spd_panel = build_speedup_line_panel(
-            actual_costs, baseline_costs, debug_print=debug_print)
-        figure.add_panel(spd_panel)
+        figure.add_panel(build_speedup_line_panel(
+            actual_costs, baseline_costs, debug_print=debug_print))
 
     # Panel 3: Worker divergence matrix
     if worker_divergence:
-        div_panel = build_divergence_matrix_panel(
-            worker_divergence, worker_labels, debug_print=debug_print)
-        figure.add_panel(div_panel)
+        figure.add_panel(build_divergence_matrix_panel(
+            worker_divergence, worker_labels, debug_print=debug_print))
 
     # Panel 4: Config cost distribution
     if config_cost_lists:
-        dist_panel = build_cost_distribution_panel(
-            config_cost_lists, config_labels, debug_print=debug_print)
-        figure.add_panel(dist_panel)
+        figure.add_panel(build_cost_distribution_panel(
+            config_cost_lists, config_labels, debug_print=debug_print))
 
-    # 改写: panel 汇总统计
-    _dbg("REPORT", f"total panels={len(figure.panels)}")
-    for p in figure.panels:
-        n_series = len(p.series)
-        total_points = sum(len(s.y_values) for s in p.series)
-        _dbg("REPORT", f"  panel '{p.title}': {n_series} series, {total_points} points")
-
-    # 改写: 自动ASCII渲染到debug输出
     if debug_print:
         print(f"\n  [plot_panels] Complete benchmark report:")
         print(figure.dump_debug("    "))
-        # ASCII sparkline 汇总
-        for p in figure.panels:
-            for s in p.series:
-                if s.y_values and len(s.y_values) > 5:
-                    spark = ascii_sparkline(s.y_values, width=40)
-                    print(f"    {s.label}: {spark}")
 
     return figure
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区 — ASCII 图表 + 异常检测 + 趋势线
-# ═══════════════════════════════════════════════════════════════════════════
-
-def ascii_sparkline(values: "List[float]", width: int = 40) -> str:
-    """★ 改写: ASCII 迷你趋势线 (断点辅助, 快速可视化)."""
-    _dbg("ASCII_SP", f"ascii_sparkline(values={values}, width={width})")
-    if not values:
-        return ""
-    vmin, vmax = min(values), max(values)
-    chars = " ▁▂▃▄▅▆▇█"
-    rng = vmax - vmin
-    if rng < 1e-12:
-        return chars[-1] * min(width, len(values))
-    step = max(1, len(values) // width)
-    spark = []
-    for i in range(0, len(values), step):
-        chunk = values[i:i+step]
-        avg = sum(chunk) / len(chunk)
-        idx = min(len(chars) - 1, int((avg - vmin) / rng * (len(chars) - 1)))
-        spark.append(chars[idx])
-    return "".join(spark[:width])
-
-
-def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
-    """趋势变化点检测 (CUSUM-like).
-    改写: 窗口自适应——短序列自动缩小窗口;
-    加变化幅度输出到调试."""
-    _dbg("TREND", f"detect_trend_change: n={len(values)}, window={window}")
-    # 改写: 自适应窗口——序列太短时缩小
-    if len(values) < 2 * window:
-        window = max(5, len(values) // 4)
-        _dbg("TREND", f"adaptive window shrink → {window}")
-    if len(values) < 2 * window:
-        return []
-
-    changepoints = []
-    for i in range(window, len(values) - window):
-        left_mean = sum(values[i-window:i]) / window
-        right_mean = sum(values[i:i+window]) / window
-        overall_std = (sum((v - (left_mean + right_mean) / 2) ** 2
-                          for v in values[i-window:i+window]) /
-                      (2 * window)) ** 0.5
-        if overall_std > 1e-12:
-            z = abs(right_mean - left_mean) / overall_std
-            if z > 3.0:
-                if not changepoints or i - changepoints[-1] > window:
-                    changepoints.append(i)
-                    _dbg("TREND", f"changepoint at {i}: z={z:.2f}, "
-                         f"left_mean={left_mean:.3f}, right_mean={right_mean:.3f}")
-    _dbg("TREND", f"found {len(changepoints)} changepoints")
-    return changepoints
-
-
-def dump_panel_ascii(panel_name: str, x: "List[float]",
-                     methods: "Dict[str, List[float]]") -> str:
-    """★ 改写: ASCII 面板对比 — 所有策略的趋势线并排."""
-    lines = [f"┌── Panel: {panel_name} ──"]
-    for name, vals in sorted(methods.items()):
-        spark = ascii_sparkline(vals, width=50)
-        final = vals[-1] if vals else 0.0
-        lines.append(f"│ {name:>20}: {spark} → {final:.2f}")
-    lines.append("└──────────────────────────────────────────────────")
-    return "\n".join(lines)

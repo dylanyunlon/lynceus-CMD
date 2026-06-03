@@ -1,27 +1,63 @@
-#pragma once
-#include <cassert>
-#include <cstring>
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
 #include <cstdio>
-#include <cstddef>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[GEN] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
+/*
+* Copyright (C) 2024 Data-Intensive Systems Lab, Simon Fraser University.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
 
 template <size_t L>
 struct GenericTPCCKey {
   char keys[L];
   static_assert(sizeof(char)==1);
+  GenericTPCCKey() {
+    std::memset(this->keys, 0, L);
+  }
 
-  GenericTPCCKey() { std::memset(this->keys, 0, L); }
-
+  // used because the member function of BTree index 
+  //  take parameters by lvalue reference, may need to 
+  //   change that later.
   GenericTPCCKey(const GenericTPCCKey &other) {
     std::memcpy(this->keys, other.keys, L);
   }
-
-  // --- 算法改写: 原版 CHECK(false) 即 abort,
-  //     port 改为正常 memcpy 但打印 warning 便于排查是谁触发的
+  
   GenericTPCCKey(GenericTPCCKey &&other) {
-    fprintf(stderr, "[KEY·MOVE] move ctor L=%zu, 原版会abort\n", L);
+    CHECK(false);	  
     std::memcpy(this->keys, other.keys, L);
   }
 
+/*
+  int cmp(const GenericTPCCKey &lhs, const GenericTPCCKey &rhs) {
+    for (int i = 0; i < L; ++i) {
+      if (lhs.keys[i] > rhs.keys[i]) {
+        return 1;
+      }	else if (lhs.keys[i] < rhs.keys[i]) {
+        return -1;
+      }
+    }
+    return 0;
+  }
+*/
   bool operator==(const GenericTPCCKey &other) const {
     return std::memcmp(this->keys, other.keys, L) == 0;
   }
@@ -29,35 +65,31 @@ struct GenericTPCCKey {
     return std::memcmp(this->keys, other.keys, L) != 0;
   }
   bool operator<(const GenericTPCCKey &other) const {
-    return std::memcmp(this->keys, other.keys, L) < 0;
+     return std::memcmp(this->keys, other.keys, L) < 0;
   }
   bool operator>(const GenericTPCCKey &other) const {
-    return std::memcmp(this->keys, other.keys, L) > 0;
+     return std::memcmp(this->keys, other.keys, L) > 0;
   }
   bool operator<=(const GenericTPCCKey &other) const {
-    return std::memcmp(this->keys, other.keys, L) <= 0;
+     return std::memcmp(this->keys, other.keys, L) <= 0;
   }
   bool operator>=(const GenericTPCCKey &other) const {
-    return std::memcmp(this->keys, other.keys, L) >= 0;
+     return std::memcmp(this->keys, other.keys, L) >= 0;
   }
 
   GenericTPCCKey& operator=(const GenericTPCCKey &other) {
-    if (this != &other) std::memcpy(this->keys, other.keys, L);
+    if ( this != &other ) {
+      std::memcpy(this->keys, other.keys, L);
+    }
     return *this;
   }
-
-  // --- 同上, 原版 CHECK(false) -> warning + memcpy
+ 
   GenericTPCCKey& operator=(GenericTPCCKey &&other) {
-    fprintf(stderr, "[KEY·MOVE] move assign L=%zu\n", L);
-    if (this != &other) std::memcpy(this->keys, other.keys, L);
+    CHECK(false);	  
+    if ( this != &other ) {
+      std::memcpy(this->keys, other.keys, L);
+    }
     return *this;
-  }
-
-  // 调试: 十六进制输出 key 内容
-  void hexdump(const char *label = "") const {
-    fprintf(stderr, "[KEY·HEX] %s L=%zu: ", label, L);
-    for (size_t i = 0; i < L; i++) fprintf(stderr, "%02x", (unsigned char)keys[i]);
-    fprintf(stderr, "\n");
   }
 };
 
@@ -65,4 +97,6 @@ template struct GenericTPCCKey<4>;
 template struct GenericTPCCKey<8>;
 template struct GenericTPCCKey<12>;
 template struct GenericTPCCKey<16>;
+// template struct GenericTPCCKey<32>;
 template struct GenericTPCCKey<40>;
+

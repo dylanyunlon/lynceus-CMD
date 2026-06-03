@@ -34,15 +34,8 @@ import time
 import logging
 from typing import List, Dict, Optional, Tuple, Any, Union
 
-_MOD_TAG = "PAS"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "PUT"
 
 
 logger = logging.getLogger("lynceus.par2qo_utils")
@@ -53,11 +46,10 @@ logger = logging.getLogger("lynceus.par2qo_utils")
 def card(a: Union[int, float, str]) -> int:
     """Clamp cardinality to at least 1.
 
-    _dbg("CARD", f"ENTER card(a={a!r}, float={float!r}, str]={str]!r})")
     PAR2QO: card(a) — if int(a)==0 return 1 else int(a).
     Lynceus: identical logic, added type safety.
     """
-    _dbg("CARD", f"card(a={a})")
+    _dbg(_T, "card()")
     try:
         v = int(a)
     except (ValueError, TypeError):
@@ -68,11 +60,10 @@ def card(a: Union[int, float, str]) -> int:
 def list_multiply(a: List[float], b: List[float]) -> List[float]:
     """Element-wise product of two lists.
 
-    _dbg("LIST_MUL", f"ENTER list_multiply(a={a!r}, b={b!r})")
     PAR2QO: list_multiply(a, b) — assert same length, zip-multiply.
     Lynceus: identical.
     """
-    _dbg("LIST_MUL", f"list_multiply(a={a}, b={b})")
+    _dbg(_T, "list_multiply()")
     assert len(a) == len(b), (
         f"list_multiply: length mismatch ({len(a)} vs {len(b)})"
     )
@@ -81,14 +72,14 @@ def list_multiply(a: List[float], b: List[float]) -> List[float]:
 
 def list_add(a: List[float], b: List[float]) -> List[float]:
     """Element-wise sum. Lynceus addition."""
-    _dbg("LIST_ADD", f"list_add(a={a}, b={b})")
+    _dbg(_T, "list_add()")
     assert len(a) == len(b), f"list_add: length mismatch ({len(a)} vs {len(b)})"
     return [x + y for x, y in zip(a, b)]
 
 
 def list_ratio(a: List[float], b: List[float], epsilon: float = 1e-12) -> List[float]:
     """Element-wise ratio a/b with epsilon guard. Lynceus addition."""
-    _dbg("LIST_RAT", f"list_ratio(a={a}, b={b}, epsilon={epsilon})")
+    _dbg(_T, "list_ratio()")
     assert len(a) == len(b), f"list_ratio: length mismatch ({len(a)} vs {len(b)})"
     return [x / max(y, epsilon) for x, y in zip(a, b)]
 
@@ -104,6 +95,7 @@ def selectivity_from_cardinality(
     PAR2QO: [est_base_card[i]/raw_base_card[i] for i in range(n)].
     Lynceus: vectorised with safety.
     """
+    _dbg(_T, "selectivity_from_cardinality()")
     result = []
     for e, r in zip(estimated, raw):
         result.append(card(e) / card(r))
@@ -123,6 +115,7 @@ def selectivity_perturbation(
     PAR2QO: prep_sel(..., error, recentered_error, relation_list, ...).
     Lynceus: simplified interface. ~20% change: log-space perturbation default.
     """
+    _dbg(_T, "selectivity_perturbation()")
     perturbed_base = list(base_sel)
     perturbed_join = list(join_sel)
     n_base = len(base_sel)
@@ -138,7 +131,7 @@ def selectivity_perturbation(
 
         if dim_id < n_base:
             old = perturbed_base[dim_id]
-            perturbed_base[dim_id] = min(1.0, max(1.02e-8, old * factor))
+            perturbed_base[dim_id] = min(1.0, max(1e-8, old * factor))
             if debug:
                 print(f"    perturb base[{dim_id}]: "
                       f"{old:.6f} → {perturbed_base[dim_id]:.6f} "
@@ -147,7 +140,7 @@ def selectivity_perturbation(
             j = dim_id - n_base
             if j < len(perturbed_join):
                 old = perturbed_join[j]
-                perturbed_join[j] = min(1.0, max(1.02e-8, old * factor))
+                perturbed_join[j] = min(1.0, max(1e-8, old * factor))
                 if debug:
                     print(f"    perturb join[{j}]: "
                           f"{old:.6f} → {perturbed_join[j]:.6f} "
@@ -160,25 +153,22 @@ def selectivity_perturbation(
 
 def yuxi(i: int, order: List[str]) -> str:
     """Build pg_hint_plan-style alias reference.
-    _dbg("YUXI", f"ENTER yuxi(i={i!r}, order={order!r})")
     PAR2QO: yuxi(i, order) → ' (yuxi_N order[i]) '."""
-    _dbg("YUXI", f"yuxi(i={i}, order={order})")
+    _dbg(_T, "yuxi()")
     return f" (yuxi_{i} {order[i]}) "
 
 
 def yuxi_short(i: int, order: List[str]) -> str:
     """Short form alias reference.
-    _dbg("YUXI_SHO", f"ENTER yuxi_short(i={i!r}, order={order!r})")
     PAR2QO: yuxi_short(i, order)."""
-    _dbg("YUXI_SHO", f"yuxi_short(i={i}, order={order})")
+    _dbg(_T, "yuxi_short()")
     return f" yuxi_{i} {order[i]}"
 
 
 def yuxi_card(join_list: List[str], rows: int) -> str:
     """Cardinality hint for a join group.
-    _dbg("YUXI_CAR", f"ENTER yuxi_card(join_list={join_list!r}, rows={rows!r})")
     PAR2QO: yuxi_card(join_list, rows)."""
-    _dbg("YUXI_CAR", f"yuxi_card(join_list={join_list}, rows={rows})")
+    _dbg(_T, "yuxi_card()")
     card_str = "Rows("
     for item in join_list:
         card_str += item
@@ -187,9 +177,8 @@ def yuxi_card(join_list: List[str], rows: int) -> str:
 
 def join_hint(join_list: List[str], mtd: Optional[str] = None) -> str:
     """Build a join hint from a list of table references.
-    _dbg("JOIN_HIN", f"ENTER join_hint(join_list={join_list!r}, mtd={mtd!r})")
     PAR2QO: join_hint(join_list, mtd)."""
-    _dbg("JOIN_HIN", f"join_hint(join_list={join_list}, mtd={mtd})")
+    _dbg(_T, "join_hint()")
     if mtd is None:
         join_str = "("
     else:
@@ -201,11 +190,10 @@ def join_hint(join_list: List[str], mtd: Optional[str] = None) -> str:
 
 def modify_query(sql: str, hint: str, explain: str = "") -> str:
     """Prepend hint to query for execution.
-    _dbg("MODIFY_Q", f"ENTER modify_query(sql={sql!r}, hint={hint!r}, explain={explain!r})")
     PAR2QO: modify_query — simple concat.
     Lynceus: also strips device annotations for clean SQL."""
-    _dbg("MODIFY_Q", f"modify_query(sql={sql}, hint={hint}, explain={explain})")
     # Strip existing device hints
+    _dbg(_T, "modify_query()")
     cleaned = re.sub(r'/\*\+\s*(GPU|CPU)\s*\*/', '', sql)
     if explain:
         return f"{explain}\n{hint}\n{cleaned}"
@@ -217,11 +205,10 @@ def modify_query(sql: str, hint: str, explain: str = "") -> str:
 def clean_json(raw_text: str, del_keys: Optional[List[str]] = None) -> str:
     """Clean PostgreSQL EXPLAIN JSON output into parseable JSON.
 
-    _dbg("CLEAN_JS", f"ENTER clean_json(raw_text={raw_text!r}, del_keys={del_keys!r})")
     PAR2QO: clean(json_file, new_json_file, del_line_key).
     Lynceus: operates on strings instead of files.
     """
-    _dbg("CLEAN_JS", f"clean_json(raw_text={raw_text}, del_keys={del_keys})")
+    _dbg(_T, "clean_json()")
     if del_keys is None:
         del_keys = ["QUERY PLAN", "row)", "----"]
 
@@ -247,6 +234,7 @@ def get_cost_list_from_json(
     PAR2QO: get_cost_list(json_file, is_estimate) → reads file.
     Lynceus: parses string. Returns (estimated_costs, actual_costs).
     """
+    _dbg(_T, "get_cost_list_from_json()")
     est_costs = []
     actual_costs = []
     in_plan = False
@@ -276,8 +264,9 @@ def parse_plan_costs(
 
     PAR2QO: scattered across robustness.py / postgres.py.
     Lynceus: unified parser with device annotation extraction.
-    Returns: {aggregate_cost, startup_cost, plan_rows, plan_width, ...}
+    Returns: {total_cost, startup_cost, plan_rows, plan_width, ...}
     """
+    _dbg(_T, "parse_plan_costs()")
     result = {}
     plan = plan_json.get("Plan", plan_json)
 
@@ -317,6 +306,7 @@ def batch_cost_summary(
     PAR2QO: scattered print statements in rqo().
     Lynceus: structured summary with device breakdown.
     """
+    _dbg(_T, "batch_cost_summary()")
     if plan_labels is None:
         plan_labels = [f"plan_{i}" for i in range(len(plans))]
 
@@ -342,7 +332,7 @@ def batch_cost_summary(
         "std": std,
         "best_plan": plan_labels[best_idx],
         "worst_plan": plan_labels[worst_idx],
-        "spread": max(costs) / max(min(costs), 1.05e-6),
+        "spread": max(costs) / max(min(costs), 1e-6),
     }
 
     if debug:
@@ -369,6 +359,7 @@ def debug_print_table(
     max_rows: int = 20,
 ):
     """Print a formatted debug table for state inspection."""
+    _dbg(_T, "debug_print_table()")
     widths = [len(h) for h in headers]
     for row in rows[:max_rows]:
         for i, cell in enumerate(row):
@@ -401,6 +392,7 @@ def debug_print_selectivities(
     label: str = "selectivities",
 ):
     """Print selectivity vectors for debugging."""
+    _dbg(_T, "debug_print_selectivities()")
     print(f"\n  ┌─ {label} ──────────────────────────────────────────")
     print(f"  │  base ({len(base_sel)}):")
     for i, s in enumerate(base_sel):
@@ -411,29 +403,3 @@ def debug_print_selectivities(
         bar = "█" * int(min(s * 50, 50))
         print(f"  │    [{j:2d}] {s:.6f} {bar}")
     print(f"  └────────────────────────────────────────────────────")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-def check_sample_coverage(samples: "List[float]",
-                          domain_lo: float, domain_hi: float,
-                          n_bins: int = 10) -> str:
-    """★ 改写: 采样覆盖率检查 — 标记空洞区间."""
-    from .. import _dbg
-    if not samples:
-        return "(no samples)"
-    bin_width = (domain_hi - domain_lo) / n_bins
-    bins = [0] * n_bins
-    for s in samples:
-        idx = min(n_bins - 1, max(0, int((s - domain_lo) / max(1e-12, bin_width))))
-        bins[idx] += 1
-    lines = ["┌── Sample Coverage ──"]
-    for i, cnt in enumerate(bins):
-        lo = domain_lo + i * bin_width
-        bar = "█" * min(30, cnt) if cnt > 0 else "  ∅ EMPTY"
-        lines.append(f"│ [{lo:.2f}, {lo + bin_width:.2f}): {bar} ({cnt})")
-    empty = sum(1 for b in bins if b == 0)
-    lines.append(f"│ coverage: {n_bins - empty}/{n_bins} bins filled")
-    lines.append("└──────────────────────────────")
-    return "\n".join(lines)

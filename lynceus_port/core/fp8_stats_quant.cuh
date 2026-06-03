@@ -1,3 +1,14 @@
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[FP8] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
 // ===========================================================================
 // lynceus/core/fp8_stats_quant.cuh — M019-M020: FP8 statistics quantization.
 //
@@ -136,6 +147,7 @@ struct Fp8Codec {
   // DeepSeek/TE saturating-cast convention used for statistics.
   LYN_HD static LYN_FI uint8_t quantize(double x) {
     if (std::isnan(x)) {
+      // Canonical NaN code per format.
       return T::kHasInf ? uint8_t((kMaxBiasedExp << T::kManBits) | 1u)
                         : uint8_t((kMaxBiasedExp << T::kManBits) | kManMask);
     }
@@ -144,28 +156,24 @@ struct Fp8Codec {
 
     if (ax == 0.0) return uint8_t(sign << kSignShift);
 
-    // --- 算法改写: flush-to-zero 快速路径
-    //     原版对极小 subnormal 走完整 round_subnormal,
-    //     port 对 ax < kMinSubnormal/2 直接返回 ±0 (节省 subnormal 路径开销)
-    constexpr double kMinSubHalf = T::kMinSubnormal * 0.5;
-    if (ax < kMinSubHalf) {
-      return uint8_t(sign << kSignShift);  // flush to ±0
-    }
-
+    // Saturate magnitudes above the largest representable normal.
     if (ax >= T::kMaxNormal) {
       return uint8_t((sign << kSignShift) |
                      (uint8_t(kMaxBiasedExp - (T::kHasInf ? 1 : 0)) << T::kManBits) |
                      (T::kHasInf ? kManMask : (kManMask - 1)));
     }
 
+    // Decompose ax = m * 2^e with m in [1,2). frexp gives [0.5,1) so adjust.
     int e2;
-    double m = std::frexp(ax, &e2);
-    m *= 2.0; e2 -= 1;
+    double m = std::frexp(ax, &e2);   // ax = m * 2^e2, m in [0.5,1)
+    m *= 2.0; e2 -= 1;                 // now m in [1,2), ax = m * 2^e2
     int biased = e2 + T::kBias;
 
     if (biased >= 1) {
+      // Normal range. Mantissa fraction (m-1) scaled to man bits, RNE.
       return round_normal(sign, biased, m);
     }
+    // Subnormal / underflow: shift the value into the subnormal grid.
     return round_subnormal(sign, ax);
   }
 

@@ -1,3 +1,14 @@
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[AGE] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
 /*
  * Lynceus — Cost-Model-Driven Query Routing for Heterogeneous GPU-CPU Systems
  *
@@ -250,9 +261,9 @@ struct AgentCostModel {
       CandidateClass cls = identify(cpu, gpu);
 
       if (cls == CandidateClass::selected || is_last_pass) {
-        // --- 算法改写: 加 hysteresis, GPU 必须比 CPU 便宜 10% 才选 GPU
-        //     原版是 gpu < cpu 就切, 现实中切换有上下文开销
-        bool use_gpu = (gpu < cpu * 0.9);
+        // Selected: route decisively
+        // (CCCL: f_early_stop lambda — write to output)
+        bool use_gpu = (gpu < cpu);
         routing_decisions[q.query_id] = use_gpu ? 1 : 0;
         cost_results[q.query_id] = {0, use_gpu ? gpu : cpu, 0, 0, 0};
 
@@ -261,11 +272,6 @@ struct AgentCostModel {
         counter->total_cost_us += (use_gpu ? gpu : cpu);
 
         temp_storage.selected_count++;
-        // 调试: 每 1000 个 selected 打印一次路由统计
-        if (temp_storage.selected_count % 1000 == 0) {
-          fprintf(stderr, "[AGENT·ROUTE] selected=%u gpu_route=%lu cpu_route=%lu\n",
-                  temp_storage.selected_count, counter->queries_routed_gpu, counter->queries_routed_cpu);
-        }
       } else {
         // Candidate: write to out_buf for next pass
         // (CCCL: f_with_out_buf lambda — write candidate + build histogram)

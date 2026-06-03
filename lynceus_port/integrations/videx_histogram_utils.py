@@ -32,35 +32,15 @@ References:
 """
 from __future__ import annotations
 
-import os as _os, sys as _sys
-_MOD_TAG = "VID"
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-def _dbg(tag, msg):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-_tr = _dbg
-
-# ── Stub fallback for missing upstream names ──
-import types as _types
-for _name in ['VidexModelBase', 'PydanticDataClassJsonMixin', 'MySQLVersion',
-              'Env', 'Table', 'Column', 'videx_logging', 'BTreeKeySide',
-              'VidexTableStats', 'PCT_CACHED_MODE_PREFER_META',
-              'OpenMySQLEnv', 'TPCH_UT_INS_80']:
-    if _name not in dir():
-        exec(f"{_name} = type('{_name}', (), {{}})")
-for _name in ['target_env_available_for_videx', 'parse_datetime',
-              'data_type_is_int', 'reformat_datetime_str',
-              'block_level_sample', 'sort_and_validate', 'fit_c_from_cv_curve',
-              'compute_required_rblk', 'build_histogram_from_samples',
-              'merge_sorted_samples']:
-    if _name not in dir():
-        exec(f"{_name} = lambda *a, **k: None")
-
 import math
 import time
 import logging
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Union
+
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "VHU"
+
 
 logger = logging.getLogger("lynceus.histogram_utils")
 
@@ -78,6 +58,7 @@ def calculate_optimal_buckets(
     Uses heuristic: min(254, sqrt(n), ndv) for MySQL compatibility.
     Lynceus: identical formula, added GPU memory consideration.
     """
+    _dbg(_T, "calculate_optimal_buckets()")
     n = len(samples)
     if n == 0:
         return 1
@@ -115,11 +96,13 @@ def block_level_sample(
     seed: int = 42,
     debug: bool = False,
 ) -> List[Any]:
-    """模拟块级页面采样.
-    改写: 加 reservoir 采样混合策略——前半用 stride 确定性采样,
-    后半用 reservoir 随机采样, 兼顾覆盖率和随机性."""
-    _dbg_state("BLKSMP", n_data=len(data) if data else 0, n_blocks=n_blocks,
-               block_size=block_size, seed=seed)
+    """Simulate block-level page sampling from a table.
+
+    Upstream: block_level_sample(env, db, table, col, ...) — queries MySQL.
+    Lynceus: operates on in-memory data, simulating block I/O pattern.
+    ~20% change: deterministic block selection via stride instead of random.
+    """
+    _dbg(_T, "block_level_sample()")
     if not data:
         return []
 
@@ -127,30 +110,18 @@ def block_level_sample(
     if n <= n_blocks * block_size:
         return list(data)
 
-    # 改写: 前半 stride 确定性 + 后半 reservoir 随机
-    half_blocks = max(1, n_blocks // 2)
-    stride = max(1, n // half_blocks)
+    # Lynceus: stride-based deterministic sampling (vs upstream random)
+    stride = max(1, n // n_blocks)
     samples = []
-
-    # Phase 1: stride-based 确定性采样
-    for b in range(half_blocks):
+    for b in range(n_blocks):
         start = b * stride
         end = min(start + block_size, n)
         samples.extend(data[start:end])
 
-    # Phase 2: reservoir 采样补充剩余块
-    import random
-    rng = random.Random(seed)
-    remaining_blocks = n_blocks - half_blocks
-    if remaining_blocks > 0:
-        candidate_starts = list(range(0, n - block_size, max(1, n // (remaining_blocks * 3))))
-        rng.shuffle(candidate_starts)
-        for start in candidate_starts[:remaining_blocks]:
-            end = min(start + block_size, n)
-            samples.extend(data[start:end])
+    if debug:
+        print(f"    block_sample: n={n} blocks={n_blocks} "
+              f"block_size={block_size} stride={stride} → {len(samples)} samples")
 
-    _dbg("BLKSMP", f"total={len(samples)} samples (stride={half_blocks} blocks + "
-         f"reservoir={remaining_blocks} blocks)")
     return samples
 
 
@@ -162,12 +133,17 @@ def sort_and_validate(
     data_type: str = "int",
     debug: bool = False,
 ) -> Tuple[List[Any], int]:
-    """排序并验证样本.
-    改写: 加去重统计——报告实际 NDV 和重复率."""
-    _dbg_state("SORTVAL", n_samples=len(samples) if samples else 0, k=k, lmax=lmax)
+    """Sort samples and validate against constraints.
+
+    Upstream: sort_and_validate(samples, k, lmax, ...).
+    Returns: (sorted_samples, effective_k).
+    k = target bucket count, lmax = max elements per bucket.
+    """
+    _dbg(_T, "sort_and_validate()")
     if not samples:
         return [], 0
 
+    # Sort — handle mixed types gracefully
     try:
         sorted_samples = sorted(samples)
     except TypeError:
@@ -175,25 +151,22 @@ def sort_and_validate(
 
     n = len(sorted_samples)
 
-    # 改写: 计算去重后的 distinct count 和重复率
-    unique_count = len(set(sorted_samples))
-    dup_ratio = 1.0 - unique_count / max(n, 1)
-    _dbg("SORTVAL", f"n={n}, unique={unique_count}, dup_ratio={dup_ratio:.3f}")
-
+    # Validate k
     effective_k = min(k, n)
     if effective_k <= 0:
         effective_k = 1
 
+    # Validate lmax
     if lmax > 0:
         min_k = max(1, n // lmax)
         effective_k = max(effective_k, min_k)
 
-    # 改写: 当重复率 > 50% 时，建议用 singleton 桶
-    if dup_ratio > 0.5 and unique_count < effective_k:
-        _dbg("SORTVAL", f"high dup ratio, adjusting k from {effective_k} to {unique_count}")
-        effective_k = max(1, unique_count)
+    if debug:
+        print(f"    sort_validate: n={n} k={k} lmax={lmax} "
+              f"→ effective_k={effective_k}")
+        if sorted_samples:
+            print(f"      range: [{sorted_samples[0]}, {sorted_samples[-1]}]")
 
-    _dbg("SORTVAL", f"effective_k={effective_k}")
     return sorted_samples, effective_k
 
 
@@ -209,6 +182,7 @@ def fit_c_from_cv_curve(
     Model: E[error²] ≈ c / n_samples.
     Lynceus: least-squares fit without scipy.
     """
+    _dbg(_T, "fit_c_from_cv_curve()")
     if len(sample_sizes) < 2 or len(sq_err_levels) < 2:
         return 1.0
 
@@ -240,6 +214,7 @@ def compute_required_rblk(
     Upstream: compute_required_rblk(c, delta_req).
     Formula: r_blk = ceil(c / delta_req²).
     """
+    _dbg(_T, "compute_required_rblk()")
     if delta_req <= 0:
         return 1000  # fallback
     r_blk = max(1, int(math.ceil(c / (delta_req * delta_req))))
@@ -277,6 +252,7 @@ def build_histogram_from_samples(
     Lynceus: added GPU cost annotation per bucket.
     ~20% change: bucket boundaries snap to distinct values to avoid splits.
     """
+    _dbg(_T, "build_histogram_from_samples()")
     if not samples:
         return []
 
@@ -351,54 +327,16 @@ def merge_sorted_samples(
     b_sorted: List[Any],
     debug: bool = False,
 ) -> List[Any]:
-    """双路归并.
-    改写: 当一方远大于另一方时，用 galloping merge (指数搜索)
-    跳过大块连续元素，降低比较次数 O(n log m) vs O(n+m)."""
-    _dbg("MERGE", f"merging: a={len(a_sorted)}, b={len(b_sorted)}")
-    na, nb = len(a_sorted), len(b_sorted)
+    """Two-way merge of sorted sample lists.
 
-    # 改写: 比例差 > 8x 时用 galloping 策略
-    if na > 0 and nb > 0 and (na > 8 * nb or nb > 8 * na):
-        _dbg("MERGE", "using galloping merge (size ratio > 8x)")
-        # 确保 smaller 是较短的
-        if na <= nb:
-            smaller, larger = a_sorted, b_sorted
-        else:
-            smaller, larger = b_sorted, a_sorted
-        result = []
-        j = 0
-        for val in smaller:
-            # galloping: 从 j 开始指数搜索 val 的插入位置
-            step = 1
-            while j + step < len(larger):
-                try:
-                    if larger[j + step] < val:
-                        step <<= 1
-                    else:
-                        break
-                except TypeError:
-                    break
-            # 线性回填
-            bound = min(j + step, len(larger))
-            while j < bound:
-                try:
-                    if larger[j] < val:
-                        result.append(larger[j])
-                        j += 1
-                    else:
-                        break
-                except TypeError:
-                    result.append(larger[j])
-                    j += 1
-            result.append(val)
-        result.extend(larger[j:])
-        _dbg("MERGE", f"galloping result: {len(result)} items")
-        return result
-
-    # 标准双路归并
+    Upstream: merge_sorted_samples(a_sorted, b_sorted).
+    Lynceus: identical algorithm.
+    """
+    _dbg(_T, "merge_sorted_samples()")
     result = []
     i, j = 0, 0
-    while i < na and j < nb:
+
+    while i < len(a_sorted) and j < len(b_sorted):
         try:
             if a_sorted[i] <= b_sorted[j]:
                 result.append(a_sorted[i])
@@ -407,11 +345,17 @@ def merge_sorted_samples(
                 result.append(b_sorted[j])
                 j += 1
         except TypeError:
+            # Fallback for incomparable types
             result.append(a_sorted[i])
             i += 1
+
     result.extend(a_sorted[i:])
     result.extend(b_sorted[j:])
-    _dbg("MERGE", f"standard merge: {len(result)} items")
+
+    if debug:
+        print(f"    merge_sorted: {len(a_sorted)} + {len(b_sorted)} "
+              f"→ {len(result)} total")
+
     return result
 
 
@@ -426,6 +370,7 @@ def estimate_null_ratio(
     Upstream: estimate_null_ratio(env, db, table, col) — queries MySQL.
     Lynceus: operates on in-memory data.
     """
+    _dbg(_T, "estimate_null_ratio()")
     if null_values is None:
         null_values = {None, "", "NULL", "null", "None"}
 
@@ -452,6 +397,7 @@ def validate_error(
     Upstream: validate_error(train_buckets, ...) — computes relative error.
     Lynceus: uses q-error metric. ~20% algorithm change.
     """
+    _dbg(_T, "validate_error()")
     if not train_buckets or not test_data:
         return {"q_error_mean": 0.0, "q_error_max": 0.0, "q_error_p95": 0.0}
 
@@ -516,11 +462,11 @@ class GpuHistogramProfile:
 
     @property
     def memory_kb(self) -> float:
-        _dbg("MEMORY_K", "ENTER memory_kb()")
+        _dbg(_T, "memory_kb()")
         return self.memory_bytes / 1024
 
     def debug_print(self):
-        _dbg("DEBUG_PR", "ENTER debug_print()")
+        _dbg(_T, "debug_print()")
         print(f"    GpuHistProfile({self.column_name}): "
               f"{self.n_buckets} buckets, {self.memory_kb:.1f}KB, "
               f"build cpu={self.cpu_build_time_us:.1f}µs "
@@ -535,6 +481,7 @@ def debug_print_histogram(
     max_bars: int = 20,
 ):
     """Print ASCII histogram for debugging."""
+    _dbg(_T, "debug_print_histogram()")
     if not buckets:
         print(f"  (empty histogram for {column_name})")
         return
@@ -555,19 +502,3 @@ def debug_print_histogram(
               f"{b.count:>7} ({pct:5.1f}%) {bar}")
 
     print(f"  └────────────────────────────────────────────────────")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-def check_merge_quality(before_buckets: int, after_buckets: int,
-                        info_loss: float) -> str:
-    """★ 改写: 桶合并质量检查."""
-    from .. import _dbg
-    ratio = after_buckets / max(1, before_buckets)
-    verdict = ("good" if info_loss < 0.05 else
-               "acceptable" if info_loss < 0.15 else "poor")
-    result = (f"Merge: {before_buckets}→{after_buckets} buckets "
-              f"(ratio={ratio:.2f}, info_loss={info_loss:.3f}, {verdict})")
-    _dbg("result", str(result))
-    return result

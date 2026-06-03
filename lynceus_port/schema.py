@@ -1,14 +1,14 @@
 """
 lynceus_port/schema.py — 移植版数据 schema.
 
-基于 lynceus/schema.py 框架, 改写 ≈ 20%:
-  - compute_statistics 使用 Welford 在线算法替代双遍扫描
-  - HardwareTopology.get_transfer_cost 增加带宽衰减因子 (拥塞模拟)
-  - 全链路结构体 dump 断点
-  - metadata 增加 wall_clock_s 字段
+改写 ~20%:
+  - compute_statistics: Welford 在线算法替代 naive two-pass
+  - SeedCurve: 增加 running EMA 平滑
+  - BenchmarkOutput.save: 写入前 dump 到 stderr 供断点检视
+  - HardwareTopology.get_transfer_cost: Bellman-Ford 替代 Dijkstra
+    (允许负权边, 虽然当前不存在, 但为未来建模折扣链路做准备)
 
-架构参考:
-    ncclResult_t / DistributedDataParallelConfig / KVCacheSpec
+架构溯源同原版.
 """
 
 from __future__ import annotations
@@ -21,21 +21,10 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
+from . import _dbg, _dump_obj, _snapshot, LYNCEUS_DEBUG
 
-# ── 调试工具 ──────────────────────────────────────────────────────────────
-import os as _os
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")  # 默认开启
+_T = "SCH"
 
-def _dbg(tag: str, msg: str):
-    """运行时断点输出 — 打印当前数据结构和状态到 stderr 以便管道分离."""
-    if _LYNCEUS_DBG != "0":
-        import sys
-        print(f"[SCH·{tag}] {msg}", file=sys.stderr, flush=True)
-
-# 保留旧名兼容
-_tr = _dbg
-
-# ───────────────────────── Enums ─────────────────────────────────────────
 
 class RoutingStrategy(Enum):
     GPU_ONLY = "GPU-Only"
@@ -65,42 +54,29 @@ class HardwareKind(Enum):
     NETWORK = auto()
 
 
-# ───────────────────────── Core data structures ─────────────────────────
-
 @dataclass
 class SeedCurve:
-    """单种子的 Y 值序列. len(values) == 父 MethodResult.num_steps."""
     seed_id: int
     values: List[float] = field(default_factory=list)
+    # [PORT] 增加 EMA 追踪, alpha=0.05 让趋势可视化
+    _ema: float = field(default=0.0, repr=False)
+    _ema_alpha: float = field(default=0.05, repr=False)
 
     def append(self, v: float) -> None:
-        _dbg("SEED", f"seed#{self.seed_id} += {v:.6f} (pos={len(self.values)})")
         self.values.append(v)
+        # [PORT] 在线 EMA 更新
+        if len(self.values) == 1:
+            self._ema = v
+        else:
+            self._ema = self._ema_alpha * v + (1.0 - self._ema_alpha) * self._ema
 
-    def dump_snapshot(self, max_show: int = 8) -> str:
-        """断点检查: 打印前/后几个值 + Welford 增量统计."""
-        n = len(self.values)
-        if n == 0:
-            return f"SeedCurve(id={self.seed_id}, EMPTY)"
-        half = max_show >> 1
-        head = self.values[:half]
-        tail = self.values[-half:] if n > max_show else []
-        # Kahan 求和减少浮点漂移
-        kahan_sum = 0.0
-        kahan_c = 0.0
-        for v in self.values:
-            y = v - kahan_c
-            t = kahan_sum + y
-            kahan_c = (t - kahan_sum) - y
-            kahan_sum = t
-        mu = kahan_sum / n
-        return (f"SeedCurve(id={self.seed_id}, n={n}, "
-                f"mean={mu:.6f}, head={head}, tail={tail})")
+    @property
+    def ema(self) -> float:
+        return self._ema
 
 
 @dataclass
 class MethodResult:
-    """聚合结果 — 一个路由策略在所有种子上的表现."""
     strategy: RoutingStrategy
     num_steps: int
     num_seeds: int
@@ -108,81 +84,57 @@ class MethodResult:
     seed_curves: List[SeedCurve] = field(default_factory=list)
     reported_final: Optional[float] = None
     total_cost: Optional[float] = None
-
     _mean: Optional[List[float]] = field(default=None, repr=False)
     _std: Optional[List[float]] = field(default=None, repr=False)
 
     def add_seed(self) -> SeedCurve:
-        cur_count = len(self.seed_curves)
-        _dbg("METHOD", f"{self.strategy.value}: add_seed#{cur_count} "
-             f"(limit={self.num_seeds}, steps={self.num_steps})")
-        if cur_count >= self.num_seeds:
+        if len(self.seed_curves) >= self.num_seeds:
             raise ValueError(
-                f"Cannot add seed #{cur_count}: "
+                f"Cannot add seed #{len(self.seed_curves)}: "
                 f"num_seeds is {self.num_seeds}"
             )
-        sc = SeedCurve(seed_id=cur_count)
+        sc = SeedCurve(seed_id=len(self.seed_curves))
         self.seed_curves.append(sc)
         return sc
 
     def compute_statistics(self) -> None:
-        """Welford 在线算法.
-        改写: 加 Kahan 补偿防浮点精度损失;
-        加收敛检测——最后10步std/mean < 5%视为已收敛;
-        加异常值标记——seed间IQR外的数据点标记."""
-        total_steps = self.num_steps
-        seed_count = len(self.seed_curves)
-        _dbg("STAT", f"compute_statistics: strategy={self.strategy.value}, "
-             f"steps={total_steps}, seeds={seed_count}")
-        if seed_count == 0 or total_steps == 0:
-            _dbg("STAT", "SKIP: no data")
+        n = self.num_steps
+        k = len(self.seed_curves)
+        if k == 0 or n == 0:
             return
-
         for sc in self.seed_curves:
-            actual_len = len(sc.values)
-            if actual_len != total_steps:
+            if len(sc.values) != n:
                 raise ValueError(
-                    f"Seed {sc.seed_id} has {actual_len} values, "
-                    f"expected {total_steps} (num_steps)"
+                    f"Seed {sc.seed_id} has {len(sc.values)} values, "
+                    f"expected {n} (num_steps)"
                 )
 
-        mean_accum: List[float] = []
-        std_accum: List[float] = []
-        for step_idx in range(total_steps):
-            # 改写: Kahan 补偿 Welford — 减少浮点累积误差
-            running_mean = 0.0
-            running_m2 = 0.0
-            comp_mean = 0.0  # Kahan 补偿项
-            for j in range(seed_count):
-                val = self.seed_curves[j].values[step_idx]
-                delta = val - running_mean
-                # Kahan 补偿加法
-                y = delta / (j + 1) - comp_mean
-                t = running_mean + y
-                comp_mean = (t - running_mean) - y
-                prev_mean = running_mean
-                running_mean = t
-                running_m2 += (val - prev_mean) * (val - running_mean)
-            mean_accum.append(running_mean)
-            variance = running_m2 / (seed_count - 1) if seed_count > 1 else 0.0
-            std_accum.append(math.sqrt(max(variance, 0.0)))
+        mean_out = []
+        std_out = []
+        for i in range(n):
+            vals = [sc.values[i] for sc in self.seed_curves]
+            # [PORT] Welford 在线方差 — 数值稳定, 单 pass
+            w_mean = 0.0
+            w_m2 = 0.0
+            for j, v in enumerate(vals, 1):
+                delta = v - w_mean
+                w_mean += delta / j
+                delta2 = v - w_mean
+                w_m2 += delta * delta2
+            mean_out.append(w_mean)
+            if k > 1:
+                std_out.append(math.sqrt(w_m2 / (k - 1)))
+            else:
+                std_out.append(0.0)
 
-        self._mean = mean_accum
-        self._std = std_accum
-        if mean_accum:
-            self.reported_final = mean_accum[-1]
+        self._mean = mean_out
+        self._std = std_out
+        if mean_out:
+            self.reported_final = mean_out[-1]
 
-        # 改写: 收敛检测——最后10步 CV < 5%
-        if len(mean_accum) >= 10:
-            tail_mean = sum(mean_accum[-10:]) / 10
-            tail_std = sum(std_accum[-10:]) / 10
-            cv = tail_std / max(abs(tail_mean), 1e-12)
-            converged = cv < 0.05
-            _dbg("STAT", f"convergence: tail_cv={cv:.4f}, converged={converged}")
-
-        _dbg("STAT", f"{self.strategy.value}: final_mean={self.reported_final:.6f}, "
-             f"final_std={std_accum[-1]:.6f}, "
-             f"range=[{min(mean_accum):.4f}, {max(mean_accum):.4f}]")
+        _dbg(_T, f"stats done: strategy={self.strategy.value}, "
+             f"final_mean={self.reported_final:.4f}, "
+             f"mean_std={sum(std_out)/len(std_out):.4f}")
 
     @property
     def mean(self) -> List[float]:
@@ -209,14 +161,6 @@ class MethodResult:
         d["std"] = self.std
         return d
 
-    def dump_snapshot(self) -> str:
-        """断点辅助: 全状态概览."""
-        lines = [f"MethodResult({self.strategy.value}, steps={self.num_steps}, "
-                 f"seeds={self.num_seeds}, final={self.reported_final})"]
-        for sc in self.seed_curves:
-            lines.append(f"  {sc.dump_snapshot()}")
-        return "\n".join(lines)
-
 
 @dataclass
 class PanelResult:
@@ -228,9 +172,11 @@ class PanelResult:
 
     def add_method(self, strategy: RoutingStrategy, num_steps: int,
                    num_seeds: int) -> MethodResult:
-        mr = MethodResult(strategy=strategy, num_steps=num_steps,
-                          num_seeds=num_seeds)
+        mr = MethodResult(
+            strategy=strategy, num_steps=num_steps, num_seeds=num_seeds,
+        )
         self.methods[strategy.value] = mr
+        _dbg(_T, f"panel[{self.panel_name}] += method {strategy.value}")
         return mr
 
     def to_dict(self) -> Dict[str, Any]:
@@ -243,7 +189,6 @@ class BenchmarkOutput:
     source: str = ""
     timestamp: str = field(default_factory=lambda: time.strftime("%Y%m%d_%H%M%S"))
     panels: Dict[str, PanelResult] = field(default_factory=dict)
-    _start_wall: float = field(default_factory=time.monotonic, repr=False)
 
     def add_panel(self, name: str, metric: MetricKind,
                   x_label: str = "step", y_label: str = "value") -> PanelResult:
@@ -272,7 +217,6 @@ class BenchmarkOutput:
             "n_seeds": n_seeds,
             "n_methods": n_methods,
             "total_data_points": total_points,
-            "wall_clock_s": round(time.monotonic() - self._start_wall, 3),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -284,17 +228,15 @@ class BenchmarkOutput:
     def save(self, path: str | Path) -> Path:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        payload = self.to_dict()
-        _dbg("IO", f"save → {p}, panels={list(payload.get('panels',{}).keys())}, "
-             f"meta={payload.get('metadata',{})}")
+        blob = self.to_dict()
+        # [PORT] 写入前 dump 元信息到 stderr, 方便断点检视
+        _dbg(_T, f"save -> {p}, metadata={blob['metadata']}")
         with open(p, "w") as f:
-            json.dump(payload, f, indent=2)
-        byte_size = p.stat().st_size
-        _dbg("IO", f"written {byte_size:,}B to {p}")
+            json.dump(blob, f, indent=2)
         return p
 
 
-# ─────────────────── Hardware topology node ──────────────────────────────
+# --- Hardware topology (NCCL-inspired) ---
 
 @dataclass
 class HardwareNode:
@@ -320,85 +262,78 @@ class TopologyEdge:
 
 @dataclass
 class HardwareTopology:
-    """完整硬件拓扑图 — Dijkstra 多跳最短路."""
     nodes: Dict[str, HardwareNode] = field(default_factory=dict)
     edges: List[TopologyEdge] = field(default_factory=list)
 
     def add_node(self, node: HardwareNode) -> None:
         self.nodes[node.node_id] = node
+        _dbg(_T, f"topo += node {node.node_id} ({node.kind.name})")
 
     def add_edge(self, edge: TopologyEdge) -> None:
         self.edges.append(edge)
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
-        """Dijkstra 多跳传输成本 (µs).
+        """Bellman-Ford 最短路 — 替代原版 Dijkstra.
 
-        改写: 拥塞衰减因子从固定 0.95 改为 sigmoid 递减模型 —
-        hop_penalty = 1 / (1 + 0.05 * hop_idx), 首跳无衰减,
-        远跳渐近 0, 更贴合交换矩阵实测曲线.
+        改写理由: Bellman-Ford 允许负权边, 为未来建模链路折扣/补贴留接口.
+        当前拓扑全正权, 两者结果等价, 但 BF 实现更简单且无需 heapq.
+        复杂度 O(V*E), 对小拓扑 (<20 nodes) 无影响.
         """
-        _dbg("XFER", f"get_transfer_cost({src}→{dst}, {data_bytes}B)")
         if src == dst:
             return 0.0
         if src not in self.nodes or dst not in self.nodes:
-            _dbg("XFER", f"UNREACHABLE: {src} or {dst} not in topology")
             return float("inf")
 
-        DECAY_COEFF = 0.05  # sigmoid 衰减系数
-
-        def hop_cost(edge: TopologyEdge, hop_idx: int) -> float:
-            if edge.bandwidth_gbps <= 0:
+        def hop_cost(e: TopologyEdge) -> float:
+            if e.bandwidth_gbps <= 0:
                 return float("inf")
-            penalty = 1.0 / (1.0 + DECAY_COEFF * hop_idx)
-            eff_bw = edge.bandwidth_gbps * penalty
-            transfer_us = (data_bytes / (eff_bw * 1e9 / 8)) * 1e6
-            total = edge.latency_us + transfer_us
-            return total
+            return e.latency_us + (data_bytes / (e.bandwidth_gbps * 1e9 / 8)) * 1e6
 
-        import heapq
-        dist: Dict[str, float] = {src: 0.0}
-        hops: Dict[str, int] = {src: 0}
-        pq: List[Tuple[float, str]] = [(0.0, src)]
-        visited = set()
-        while pq:
-            d, u = heapq.heappop(pq)
-            if u == dst:
-                _dbg("XFER", f"  result={d:.2f}µs via {hops.get(u,0)} hops")
-                return d
-            if u in visited:
-                continue
-            visited.add(u)
-            h = hops.get(u, 0)
+        all_ids = list(self.nodes.keys())
+        dist = {nid: float("inf") for nid in all_ids}
+        dist[src] = 0.0
+
+        # [PORT] Bellman-Ford: V-1 轮松弛
+        n_nodes = len(all_ids)
+        for _round in range(n_nodes - 1):
+            updated = False
             for e in self.edges:
-                if e.src != u:
+                w = hop_cost(e)
+                if w == float("inf"):
                     continue
-                v = e.dst
-                w = hop_cost(e, h)
-                nd = d + w
-                if nd < dist.get(v, float("inf")):
-                    dist[v] = nd
-                    hops[v] = h + 1
-                    heapq.heappush(pq, (nd, v))
-        final = dist.get(dst, float("inf"))
-        _dbg("XFER", f"  result={final:.2f}µs (Dijkstra converged)")
-        return final
+                if dist[e.src] + w < dist[e.dst]:
+                    dist[e.dst] = dist[e.src] + w
+                    updated = True
+            if not updated:
+                break  # 提前收敛
+
+        result = dist.get(dst, float("inf"))
+        _dbg(_T, f"transfer {src}->{dst}: {data_bytes}B = {result:.1f}us")
+        return result
 
     def get_node(self, node_id: str) -> Optional[HardwareNode]:
         return self.nodes.get(node_id)
 
-    def dump_reachability(self) -> str:
-        """断点辅助: 打印全对可达矩阵."""
-        ids = sorted(self.nodes.keys())
-        lines = ["Reachability (1MB payload):"]
-        hdr = "       " + "  ".join(f"{n:>6}" for n in ids)
-        lines.append(hdr)
-        for s in ids:
-            row = []
-            for d in ids:
-                if s == d:
-                    row.append("     0")
-                else:
-                    c = self.get_transfer_cost(s, d, 1 << 20)
-                    row.append(f"{c:6.1f}" if c < float("inf") else "   inf")
-            lines.append(f" {s:>5} " + "  ".join(row))
-        return "\n".join(lines)
+    # [PORT] 拓扑完整性自检
+    def dump_reachability(self) -> Dict[str, Dict[str, float]]:
+        """断点辅助: 打印全对最短路矩阵."""
+        matrix = {}
+        ref_bytes = 1024 * 1024  # 1 MB 参考负载
+        for src in self.nodes:
+            row = {}
+            for dst in self.nodes:
+                row[dst] = self.get_transfer_cost(src, dst, ref_bytes)
+            matrix[src] = row
+        if LYNCEUS_DEBUG:
+            import sys
+            print("== Reachability Matrix (1MB, us) ==", file=sys.stderr)
+            ids = sorted(self.nodes.keys())
+            hdr = "        " + "  ".join(f"{x:>7}" for x in ids)
+            print(hdr, file=sys.stderr)
+            for s in ids:
+                vals = "  ".join(
+                    f"{matrix[s][d]:7.1f}" if matrix[s][d] < 1e9 else "    inf"
+                    for d in ids
+                )
+                print(f"{s:>7} {vals}", file=sys.stderr)
+        return matrix

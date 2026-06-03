@@ -1,9 +1,41 @@
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[HAS] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
+/*
+ * Copyright (C) 2024 Data-Intensive Systems Lab, Simon Fraser University.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 #include <cassert>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
-#include <cstdio>
+
+// glog removed — use assert for portability
+
+#include <cstdint>
+
+
 
 #ifndef HASHTABLE_PAGE_SIZE
 #define HASHTABLE_PAGE_SIZE 256
@@ -14,31 +46,16 @@ namespace index {
 
 static inline constexpr uint64_t kHashTablePageSize = HASHTABLE_PAGE_SIZE;
 
-// --- 算法改写: 原版用 FNV-1a (h^=b[i]; h*=prime)
-//     port 换 murmur3-finalizer 风格的 avalanche mixing
-//     减少低位碰撞, 对 extendible hashing 的 directory mask 更友好
 template <typename Key>
 inline static uint64_t Hash(Key key) {
-  uint64_t h = 0;
-  const auto *b = reinterpret_cast<const uint8_t*>(&key);
-  for (size_t i = 0; i < sizeof(Key); i++) {
-    h = (h << 8) | b[i];           // 先把字节拼进去
-  }
-  // murmur3 finalizer (原版是 FNV 的逐字节 XOR-mul)
-  h ^= h >> 33;
-  h *= 0xFF51AFD7ED558CCDULL;
-  h ^= h >> 33;
-  h *= 0xC4CEB9FE1A85EC53ULL;
-  h ^= h >> 33;
-  return h;
+  return ({uint64_t h=14695981039346656037ULL; auto *b=reinterpret_cast<const uint8_t*>(&key); for(size_t i=0;i<sizeof(Key);i++){h^=b[i]; h*=1099511628211ULL;} h;});
 }
 
 template <typename Key, typename Value>
 struct HashTableBucket {
   struct Header {
     size_t size;
-    size_t _probe_total;  // 调试: 累计线性探测步数
-    Header() : size(0), _probe_total(0) {}
+    Header() : size(0) {}
   };
   struct Entry {
     Key key;
@@ -53,8 +70,7 @@ struct HashTableBucket {
   Entry entries[kMaxEntries];
 
   bool Find(Key key, Value *out_value) {
-    for (size_t i = 0; i < header.size; i++) {
-      header._probe_total++;
+    for (auto i = 0; i < header.size; i++) {
       auto &entry = entries[i];
       if (entry.key == key) {
         *out_value = entry.value;
@@ -65,14 +81,18 @@ struct HashTableBucket {
   }
 
   bool Find(Key key) {
-    for (size_t i = 0; i < header.size; i++) {
-      header._probe_total++;
-      if (entries[i].key == key) return true;
+    for (auto i = 0; i < header.size; i++) {
+      auto &entry = entries[i];
+      if (entry.key == key) {
+        return true;
+      }
     }
     return false;
   }
 
-  bool IsFull() { return header.size == kMaxEntries; }
+  bool IsFull() {
+    return header.size == kMaxEntries;
+  }
 
   void Insert(Key key, const Value &value) {
     assert(header.size < kMaxEntries);
@@ -82,50 +102,42 @@ struct HashTableBucket {
   }
 
   bool Update(Key key, const Value &value) {
-    for (size_t i = 0; i < header.size; i++) {
-      if (entries[i].key == key) {
-        entries[i].value = value;
+    for (auto i = 0; i < header.size; i++) {
+      auto &entry = entries[i];
+      if (entry.key == key) {
+        entry.value = value;
         return true;
       }
     }
     return false;
   }
 
-  // --- 算法改写: split 时统计迁移量, 方便判断 hash 分布是否倾斜
+  // Split this bucket into a new bucket.
+  // The new bucket will have the entries whose additional bit is one.
   void SplitTo(uint64_t local_depth, HashTableBucket *new_bucket) {
-    size_t stay = 0, move = 0;
-    auto mask = 1ULL << local_depth;
+    auto curr_idx = 0;
+    auto other_idx = 0;
     for (size_t i = 0; i < header.size; i++) {
-      auto &e = entries[i];
-      auto hash = Hash(e.key);
-      if (hash & mask) {
-        new_bucket->entries[move].key = e.key;
-        new_bucket->entries[move].value = e.value;
-        move++;
-      } else {
-        if (i > stay) {
-          entries[stay].key = e.key;
-          entries[stay].value = e.value;
+      auto &entry = entries[i];
+      // mask to extract only the additional bit from old to new local depth.
+      auto mask = 1ULL << local_depth;
+      auto hash = Hash(entry.key);
+      if (hash & mask) {  // non-zero
+        // move to new bucket
+        new_bucket->entries[other_idx].key = entry.key;
+        new_bucket->entries[other_idx].value = entry.value;
+        other_idx += 1;
+      } else {  // zero
+        // stay in old bucket
+        if (i > curr_idx) {
+          entries[curr_idx].key = entry.key;
+          entries[curr_idx].value = entry.value;
         }
-        stay++;
+        curr_idx += 1;
       }
     }
-    header.size = stay;
-    new_bucket->header.size = move;
-    // 调试: 倾斜检测
-    if (stay > 0 && move > 0) {
-      double ratio = (double)stay / (double)move;
-      if (ratio > 4.0 || ratio < 0.25) {
-        fprintf(stderr, "[HT·SPLIT] skew detected depth=%lu stay=%zu move=%zu ratio=%.2f\n",
-                (unsigned long)local_depth, stay, move, ratio);
-      }
-    }
-  }
-
-  // 调试: 输出桶的统计摘要
-  void dump_bucket(const char *tag) const {
-    fprintf(stderr, "[HT·BUCKET] %s size=%zu/%lu probes=%zu\n",
-            tag, header.size, (unsigned long)kMaxEntries, header._probe_total);
+    header.size = curr_idx;
+    new_bucket->header.size = other_idx;
   }
 };
 

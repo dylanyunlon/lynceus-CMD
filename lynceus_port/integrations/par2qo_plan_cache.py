@@ -27,23 +27,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
-_MOD_TAG = "PAE"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag, msg):
-    """调试输出 — 修复自递归, 改写加序号."""
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-def _dbg_state(tag, **kwargs):
-    """改写新增: 键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-
-_tr = _dbg  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "PPC"
 
 
 logger = logging.getLogger("lynceus.plan_cache")
@@ -66,13 +51,13 @@ class CachedPlanEntry:
     last_access: float = 0.0
 
     def touch(self):
-        _dbg("TOUCH", "touch entered")
+        _dbg(_T, "touch()")
         self.access_count += 1
         self.last_access = time.time()
 
     @property
     def best_plan(self) -> int:
-        _dbg("BEST_PLA", "best_plan entered")
+        _dbg(_T, "best_plan()")
         return self.plan_indices[0] if self.plan_indices else -1
 
 
@@ -160,6 +145,7 @@ class RobustPlanCache:
         preload: str = "tpch",
         debug: bool = True,
     ):
+        _dbg(_T, "__init__()")
         self._cache: OrderedDict[str, CachedPlanEntry] = OrderedDict()
         self.max_size = max_size
         self.debug = debug
@@ -199,6 +185,7 @@ class RobustPlanCache:
         PAR2QO: cached_rob_plan_dict[query_id] → [plan_index].
         Lynceus: LRU-ordered lookup with device filtering.
         """
+        _dbg(_T, "lookup()")
         if query_id in self._cache:
             entry = self._cache[query_id]
 
@@ -244,6 +231,7 @@ class RobustPlanCache:
         PAR2QO: no dynamic insertion (static dicts only).
         Lynceus: supports runtime insertion with LRU eviction.
         """
+        _dbg(_T, "insert()")
         if query_id in self._cache:
             self._cache.move_to_end(query_id)
             entry = self._cache[query_id]
@@ -253,27 +241,12 @@ class RobustPlanCache:
             entry.penalty_std = penalty_std
             entry.timestamp = time.time()
         else:
-            # 改写: 2Q 驱逐策略——优先驱逐只访问过一次的 LRU 项，
-            # 而不是简单 LRU（防止刚插入的热查询被误淘汰）
+            # Evict LRU if full
             while len(self._cache) >= self.max_size:
-                # 改写: 扫描前 25% 的 LRU 项，找 access_count 最小的
-                scan_limit = max(1, len(self._cache) // 4)
-                worst_key = None
-                worst_access = float('inf')
-                for idx, (k, entry) in enumerate(self._cache.items()):
-                    if idx >= scan_limit:
-                        break
-                    if entry.access_count < worst_access:
-                        worst_access = entry.access_count
-                        worst_key = k
-                if worst_key is None:
-                    worst_key = next(iter(self._cache))  # fallback to LRU
-                evicted_entry = self._cache.pop(worst_key)
+                evicted_key, evicted_entry = self._cache.popitem(last=False)
                 self._evictions += 1
-                _dbg("CACHE", f"EVICT {worst_key} (accesses={evicted_entry.access_count}, "
-                     f"cache_size={len(self._cache)})")
                 if self.debug:
-                    print(f"  │  cache EVICT {worst_key} "
+                    print(f"  │  cache EVICT {evicted_key} "
                           f"(accesses={evicted_entry.access_count})")
 
             self._cache[query_id] = CachedPlanEntry(
@@ -288,26 +261,25 @@ class RobustPlanCache:
                   f"[{device_preference or 'auto'}] penalty={expected_penalty:.1f}")
 
     def remove(self, query_id: str) -> bool:
-        _dbg("REMOVE", "remove entered")
-        _dbg("REMOVE", f"remove(query_id={query_id})")
+        _dbg(_T, "remove()")
         if query_id in self._cache:
             del self._cache[query_id]
             return True
         return False
 
     @property
-    def cache_hit_ratio(self) -> float:
-        _dbg("CACHE_HI", "cache_hit_ratio entered")
+    def hit_rate(self) -> float:
+        _dbg(_T, "hit_rate()")
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     @property
     def cold_hit_rate(self) -> float:
-        _dbg("COLD_HIT", "cold_hit_rate entered")
+        _dbg(_T, "cold_hit_rate()")
         return self._cold_hits / self._hits if self._hits > 0 else 0.0
 
     def stats(self) -> Dict[str, Any]:
-        _dbg("STATS", "stats entered")
+        _dbg(_T, "stats()")
         return {
             "size": len(self._cache),
             "max_size": self.max_size,
@@ -315,13 +287,13 @@ class RobustPlanCache:
             "misses": self._misses,
             "cold_hits": self._cold_hits,
             "evictions": self._evictions,
-            "hit_rate": f"{self.cache_hit_ratio:.3f}",
+            "hit_rate": f"{self.hit_rate:.3f}",
             "cold_hit_rate": f"{self.cold_hit_rate:.3f}",
         }
 
     # ── Serialization ──────────────────────────────────────────────────
     def to_json(self) -> str:
-        _dbg("TO_JSON", "to_json entered")
+        _dbg(_T, "to_json()")
         data = {}
         for k, e in self._cache.items():
             data[k] = {
@@ -335,7 +307,7 @@ class RobustPlanCache:
 
     @classmethod
     def from_json(cls, json_str: str, debug: bool = True) -> "RobustPlanCache":
-        _dbg("FROM_JSO", f"from_json(json_str={json_str}, debug={debug})")
+        _dbg(_T, "from_json()")
         data = json.loads(json_str)
         cache = cls(preload="", debug=debug)
         for k, v in data.items():
@@ -350,7 +322,7 @@ class RobustPlanCache:
 
     # ── Debug dump ─────────────────────────────────────────────────────
     def debug_dump(self):
-        _dbg("DEBUG_DU", "ENTER debug_dump()")
+        _dbg(_T, "debug_dump()")
         print(f"\n  ┌─ PLAN CACHE STATE DUMP ────────────────────────────")
         stats = self.stats()
         for k, v in stats.items():
@@ -365,23 +337,3 @@ class RobustPlanCache:
                   f"penalty={entry.expected_penalty:.1f} "
                   f"accesses={entry.access_count}")
         print(f"  └────────────────────────────────────────────────────")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def dump_hit_rate_trend(self, window: int = 20) -> str:
-        """★ 改写: 缓存命中率滑动窗口趋势."""
-        _dbg("DUMP_HIT", f"dump_hit_rate_trend(window={window})")
-        from .. import _dbg
-        if not self._access_log:
-            return "(no accesses)"
-        lines = ["┌── Plan Cache Hit Rate Trend ──"]
-        for i in range(0, len(self._access_log), window):
-            chunk = self._access_log[i:i+window]
-            hits = sum(1 for x in chunk if x)
-            rate = hits / max(1, len(chunk))
-            bar = "█" * int(rate * 30) + "░" * (30 - int(rate * 30))
-            lines.append(f"│ [{i:>5}-{i+len(chunk):>5}]: {bar} {rate:.1%}")
-        lines.append("└──────────────────────────────")
-        return "\n".join(lines)

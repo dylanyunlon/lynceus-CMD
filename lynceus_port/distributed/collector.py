@@ -44,23 +44,8 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost
 
-_MOD_TAG = "COR"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg
-
-def _dbg_state(tag, **kwargs):
-    """键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "COL"
 
 
 logger = logging.getLogger(__name__)
@@ -73,7 +58,7 @@ logger = logging.getLogger(__name__)
 class StatisticKind(Enum):
     """Kind of statistic being collected — mirrors par2qo's separate
     collection paths for single-table vs join cardinalities."""
-    QUERY_LATENCY = auto()       # observed execution wire_delay (µs)
+    QUERY_LATENCY = auto()       # observed execution latency (µs)
     HARDWARE_UTIL = auto()       # GPU/CPU utilisation fraction
     TRANSFER_COST = auto()       # data movement cost (µs)
     INDEX_BUILD_COST = auto()    # index construction time (µs)
@@ -97,7 +82,7 @@ class StatisticSample:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         return (f"{prefix}[Sample] {self.kind.name} worker={self.worker_id} "
                 f"dim={self.dimension} val={self.value:.4f} t={self.timestamp_us:.1f}µs "
                 f"meta={self.metadata}")
@@ -126,7 +111,7 @@ class AggregatedStatistic:
     rel_error_max: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ AggregatedStatistic ══════════════════════════",
             f"{prefix}║ kind           = {self.kind.name}",
@@ -160,6 +145,7 @@ class CollectionBuffer:
 
     def __init__(self, worker_id: str, max_buffer_size: int = 10000,
                  debug_print: bool = True):
+        _dbg(_T, "__init__()")
         self._worker_id = worker_id
         self._max_size = max_buffer_size
         self._buffer: List[StatisticSample] = []
@@ -170,6 +156,7 @@ class CollectionBuffer:
     def add(self, kind: StatisticKind, value: float,
             dimension: str = "", metadata: Optional[Dict] = None) -> None:
         """Add a sample to the buffer."""
+        _dbg(_T, "add()")
         sample = StatisticSample(
             kind=kind,
             worker_id=self._worker_id,
@@ -187,7 +174,7 @@ class CollectionBuffer:
 
     def flush(self) -> List[StatisticSample]:
         """Return and clear the buffer — like par2qo's write_to_file."""
-        _dbg("FLUSH", "ENTER flush")
+        _dbg(_T, "flush()")
         samples = self._buffer.copy()
         self._buffer.clear()
         self._flush_count += 1
@@ -200,16 +187,16 @@ class CollectionBuffer:
 
     @property
     def size(self) -> int:
-        _dbg("SIZE", "ENTER size")
+        _dbg(_T, "size()")
         return len(self._buffer)
 
     @property
     def is_full(self) -> bool:
-        _dbg("IS_FULL", "ENTER is_full")
+        _dbg(_T, "is_full()")
         return len(self._buffer) >= self._max_size
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ CollectionBuffer ═══════════════════════════",
             f"{prefix}║ worker_id       = {self._worker_id}",
@@ -232,16 +219,22 @@ class CollectionBuffer:
 #   else: error = -log(est/true)
 # We add NaN/zero guards per INV-5.
 
-def cal_rel_error(true_val: float, est_val: float,
-                  mode: str = "log_ratio") -> float:
-    """计算相对误差.
-    改写: 支持两种模式——
-      log_ratio (原始): log(true/est)
-      smape: 2|true-est|/(|true|+|est|), 对称且有界[0,2]
-    改写: 加 q-error 输出到调试日志."""
-    _dbg_state("RELERR", true_val=true_val, est_val=est_val, mode=mode)
+def cal_rel_error(true_val: float, est_val: float) -> float:
+    """Calculate relative error using log-ratio.
 
+    Ported from par2qo/code/utility.py:cal_rel_error (line ~260).
+    Added: zero/NaN guards (INV-5 compliance).
+
+    Original:
+        if true > est:
+            error = math.log(true / est)
+        else:
+            error = - math.log(est / true)
+
+    Lynceus modification: guard against zero/negative values.
+    """
     # INV-5: zero and NaN guards
+    _dbg(_T, "cal_rel_error()")
     if true_val <= 0 or est_val <= 0:
         if true_val <= 0 and est_val <= 0:
             return 0.0
@@ -250,15 +243,6 @@ def cal_rel_error(true_val: float, est_val: float,
     if math.isnan(true_val) or math.isnan(est_val):
         return 0.0
 
-    # 改写: q-error (对称最大比) 用于调试输出
-    q_error = max(true_val / est_val, est_val / true_val)
-    _dbg("RELERR", f"q_error={q_error:.3f}")
-
-    if mode == "smape":
-        # 改写: SMAPE — 对称且有界 [0, 2]
-        return 2.0 * abs(true_val - est_val) / (abs(true_val) + abs(est_val))
-
-    # 原始 log_ratio 模式
     if true_val > est_val:
         error = math.log(true_val / est_val)
     else:
@@ -275,12 +259,11 @@ def cal_rel_error(true_val: float, est_val: float,
 def evenly_sample_range(n: int, lower: float, upper: float) -> List[float]:
     """Generate N evenly-spaced samples in [lower, upper].
 
-    _dbg("EVENLY_S", "ENTER evenly_sample_range")
     Ported from par2qo/code/utility.py:evenly_sample_card (line ~120).
     Removed: numpy dependency.
     Added: edge case handling for n<=1.
     """
-    _dbg("EVENLY_S", f"evenly_sample_range(n={n}, lower={lower}, upper={upper})")
+    _dbg(_T, "evenly_sample_range()")
     if n <= 1:
         return [(lower + upper) / 2.0]
     step = (upper - lower) / (n - 1)
@@ -302,6 +285,7 @@ def top_n_of_matrix(matrix: List[List[float]], n: int,
     Original printed:
         Max absolute value {i+1}: ({x}, {y}) - Value: {value}
     """
+    _dbg(_T, "top_n_of_matrix()")
     entries = []
     for i, row in enumerate(matrix):
         for j, val in enumerate(row):
@@ -335,6 +319,7 @@ def empirical_kl_divergence(p_counts: List[float], q_counts: List[float],
 
     kl(P||Q) = sum(p_i * log(p_i / q_i))
     """
+    _dbg(_T, "empirical_kl_divergence()")
     assert len(p_counts) == len(q_counts), "Distribution length mismatch"
     n = len(p_counts)
 
@@ -373,6 +358,7 @@ class AllReduceCollector:
     def __init__(self, worker_ids: Optional[List[str]] = None,
                  sync_config: Optional[SyncConfig] = None,
                  debug_print: bool = True):
+        _dbg(_T, "__init__()")
         self._worker_ids = worker_ids or ["worker_0"]
         self._buffers: Dict[str, CollectionBuffer] = {
             wid: CollectionBuffer(wid, debug_print=debug_print)
@@ -394,6 +380,7 @@ class AllReduceCollector:
     def record(self, worker_id: str, kind: StatisticKind, value: float,
                dimension: str = "", metadata: Optional[Dict] = None) -> None:
         """Record a single observation from a worker."""
+        _dbg(_T, "record()")
         buf = self._buffers.get(worker_id)
         if buf is None:
             if self._debug:
@@ -412,6 +399,7 @@ class AllReduceCollector:
             predicted_values: optional dict of dimension→predicted_value
                 for computing calibration error (like par2qo's est vs actual).
         """
+        _dbg(_T, "collect_and_aggregate()")
         dp = debug_print if debug_print is not None else self._debug
         self._collection_rounds += 1
 
@@ -522,6 +510,7 @@ class AllReduceCollector:
         Returns n_workers × n_workers matrix of KL divergences.
         """
         # Collect per-worker value distributions for this kind
+        _dbg(_T, "get_divergence_matrix()")
         worker_values: Dict[str, List[float]] = {wid: [] for wid in self._worker_ids}
         for key, agg in self._aggregated.items():
             if agg.kind == kind:
@@ -558,7 +547,7 @@ class AllReduceCollector:
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
-        _dbg("DUMP_STA", "ENTER dump_state")
+        _dbg(_T, "dump_state()")
         lines = [
             "╔══ AllReduceCollector State ═══════════════════════════",
             f"║ n_workers          = {len(self._worker_ids)}",
@@ -582,9 +571,9 @@ class AllReduceCollector:
 
     def export_json(self) -> str:
         """Export aggregated statistics as JSON — adapted from par2qo's
-        _dbg("EXPORT_J", "ENTER export_json")
         saveModeltoCache pattern (diagram.py) which dumps model state
         to JSON for later reloading."""
+        _dbg(_T, "export_json()")
         export = {}
         for key, agg in self._aggregated.items():
             export[key] = {
@@ -600,50 +589,3 @@ class AllReduceCollector:
                 "per_worker": agg.per_worker_means,
             }
         return json.dumps(export, indent=2)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区 — 追加在线方差追踪 + 异常值检测
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def detect_outlier_workers(self, kind: "StatisticKind",
-                               z_threshold: float = 2.5) -> "List[str]":
-        """★ 改写: 基于 z-score 的异常工作节点检测.
-
-        收集各 worker 对同一种类统计量的均值, 标记偏差 > z_threshold 的节点.
-        断点辅助: 快速定位行为异常的节点 (校准偏移、硬件降速等).
-        """
-        from . import _dbg
-        worker_means: "Dict[str, float]" = {}
-        for wid, buf in self._buffers.items():
-            vals = [s.value for s in buf._samples if s.kind == kind]
-            if vals:
-                worker_means[wid] = sum(vals) / len(vals)
-        if len(worker_means) < 2:
-            return []
-        grand_mean = sum(worker_means.values()) / len(worker_means)
-        var = sum((v - grand_mean) ** 2 for v in worker_means.values()) / len(worker_means)
-        std = var ** 0.495
-        if std < 1e-12:
-            return []
-        outliers = [wid for wid, m in worker_means.items()
-                    if abs(m - grand_mean) / std > z_threshold]
-        if outliers:
-            _dbg("outlier", f"outlier_workers({kind.name}): {outliers} "
-                 f"(grand_mean={grand_mean:.2f}, std={std:.2f})")
-        return outliers
-
-    def dump_worker_heatmap(self) -> str:
-        """断点辅助: 各 worker 按统计类别的样本数热力图."""
-        _dbg("DUMP_WOR", "ENTER dump_worker_heatmap")
-        lines = ["┌── Worker × StatKind Heatmap ──"]
-        kinds = list(StatisticKind)
-        hdr = "│ worker   " + "  ".join(f"{k.name:>8}" for k in kinds)
-        lines.append(hdr)
-        for wid, buf in sorted(self._buffers.items()):
-            counts = []
-            for k in kinds:
-                n = sum(1 for s in buf._samples if s.kind == k)
-                counts.append(f"{n:>8}")
-            lines.append(f"│ {wid:>8} " + "  ".join(counts))
-        lines.append("└──────────────────────────────")
-        return "\n".join(lines)

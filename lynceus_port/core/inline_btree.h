@@ -1,4 +1,14 @@
-/* lynceus_port/core/inline_btree.h — 移植版, ~20%算法修改+调试桩 */
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[INL] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
 /*
  * Copyright (C) 2023 Data-Intensive Systems Lab, Simon Fraser University.
  *
@@ -25,9 +35,6 @@
 // transaction/occ.h — Lynceus uses own concurrency
 
 namespace lynceus {
-#ifndef _CORE_TRACE
-#define _CORE_TRACE(mod, fn) fprintf(stderr, "[" mod "·ENTER] %s\n", fn)
-#endif
 namespace tabular {
 
 using noname::transaction::occ::Transaction;
@@ -185,19 +192,12 @@ struct InlineBTree {
 
   bool insert(const Key &k, Value v) {
     Result result = Result::TRANSACTION_FAILED;
-    // --- 算法改写: 加重试上限, 原版无限 while 可能活锁
-    unsigned retries = 0;
-    constexpr unsigned kMaxRetries = 1000;
-    while (result == Result::TRANSACTION_FAILED && retries < kMaxRetries) {
+    while (result == Result::TRANSACTION_FAILED) {
       #if defined(MATERIALIZED_INSERT)
       result = insert_internal(k, v);
       #else
       result = insert_internal_callback(k, v);
       #endif
-      retries++;
-    }
-    if (retries > 1) {
-      fprintf(stderr, "[BTREE·INSERT] retries=%u result=%d\n", retries, (int)result);
     }
     assert(result != Result::TRANSACTION_FAILED);
     return result == Result::SUCCEED;

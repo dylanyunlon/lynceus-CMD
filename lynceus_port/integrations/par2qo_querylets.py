@@ -30,23 +30,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Set
 from enum import Enum, auto
 
-_MOD_TAG = "PAS"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag, msg):
-    """调试输出 — 修复自递归, 改写加序号."""
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-def _dbg_state(tag, **kwargs):
-    """改写新增: 键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v!r}" if not isinstance(v, float) else f"{k}={v:.6g}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-
-_tr = _dbg  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "PQL"
 
 
 logger = logging.getLogger("lynceus.querylets")
@@ -116,11 +101,10 @@ class Predicate:
     column: str
     pred_type: PredicateType
     alias: str = ""
-    selectivity_hint: float = 0.098   # estimated selectivity for cost model
+    selectivity_hint: float = 0.1   # estimated selectivity for cost model
 
     def to_sql(self, param_id: int = 0) -> str:
-        _dbg("TO_SQL", "to_sql entered")
-        _dbg("TO_SQL", f"to_sql(param_id={param_id})")
+        _dbg(_T, "to_sql()")
         col = f"{self.alias}.{self.column}" if self.alias else self.column
         if self.pred_type == PredicateType.RANGE:
             return f"{col} BETWEEN :p{param_id}_lo AND :p{param_id}_hi"
@@ -154,46 +138,24 @@ class Querylet:
     device_hint: str = ""     # Lynceus: "gpu" | "cpu" | "" for auto
 
     def fingerprint(self) -> str:
-        _dbg("FINGERPR", "fingerprint entered")
+        _dbg(_T, "fingerprint()")
         raw = f"{self.template_id}:{','.join(sorted(self.tables))}"
         return hashlib.md5(raw.encode()).hexdigest()[:10]
 
     def estimated_rows(self, table_rows: Dict[str, int]) -> float:
-        """估计输出基数.
-        改写: 加相关性修正——当多个谓词作用于同一表时,
-        用 sqrt(Πsel) 替代 Πsel，减轻独立性假设的过度估计."""
-        _dbg_state("ESTROWS", tables=self.tables, n_preds=len(self.predicates),
-                   n_joins=len(self.joins))
+        """Estimate output cardinality using independence assumption."""
+        _dbg(_T, "estimated_rows()")
         total = 1.0
         for t in self.tables:
             total *= table_rows.get(t, 10000)
-
-        # 改写: 按表分组谓词，组内用 sqrt 修正相关性
-        from collections import defaultdict
-        preds_by_table = defaultdict(list)
         for p in self.predicates:
-            preds_by_table[p.table].append(p.selectivity_hint)
-        for table, sels in preds_by_table.items():
-            if len(sels) > 1:
-                # 多谓词同表: 假设 50% 相关，用 geometric mean 修正
-                combined = 1.0
-                for s in sels:
-                    combined *= s
-                # 改写: sqrt 修正——比完全独立估计更保守
-                combined = math.sqrt(combined)
-                total *= combined
-                _dbg("ESTROWS", f"table={table}: {len(sels)} preds, corr_sel={combined:.6f}")
-            else:
-                total *= sels[0]
-
+            total *= p.selectivity_hint
         for _ in self.joins:
-            total *= 0.00105
-        result = max(total, 1.0)
-        _dbg("ESTROWS", f"result={result:.1f}")
-        return result
+            total *= 0.001  # default join selectivity
+        return max(total, 1.0)
 
     def to_sql(self) -> str:
-        _dbg("TO_SQL", "to_sql entered")
+        _dbg(_T, "to_sql()")
         if self.sql_template:
             return self.sql_template
         # Build SQL from components
@@ -218,12 +180,10 @@ class Querylet:
 def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
     """Generate TPC-H querylet dictionary.
 
-    _dbg("QUERYLET", f"ENTER querylet_tpch(cc={cc!r}, kk={kk!r})")
     PAR2QO: querylet(db, kk, cc, template_name) → dict of SQL strings.
     Lynceus: returns dict of structured Querylet objects.
     """
-    _dbg("QUERYLET", "querylet_tpch entered")
-    _dbg("QUERYLET", f"querylet_tpch(cc={cc}, 1={1}, kk={kk}, 1={1})")
+    _dbg(_T, "querylet_tpch()")
     templates = {}
 
     # ── Q1-style: lineitem scan with date range ──
@@ -258,9 +218,9 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
             Predicate("customer", "c_mktsegment", PredicateType.EQUALITY,
                       alias="c", selectivity_hint=0.2),
             Predicate("orders", "o_orderdate", PredicateType.COMPARISON,
-                      alias="o", selectivity_hint=0.495),
+                      alias="o", selectivity_hint=0.5),
             Predicate("lineitem", "l_shipdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.495),
+                      alias="l", selectivity_hint=0.5),
         ],
         sql_template=f"""
             SELECT l.l_orderkey, SUM(l.l_extendedprice * (1 - l.l_discount))
@@ -328,11 +288,11 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
             Predicate("lineitem", "l_shipmode", PredicateType.IN_LIST,
                       alias="l", selectivity_hint=0.28),
             Predicate("lineitem", "l_commitdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.495),
+                      alias="l", selectivity_hint=0.5),
             Predicate("lineitem", "l_shipdate", PredicateType.RANGE,
                       alias="l", selectivity_hint=0.15),
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.495),
+                      alias="l", selectivity_hint=0.5),
         ],
     )
 
@@ -359,7 +319,7 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         ],
         predicates=[
             Predicate("lineitem", "l_quantity", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.0098),
+                      alias="l", selectivity_hint=0.01),
         ],
         device_hint="gpu",  # aggregate-heavy → GPU
     )
@@ -376,11 +336,11 @@ def querylet_tpch(cc: str = "1=1", kk: str = "1=1") -> Dict[str, Querylet]:
         ],
         predicates=[
             Predicate("orders", "o_orderstatus", PredicateType.EQUALITY,
-                      alias="o", selectivity_hint=0.495),
+                      alias="o", selectivity_hint=0.5),
             Predicate("nation", "n_name", PredicateType.EQUALITY,
                       alias="n", selectivity_hint=0.04),
             Predicate("lineitem", "l_receiptdate", PredicateType.COMPARISON,
-                      alias="l", selectivity_hint=0.495),
+                      alias="l", selectivity_hint=0.5),
         ],
     )
 
@@ -403,6 +363,7 @@ def make_join_querylet(
     PAR2QO: stats_join_querylet(left_alias, right_alias, l_r_b, cc, kk)
     Lynceus: generic for any schema with optional device hint.
     """
+    _dbg(_T, "make_join_querylet()")
     template_id = f"join_{left_table}_{right_table}"
     return Querylet(
         template_id=template_id,
@@ -423,6 +384,7 @@ def make_single_table_querylet(
 
     PAR2QO: gen_one_table_query(table_name, condition).
     """
+    _dbg(_T, "make_single_table_querylet()")
     return Querylet(
         template_id=f"scan_{table}",
         tables=[table],
@@ -446,6 +408,7 @@ class QueryletGenerator:
         join_graph: Optional[List[Tuple[str, str, str, str]]] = None,
         debug: bool = True,
     ):
+        _dbg(_T, "__init__()")
         self.schema = schema or TPCH_TABLES
         self.join_graph = join_graph or TPCH_JOINS
         self.debug = debug
@@ -458,11 +421,10 @@ class QueryletGenerator:
     def generate_all(self) -> Dict[str, Querylet]:
         """Generate the full querylet dictionary.
 
-        _dbg("GENERATE", "ENTER generate_all()")
         PAR2QO: querylet(db, kk, cc, template_name).
         Lynceus: generates all TPC-H templates.
         """
-        _dbg("GENERATE", "generate_all entered")
+        _dbg(_T, "generate_all()")
         t0 = time.time()
         self._templates = querylet_tpch()
 
@@ -477,9 +439,9 @@ class QueryletGenerator:
             if key not in self._templates:
                 self._templates[key] = qlet
 
-        wall_time_us = time.time() - t0
+        elapsed = time.time() - t0
         if self.debug:
-            print(f"  ├─ generated {len(self._templates)} querylets in {wall_time_us:.3f}s")
+            print(f"  ├─ generated {len(self._templates)} querylets in {elapsed:.3f}s")
             for tid, qlet in list(self._templates.items())[:5]:
                 est = qlet.estimated_rows(
                     {t: self.schema[t]["rows"] for t in self.schema}
@@ -490,21 +452,20 @@ class QueryletGenerator:
         return self._templates
 
     def get_template(self, template_id: str) -> Optional[Querylet]:
-        _dbg("GET_TEMP", "get_template entered")
-        _dbg("GET_TEMP", f"get_template(template_id={template_id})")
+        _dbg(_T, "get_template()")
         if not self._templates:
             self.generate_all()
         return self._templates.get(template_id)
 
     def list_templates(self) -> List[str]:
-        _dbg("LIST_TEM", "ENTER list_templates()")
+        _dbg(_T, "list_templates()")
         if not self._templates:
             self.generate_all()
         return list(self._templates.keys())
 
     def templates_for_tables(self, tables: Set[str]) -> List[Querylet]:
         """Find all querylets involving the given tables."""
-        _dbg("TEMPLATE", f"templates_for_tables(tables={tables})")
+        _dbg(_T, "templates_for_tables()")
         if not self._templates:
             self.generate_all()
         return [q for q in self._templates.values()
@@ -521,7 +482,7 @@ class WorkloadQuery:
     table_name: str = ""   # explicit logical table (INV-3 compliance)
 
     def describe(self) -> str:
-        _dbg("DESCRIBE", "ENTER describe()")
+        _dbg(_T, "describe()")
         return (f"WorkloadQuery({self.query_id}, "
                 f"template={self.querylet.template_id}, "
                 f"tables={self.querylet.tables})")
@@ -538,6 +499,7 @@ def workload_from_querylets(
     PAR2QO: not directly present; workload was generated externally.
     Lynceus: produces WorkloadQuery instances for benchmark.main().
     """
+    _dbg(_T, "workload_from_querylets()")
     import random
     rng = random.Random(seed)
     template_list = list(templates.values())
@@ -572,7 +534,7 @@ def workload_from_querylets(
 # ── Debug utilities ────────────────────────────────────────────────────
 def debug_dump_querylet(qlet: Querylet):
     """Print full querylet structure for debugging."""
-    _dbg("DEBUG_DU", f"debug_dump_querylet(qlet={qlet})")
+    _dbg(_T, "debug_dump_querylet()")
     print(f"\n  ┌─ QUERYLET: {qlet.template_id} ──────────────────────")
     print(f"  │  tables: {qlet.tables}")
     print(f"  │  aliases: {qlet.aliases}")
@@ -586,20 +548,3 @@ def debug_dump_querylet(qlet: Querylet):
     print(f"  │  fingerprint: {qlet.fingerprint()}")
     print(f"  │  SQL:\n{qlet.to_sql()}")
     print(f"  └────────────────────────────────────────────────────")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def dump_template_fingerprints(self) -> str:
-        """★ 改写: 查询模板指纹摘要."""
-        _dbg("DUMP_TEM", "ENTER dump_template_fingerprints()")
-        from .. import _dbg
-        lines = ["┌── Querylet Templates ──"]
-        for tid, tmpl in sorted(self._templates.items()):
-            n_instances = len(tmpl.get('instances', []))
-            lines.append(f"│ T{tid}: {tmpl.get('pattern','?')} "
-                         f"({n_instances} instances)")
-        lines.append(f"│ {len(self._templates)} templates total")
-        lines.append("└──────────────────────────────")
-        return "\n".join(lines)

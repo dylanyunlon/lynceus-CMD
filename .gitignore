@@ -6,3 +6,8 @@ output/
 dist/
 build/
 __pycache__/
+_do_port.py
+_fix_port.py
+_port_v3.py
+port_generator.py
+__pycache__/

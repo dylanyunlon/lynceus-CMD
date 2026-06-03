@@ -39,23 +39,8 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost, SyncMetrics
 
-_MOD_TAG = "OPR"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg
-
-def _dbg_state(tag, **kwargs):
-    """键值对状态快照."""
-    if _LYNCEUS_DBG == "0":
-        return
-    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
-    _dbg(tag, " | ".join(parts))
-  # 兼容旧调用
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
+_T = "OPT"
 
 
 logger = logging.getLogger(__name__)
@@ -99,11 +84,11 @@ class CostModelParams:
 
     def to_bytes(self) -> int:
         """Size when serialised for transmission (float64 each)."""
-        _dbg("TO_BYTES", "ENTER to_bytes")
+        _dbg(_T, "to_bytes()")
         return self.n_params * 8
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ CostModelParams State ═══════════════════════",
             f"{prefix}║ gpu_compute_scale     = {self.gpu_compute_scale:.6f}",
@@ -126,10 +111,10 @@ class OptimizerConfig:
     partition_strategy: PartitionStrategy = PartitionStrategy.REPLICATED
     sync_config: SyncConfig = field(default_factory=SyncConfig)
     # Adam-like hyperparameters (for the calibration update)
-    learning_rate: float = 0.0098
+    learning_rate: float = 0.01
     beta1: float = 0.9
     beta2: float = 0.999
-    epsilon: float = 1.02e-8
+    epsilon: float = 1e-8
     weight_decay: float = 0.0
     # Fusion: batch N parameter updates before sync
     # (Inspired by APEX fused optimizer — reduces sync overhead)
@@ -150,7 +135,7 @@ class OptimizerStep:
     param_delta_norm: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg("DUMP_DEB", f"dump_debug(prefix={prefix})")
+        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ OptimizerStep #{self.step_number} ═══════════════════",
             f"{prefix}║ param_update_us   = {self.param_update_us:,.1f}",
@@ -167,7 +152,7 @@ class DistributedCostModelOptimizer:
     """Manages distributed updates to cost-model calibration parameters.
 
     Simulates the lifecycle of APEX DistributedFusedAdam:
-    1. Receive feedback (observed vs predicted wire_delay)
+    1. Receive feedback (observed vs predicted latency)
     2. Compute gradient of calibration error
     3. Apply Adam update locally
     4. Synchronize parameters across workers
@@ -179,6 +164,7 @@ class DistributedCostModelOptimizer:
     """
 
     def __init__(self, config: Optional[OptimizerConfig] = None):
+        _dbg(_T, "__init__()")
         self._config = config or OptimizerConfig()
         self._params = CostModelParams()
         self._step_count = 0
@@ -196,63 +182,53 @@ class DistributedCostModelOptimizer:
 
     def step(self, observed_latency_us: float, predicted_latency_us: float,
              debug_print: Optional[bool] = None) -> OptimizerStep:
-        """执行一步优化.
-        改写: Adam→AdamW (加 weight decay 解耦正则);
-        加 gradient clipping (max_grad_norm=1.0);
-        加 loss scale 溢出检测."""
+        """Execute one optimizer step.
+
+        Simulates:
+        1. Gradient computation (how wrong was the cost model?)
+        2. Adam parameter update (local)
+        3. Distributed sync (cross-worker parameter averaging)
+        """
+        _dbg(_T, "step()")
         dp = debug_print if debug_print is not None else self._config.debug_print
         self._step_count += 1
 
-        _dbg_state("STEP", step=self._step_count,
-                   observed=observed_latency_us, predicted=predicted_latency_us)
-
         # ─── Gradient computation ─────────────────────────────
+        # "Gradient" = direction to adjust calibration params based on
+        # the error between observed and predicted latency.
         error = predicted_latency_us - observed_latency_us
         rel_error = error / max(1.0, observed_latency_us)
 
+        # Simple gradient: proportional to relative error
+        # In reality this would be a Jacobian of the cost model, but
+        # we simulate the magnitude for cost estimation purposes.
         grad_magnitude = abs(rel_error)
         grad_norm = grad_magnitude * math.sqrt(self._params.n_params)
 
-        # 改写: gradient clipping — cap grad_norm to 1.0
-        max_grad_norm = 1.0
-        if grad_norm > max_grad_norm:
-            clip_coef = max_grad_norm / grad_norm
-            grad_magnitude *= clip_coef
-            _dbg("STEP", f"grad clipped: {grad_norm:.4f} → {grad_magnitude * math.sqrt(self._params.n_params):.4f}")
-            grad_norm = max_grad_norm
-
-        # 改写: loss scale 溢出检测 — NaN/Inf 梯度跳过更新
-        if not math.isfinite(grad_magnitude):
-            _dbg("STEP", "WARNING: non-finite gradient, skipping update")
-            result = OptimizerStep(
-                step_number=self._step_count,
-                param_update_us=0.0, sync_us=0.0, total_us=0.0,
-                sync_metrics=None, grad_norm=float('inf'), param_delta_norm=0.0,
-            )
-            self._history.append(result)
-            return result
-
-        # ─── Local AdamW update ────────────────────────────────
-        # 改写: AdamW — 5 ops per param (m, v, bias_correct, weight_decay, param_update)
-        param_update_ns = self._params.n_params * 5 * 5
+        # ─── Local Adam update ────────────────────────────────
+        # Cost of Adam update: 4 ops per parameter (m update, v update, bias correct, param update)
+        # Each op ≈ 1 FP64 multiply-add ≈ 5ns on modern CPU
+        param_update_ns = self._params.n_params * 4 * 5  # nanoseconds
         param_update_us = param_update_ns / 1000.0
 
+        # Simulate parameter delta (how much params changed)
         lr = self._config.learning_rate
-        # 改写: AdamW weight decay 解耦 — param *= (1 - lr * weight_decay)
-        weight_decay = 0.01
         param_delta = lr * grad_magnitude / max(1e-8, math.sqrt(grad_magnitude) + self._config.epsilon)
         param_delta_norm = param_delta * math.sqrt(self._params.n_params)
-        _dbg("STEP", f"AdamW: lr={lr:.6f}, wd={weight_decay}, delta_norm={param_delta_norm:.6f}")
 
         # ─── Distributed sync ─────────────────────────────────
         data_bytes = self._params.to_bytes()
 
+        # Partition strategy affects what gets synced
         if self._config.partition_strategy == PartitionStrategy.REPLICATED:
+            # Full parameter sync via all-reduce
             sync_data = data_bytes
         elif self._config.partition_strategy == PartitionStrategy.PARTITIONED_GRADS:
+            # Sync gradients (same size as params), then local update
             sync_data = data_bytes
         else:
-            sync_data = data_bytes
+            # PARTITIONED_PARAMS: each worker holds params/n_workers, then all-gather
+            sync_data = data_bytes  # all-gather sends full data eventually
 
         sync_metrics = estimate_sync_cost(
             data_bytes=sync_data,
@@ -261,11 +237,14 @@ class DistributedCostModelOptimizer:
         )
         sync_us = sync_metrics.total_time_us
 
+        # Fusion: amortize sync over batch_size steps
         if self._config.fusion_batch_size > 1:
             if self._step_count % self._config.fusion_batch_size != 0:
-                sync_us = 0.0
-                _dbg("STEP", f"fused: skip sync (batch {self._step_count % self._config.fusion_batch_size}"
-                     f"/{self._config.fusion_batch_size})")
+                sync_us = 0.0  # skip sync for non-boundary steps
+                if dp:
+                    print(f"  [optimizer] Fused step {self._step_count}: skipping sync "
+                          f"(batch {self._step_count % self._config.fusion_batch_size}"
+                          f"/{self._config.fusion_batch_size})")
 
         total_us = param_update_us + sync_us
 
@@ -279,7 +258,6 @@ class DistributedCostModelOptimizer:
             param_delta_norm=param_delta_norm,
         )
         self._history.append(result)
-        _dbg("STEP", f"done: total={total_us:.1f}us (update={param_update_us:.1f}+sync={sync_us:.1f})")
 
         if dp:
             print(f"\n  [optimizer] Step #{self._step_count}:")
@@ -292,17 +270,17 @@ class DistributedCostModelOptimizer:
 
     @property
     def params(self) -> CostModelParams:
-        _dbg("PARAMS", "ENTER params")
+        _dbg(_T, "params()")
         return self._params
 
     @property
     def step_count(self) -> int:
-        _dbg("STEP_COU", "ENTER step_count")
+        _dbg(_T, "step_count()")
         return self._step_count
 
     def dump_state(self) -> str:
         """Full optimizer state dump for breakpoint inspection."""
-        _dbg("DUMP_STA", "ENTER dump_state")
+        _dbg(_T, "dump_state()")
         lines = [
             "╔══ DistributedCostModelOptimizer State ═══════════════",
             f"║ step_count   = {self._step_count}",
@@ -324,7 +302,7 @@ class DistributedCostModelOptimizer:
 
     def dump_history_summary(self, last_n: int = 10) -> str:
         """Print recent optimizer step history."""
-        _dbg("DUMP_HIS", f"dump_history_summary(last_n={last_n})")
+        _dbg(_T, "dump_history_summary()")
         recent = self._history[-last_n:]
         lines = [f"[optimizer] Last {len(recent)} steps:"]
         for s in recent:
@@ -332,41 +310,3 @@ class DistributedCostModelOptimizer:
                         f"sync={s.sync_us:8.1f}µs  grad={s.grad_norm:.4f}  "
                         f"Δparam={s.param_delta_norm:.4f}")
         return "\n".join(lines)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ★ 移植改写区
-# ═══════════════════════════════════════════════════════════════════════════
-
-    def dump_lr_schedule(self) -> str:
-        """★ 改写: ASCII 学习率变化曲线."""
-        _dbg("DUMP_LR_", "ENTER dump_lr_schedule")
-        if not self._history:
-            return "(no history)"
-        lines = ["┌── LR Schedule ──"]
-        for step in self._history[-20:]:
-            lr = step.learning_rate
-            bar = "█" * max(1, int(lr / max(1e-9, self._config.learning_rate) * 30))
-            lines.append(f"│ step{step.step_id:>4}: {bar} lr={lr:.6f} "
-                         f"loss={step.loss:.4f}")
-        lines.append("└──────────────────")
-        return "\n".join(lines)
-
-    def estimate_convergence(self, window: int = 20) -> float:
-        """★ 改写: 基于滑动窗口斜率估算收敛速度.
-
-        _dbg("ESTIMATE", "ENTER estimate_convergence")
-        返回: loss 斜率 (负值=收敛中, 正值=发散, ~0=平台).
-        """
-        _dbg("ESTIMATE", f"estimate_convergence(window={window})")
-        if len(self._history) < window:
-            return 0.0
-        recent = self._history[-window:]
-        n = len(recent)
-        x_mean = (n - 1) / 2.0
-        y_mean = sum(s.loss for s in recent) / n
-        num = sum((i - x_mean) * (s.loss - y_mean) for i, s in enumerate(recent))
-        den = sum((i - x_mean) ** 2 for i in range(n))
-        slope = num / max(1e-12, den)
-        from . import _dbg
-        _dbg("converg", f"convergence: slope={slope:.6f} (window={window})")
-        return slope

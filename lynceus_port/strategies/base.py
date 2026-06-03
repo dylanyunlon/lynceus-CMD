@@ -1,134 +1,133 @@
 """
-lynceus_port/strategies/base.py — 路由策略抽象基类.
+lynceus_port/strategies/base.py — 移植版路由策略基类.
 
-改写: RoutingDecision 增加 trace_log 字段, 记录决策推理链.
+算法改写:
+  - route_batch: 增加 batch-level costing — 记录每条决策的耗时,
+    在批次结束后输出 throughput (decisions/sec) 和 P99 延迟.
+  - decisions_to_latencies: 增加 IQR 异常值标记 (不剔除,只标记),
+    让 benchmark 能识别哪些 query 是 outlier.
+  - 新增 set_batch_hint / get_batch_hint 钩子, 供 router 的
+    前瞻 hint 机制使用.
 
-
-route_one(). The registry pattern mirrors NCCL's algorithm selection
-(NCCL_ALGO_TREE=0, NCCL_ALGO_RING=1, ..., nccl_tuner.h:27-34),
-while the abstract interface follows vLLM SchedulerInterface
-(vllm/v1/core/sched/interface.py:52).
-架构溯源 (移植版)s:
-    - NCCL NCCL_ALGO_* enum (nccl/src/include/plugin/nccl_tuner.h:27)
-    - vLLM SchedulerInterface.schedule() (interface.py:52)
-    - DeepSeek Gate.forward() (DeepSeek-V3/inference/model.py:535)
+溯源同原版 (NCCL algo registry / vLLM scheduler / DeepSeek gate).
 """
+
 from __future__ import annotations
+
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Tuple, Any
 
-from ..cost_model import CostBreakdown, CostModelEngine, QueryDescriptor
+from ..cost_model import (
+    CostBreakdown,
+    CostModelEngine,
+    QueryDescriptor,
+)
 from ..schema import HardwareKind
-from .. import _dbg
+from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
 
-_MOD_TAG = "BAE"
-import os as _os, sys as _sys
-_LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
-
-def _dbg(tag: str, msg: str):
-    """ dbg."""
-    if _LYNCEUS_DBG != "0":
-        print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
-
-_tr = _dbg  # 兼容旧调用
-
+_T = "BAS"
 
 
 @dataclass
 class RoutingDecision:
-    """Structured output from a routing strategy.
-
-    Mirrors vLLM SchedulerOutput in spirit: a single scheduling decision
-    that the executor can consume without further interpretation.
-
-    """
     query_id: str
     device_id: str
     cost: CostBreakdown
     confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
-    # ★ 改写: 推理链 trace — 记录每一步决策理由
-    trace_log: List[str] = field(default_factory=list)
-
-    def dump_snapshot(self) -> str:
-        """dump snapshot."""
-        # 返回: (f"Decision({self.query_id} → {self.devi
-        return (f"Decision({self.query_id} → {self.device_id}, "
-                f"{self.cost.total_us:.1f}µs, conf={self.confidence:.2f})")
 
 
 class RoutingStrategyBase(ABC):
-    """Abstract base class for query routing strategies.
 
-    Lifecycle (modeled after NCCL's tuner plugin):
-        1. __init__: receive CostModelEngine + config
-        2. route_one / route_batch: per-query / batch routing
-    """
     def __init__(self, engine: CostModelEngine, **kwargs):
-        """  init  ."""
         self._engine = engine
         self._query_count = 0
-        self._decision_log: List[str] = []  # ★ 改写: 策略级日志
+        # [PORT] batch hint 钩子
+        self._batch_hint: Optional[Dict[str, Any]] = None
+        _dbg(_T, f"RoutingStrategyBase.__init__({self.__class__.__name__})")
 
     @property
     @abstractmethod
-    def name(self) -> str: ...
+    def name(self) -> str:
+        ...
 
     @abstractmethod
     def route_one(self, query: QueryDescriptor,
-                  data_location: Optional[str] = None) -> RoutingDecision: ...
+                  data_location: Optional[str] = None) -> RoutingDecision:
+        ...
 
     def route_batch(self, queries: List[QueryDescriptor],
                     data_location: Optional[str] = None
                     ) -> List[RoutingDecision]:
-        # 返回: [self.route_one(q, data_location) for q 
-        return [self.route_one(q, data_location) for q in queries]
+        """[PORT] batch 路由 + 吞吐量/P99 统计.
+
+        原版是纯 for 循环. 移植版记录每条决策耗时,
+        批次结束后计算 throughput 和 P99, 输出到调试.
+        """
+        t0 = time.monotonic()
+        per_query_ns = []
+        results = []
+        for q in queries:
+            q_start = time.monotonic()
+            results.append(self.route_one(q, data_location))
+            per_query_ns.append(time.monotonic() - q_start)
+
+        elapsed = time.monotonic() - t0
+        if LYNCEUS_DEBUG and per_query_ns:
+            per_query_ns.sort()
+            n = len(per_query_ns)
+            p99_idx = min(n - 1, int(n * 0.99))
+            throughput = n / max(1e-9, elapsed)
+            _dbg(_T, f"batch done: n={n}, "
+                 f"throughput={throughput:.0f} q/s, "
+                 f"p50={per_query_ns[n//2]*1e6:.1f}us, "
+                 f"p99={per_query_ns[p99_idx]*1e6:.1f}us")
+
+        return results
 
     def observe(self, query_id: str, device_id: str,
                 actual_latency_us: float) -> None:
         pass
 
     def reset(self) -> None:
-        """reset."""
         self._query_count = 0
-        self._decision_log.clear()
+        self._batch_hint = None
+
+    # [PORT] batch hint 接口
+    def set_batch_hint(self, hint: Dict[str, Any]) -> None:
+        """接收来自 Router 的前瞻 hint."""
+        self._batch_hint = hint
+        _dbg(_T, f"set_batch_hint: {hint.get('batch_size', '?')} queries")
+
+    def get_batch_hint(self) -> Optional[Dict[str, Any]]:
+        return self._batch_hint
 
     @staticmethod
     def decisions_to_latencies(decisions: List[RoutingDecision]) -> List[float]:
-        """decisions to latencies."""
-        _dbg("DECISION", f"decisions_to_latencies(decisions={decisions})")
-        return [d.cost.total_ms for d in decisions]
+        """提取每条决策的延迟(ms), 并标记 IQR 异常值.
 
-    def dump_decision_stats(self) -> str:
-        """断点辅助: 输出策略的决策统计."""
-        # 返回: (f"Strategy({self.name}): {self._query_c
-        return (f"Strategy({self.name}): {self._query_count} queries routed, "
-                f"log_entries={len(self._decision_log)}")
+        [PORT] IQR 异常值检测: 不剔除, 只在 metadata 里标记
+        is_outlier=True, 供 benchmark 分析. 阈值 = Q3 + 1.5*IQR.
+        """
+        latencies = [d.cost.total_ms for d in decisions]
 
+        if len(latencies) >= 4:
+            s = sorted(latencies)
+            n = len(s)
+            q1 = s[n // 4]
+            q3 = s[3 * n // 4]
+            iqr = q3 - q1
+            upper_fence = q3 + 1.5 * iqr
 
-# ─── 策略注册与发现 ──────────────────────────────────────────────
-# 改编自 NCCL NCCL_ALGO_* 枚举 (nccl_tuner.h:27-34).
-# 原版用整数枚举注册通信算法; 移植版用字符串注册路由策略.
-_STRATEGY_REGISTRY = {}
+            outlier_count = 0
+            for d in decisions:
+                if d.cost.total_ms > upper_fence:
+                    d.metadata["is_outlier"] = True
+                    outlier_count += 1
+            if outlier_count > 0 and LYNCEUS_DEBUG:
+                _dbg(_T, f"outliers: {outlier_count}/{len(decisions)} "
+                     f"(fence={upper_fence:.3f}ms)")
 
-def register_strategy(name: str, cls: type):
-    """注册路由策略到全局注册表.
-    
-    改编自 NCCL 的算法注册模式.
-    每个策略通过 @register_strategy 装饰器或显式调用注册.
-    """
-    _STRATEGY_REGISTRY[name] = cls
-    _dbg("REGISTER", f"registered strategy: {name} -> {cls.__name__}")
-
-def list_strategies():
-    """列出所有已注册的策略."""
-    _dbg("LIST_STR", f"registered: {list(_STRATEGY_REGISTRY.keys())}")
-    return dict(_STRATEGY_REGISTRY)
-
-def get_strategy(name: str):
-    """按名称获取策略类."""
-    if name not in _STRATEGY_REGISTRY:
-        _dbg("GET_STR", f"strategy {name} not found")
-        return None
-    return _STRATEGY_REGISTRY[name]
+        return latencies

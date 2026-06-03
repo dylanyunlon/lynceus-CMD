@@ -1,3 +1,14 @@
+// [PORT] lynceus_port — trace instrumented
+#ifndef LYNCEUS_TRACE
+#define LYNCEUS_TRACE 1
+#endif
+#if LYNCEUS_TRACE
+#include <cstdio>
+#define LYN_TR(fmt, ...) fprintf(stderr, "[BTR] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LYN_TR(fmt, ...) ((void)0)
+#endif
+
 /*
  * Original: Copyright (C) 2023 Data-Intensive Systems Lab, Simon Fraser University.
  * Modified: Lynceus — cost-aware B-tree node structures with heterogeneous dispatch.
@@ -79,29 +90,35 @@ struct BTreeLeafNode : public NodeBase {
 
   bool isFull() { return count == maxEntries; }
 
-  // --- 算法改写: 线性搜索分支加 early-exit sentinel 检查 ---
-  //     如果 count>0 且最后一个 key < k, 直接返回 count (跳过遍历)
-  //     二分分支改用 branchless 风格的 conditional move
   unsigned lowerBound(const Key &k) {
     if constexpr (kPageSize <= kPageSizeLinearSearchCutoff) {
-      if (count > 0 && data[count - 1].key < k) return count;  // sentinel
       unsigned lower = 0;
       while (lower < count) {
-        if (k <= data[lower].key) return lower;
-        lower++;
+        const Key &next_key = data[lower].key;
+
+        if (k <= next_key) {
+          return lower;
+        } else {
+          lower++;
+        }
       }
       return lower;
     } else {
       unsigned lower = 0;
       unsigned upper = count;
-      while (lower < upper) {
-        unsigned mid = lower + ((upper - lower) >> 1);
-        // branchless: lower = (data[mid].key < k) ? mid+1 : lower
-        //             upper = (data[mid].key < k) ? upper : mid
-        bool go_right = (data[mid].key < k);
-        lower = go_right ? (mid + 1) : lower;
-        upper = go_right ? upper : mid;
-      }
+      do {
+        unsigned mid = ((upper - lower) / 2) + lower;
+        // This is the key at the pivot position
+        const Key &middle_key = data[mid].key;
+
+        if (k < middle_key) {
+          upper = mid;
+        } else if (k > middle_key) {
+          lower = mid + 1;
+        } else {
+          return mid;
+        }
+      } while (lower < upper);
       return lower;
     }
   }
@@ -224,25 +241,32 @@ struct BTreeInnerNode : public NodeBase {
     return (*base < k) + base - keys;
   }
 
-  // --- 算法改写: 同 LeafNode, sentinel + branchless binary search
   unsigned lowerBound(const Key &k) {
     if constexpr (kPageSize <= kPageSizeLinearSearchCutoff) {
-      if (count > 0 && keys[count - 1] < k) return count;
       unsigned lower = 0;
       while (lower < count) {
-        if (k <= keys[lower]) return lower;
-        lower++;
+        const Key &next_key = keys[lower];
+
+        if (k <= next_key) {
+          return lower;
+        } else {
+          lower++;
+        }
       }
       return lower;
     } else {
       unsigned lower = 0;
       unsigned upper = count;
-      while (lower < upper) {
-        unsigned mid = lower + ((upper - lower) >> 1);
-        bool go_right = (keys[mid] < k);
-        lower = go_right ? (mid + 1) : lower;
-        upper = go_right ? upper : mid;
-      }
+      do {
+        unsigned mid = ((upper - lower) / 2) + lower;
+        if (k < keys[mid]) {
+          upper = mid;
+        } else if (k > keys[mid]) {
+          lower = mid + 1;
+        } else {
+          return mid;
+        }
+      } while (lower < upper);
       return lower;
     }
   }
@@ -403,35 +427,33 @@ struct CostAnnotatedLeafNode : public NodeBase {
   //   candidate (ambiguous)       → stay in this leaf
   //
   // Returns the count of entries moved to gpu_leaf.
-  // --- 算法改写: 原版二分(GPU win / CPU stay), 阈值 0.8
-  //     port 改三档分类 + 阈值收紧到 0.7 + 分裂统计
   unsigned SplitByCostThreshold(double gpu_threshold_us,
                                 CostAnnotatedLeafNode *gpu_leaf) {
     unsigned cpu_idx = 0;
     unsigned gpu_idx = 0;
-    unsigned ambiguous = 0;
     CostEntry temp[maxEntries > 0 ? maxEntries : 1];
 
+    // Classify and partition (like CCCL's f_with_out_buf lambda)
     for (unsigned i = 0; i < count; ++i) {
       const auto &e = data[i];
-      double ratio = (e.cpu_cost_us > 0) ? e.gpu_cost_us / e.cpu_cost_us : 1.0;
-      if (e.gpu_cost_us < gpu_threshold_us && ratio < 0.7) {
-        // GPU 明确胜出 (原版阈值 0.8, port 收紧到 0.7)
-        gpu_leaf->data[gpu_idx++] = e;
-      } else if (ratio >= 0.7 && ratio <= 1.3) {
-        // 模糊地带: 倾向留 CPU (保守策略)
-        temp[cpu_idx++] = e;
-        ambiguous++;
+      if (e.gpu_cost_us < gpu_threshold_us &&
+          e.gpu_cost_us < e.cpu_cost_us * 0.8) {
+        // Clear GPU winner → move to gpu_leaf
+        gpu_leaf->data[gpu_idx] = e;
+        gpu_idx++;
       } else {
-        temp[cpu_idx++] = e;
+        // CPU-bound or ambiguous → stay
+        temp[cpu_idx] = e;
+        cpu_idx++;
       }
     }
 
+    // Compact this leaf
     memcpy(data, temp, sizeof(CostEntry) * cpu_idx);
     count = cpu_idx;
     gpu_leaf->count = gpu_idx;
 
-    // 重算代价和
+    // Recompute cost sums
     total_cpu_cost = total_gpu_cost = 0;
     for (unsigned i = 0; i < count; ++i) {
       total_cpu_cost += data[i].cpu_cost_us;
@@ -442,10 +464,6 @@ struct CostAnnotatedLeafNode : public NodeBase {
       gpu_leaf->total_cpu_cost += gpu_leaf->data[i].cpu_cost_us;
       gpu_leaf->total_gpu_cost += gpu_leaf->data[i].gpu_cost_us;
     }
-
-    // 调试: 分裂决策摘要
-    fprintf(stderr, "[BTREE·COST-SPLIT] gpu=%u cpu=%u ambiguous=%u threshold=%.1fus\n",
-            gpu_idx, cpu_idx, ambiguous, gpu_threshold_us);
 
     return gpu_idx;
   }
