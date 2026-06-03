@@ -91,19 +91,31 @@ class _FreeBlockPool:
         return bool(self._free) or bool(self._lru_cold) or bool(self._lru_hot)
 
     def acquire(self) -> Optional[int]:
-        """acquire."""
+        """获取空闲块.
+        改写: 冷块驱逐改为扫描前25%找频率最低的(2Q策略),
+        防止刚插入但即将变热的块被误驱逐."""
         if self._free:
-            # 返回: self._free.pop()
             return self._free.pop()
-        # ★ 优先驱逐冷块 (访问 < K 次)
+        # 改写: 扫描冷块前 25% 中频率最低的
         if self._lru_cold:
-            candidate_for_reclaim, _ = self._lru_cold.popitem(last=False)
-            # 返回: candidate_for_reclaim
-            return candidate_for_reclaim
+            scan_count = max(1, len(self._lru_cold) // 4)
+            best_bid = None
+            best_freq = float('inf')
+            for i, (bid, _) in enumerate(self._lru_cold.items()):
+                if i >= scan_count:
+                    break
+                freq = self.blocks[bid].access_count
+                if freq < best_freq:
+                    best_freq = freq
+                    best_bid = bid
+            if best_bid is not None:
+                self._lru_cold.pop(best_bid)
+                _dbg("ACQUIRE", f"evict cold bid={best_bid}, freq={best_freq}")
+                return best_bid
         if self._lru_hot:
-            candidate_for_reclaim, _ = self._lru_hot.popitem(last=False)
-            # 返回: candidate_for_reclaim
-            return candidate_for_reclaim
+            candidate, _ = self._lru_hot.popitem(last=False)
+            _dbg("ACQUIRE", f"evict hot bid={candidate}")
+            return candidate
         return None
 
     def mark_idle(self, block_id: int) -> None:
@@ -246,18 +258,36 @@ class IndexCacheManager:
         return hits, misses
 
     def _admit(self, key: BlockKey) -> Optional[int]:
-        """ admit."""
-        _dbg("_ADMIT", f"_admit(key={key})")
+        """准入新块.
+        改写: 频率感知驱逐——优先驱逐 access_count 最低的 idle 块;
+        当多个块频率相同时，驱逐最久未访问的(LRU);
+        加 ghost 缓存计数——追踪最近被驱逐的 key，若再次命中说明容量不足."""
+        _dbg("_ADMIT", f"admit key={key}")
         bid = self._pool.acquire()
         if bid is None:
             return None
         blk = self._pool.blocks[bid]
+
         if blk.key is not None and blk.key in self._table:
-            del self._table[blk.key]
+            # 改写: 记录被驱逐 key 到 ghost 计数器
+            evicted_key = blk.key
+            if not hasattr(self, '_ghost_hits'):
+                self._ghost_hits = 0
+                self._ghost_set = set()
+            if evicted_key in self._ghost_set:
+                self._ghost_hits += 1
+                _dbg("_ADMIT", f"ghost re-eviction: {evicted_key}, ghost_hits={self._ghost_hits}")
+            self._ghost_set.add(evicted_key)
+            # 限制 ghost set 大小
+            if len(self._ghost_set) > self._pool.num_blocks * 2:
+                self._ghost_set = set(list(self._ghost_set)[-self._pool.num_blocks:])
+
+            del self._table[evicted_key]
             self.stats.evictions += 1
             self.stats.eviction_cost_us += self.EVICTION_PENALTY_US
+
         blk.key = key
-        blk.access_count = 1  # 新块首次访问
+        blk.access_count = 1
         self._table[key] = bid
         return bid
 

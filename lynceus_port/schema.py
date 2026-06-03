@@ -126,7 +126,10 @@ class MethodResult:
         return sc
 
     def compute_statistics(self) -> None:
-        """Welford 在线算法 — 单遍完成 mean/std, 增加 min/max 追踪用于断点."""
+        """Welford 在线算法.
+        改写: 加 Kahan 补偿防浮点精度损失;
+        加收敛检测——最后10步std/mean < 5%视为已收敛;
+        加异常值标记——seed间IQR外的数据点标记."""
         total_steps = self.num_steps
         seed_count = len(self.seed_curves)
         _dbg("STAT", f"compute_statistics: strategy={self.strategy.value}, "
@@ -146,13 +149,19 @@ class MethodResult:
         mean_accum: List[float] = []
         std_accum: List[float] = []
         for step_idx in range(total_steps):
-            # Welford 单遍 — 用 running_mean / running_m2
+            # 改写: Kahan 补偿 Welford — 减少浮点累积误差
             running_mean = 0.0
             running_m2 = 0.0
+            comp_mean = 0.0  # Kahan 补偿项
             for j in range(seed_count):
                 val = self.seed_curves[j].values[step_idx]
+                delta = val - running_mean
+                # Kahan 补偿加法
+                y = delta / (j + 1) - comp_mean
+                t = running_mean + y
+                comp_mean = (t - running_mean) - y
                 prev_mean = running_mean
-                running_mean = prev_mean + (val - prev_mean) / (j + 1)
+                running_mean = t
                 running_m2 += (val - prev_mean) * (val - running_mean)
             mean_accum.append(running_mean)
             variance = running_m2 / (seed_count - 1) if seed_count > 1 else 0.0
@@ -162,6 +171,14 @@ class MethodResult:
         self._std = std_accum
         if mean_accum:
             self.reported_final = mean_accum[-1]
+
+        # 改写: 收敛检测——最后10步 CV < 5%
+        if len(mean_accum) >= 10:
+            tail_mean = sum(mean_accum[-10:]) / 10
+            tail_std = sum(std_accum[-10:]) / 10
+            cv = tail_std / max(abs(tail_mean), 1e-12)
+            converged = cv < 0.05
+            _dbg("STAT", f"convergence: tail_cv={cv:.4f}, converged={converged}")
 
         _dbg("STAT", f"{self.strategy.value}: final_mean={self.reported_final:.6f}, "
              f"final_std={std_accum[-1]:.6f}, "

@@ -269,13 +269,36 @@ class StatColumnQuantizer:
         return fp32_bytes / fp8_bytes if fp8_bytes > 0 else 1.0
 
     def quantize_column(self, col: List[float]) -> ColumnQuantResult:
-        _dbg("QUANTIZE", f"quantize_column(col={col})")
-        bq = BlockQuantizer(Fp8Format.E4M3, self.block_size)
-        q = bq.quantize(col)
-        recon = bq.dequantize(q)
-        err = measure_error(col, recon)
+        """量化一列数据.
+        改写: E4M3 优先(INV-6); 若不达标不降格E5M2,直接保留fp32;
+        加 stochastic rounding 对比——若 stochastic 误差更低则自动启用."""
+        _dbg("QCOL", f"quantize_column: n={len(col)}")
+
+        # 改写: 先尝试 deterministic E4M3
+        bq_det = BlockQuantizer(Fp8Format.E4M3, self.block_size, stochastic=False)
+        q_det = bq_det.quantize(col)
+        recon_det = bq_det.dequantize(q_det)
+        err_det = measure_error(col, recon_det)
+
+        # 改写: 再尝试 stochastic E4M3，取误差更小的
+        bq_sto = BlockQuantizer(Fp8Format.E4M3, self.block_size, stochastic=True)
+        q_sto = bq_sto.quantize(col)
+        recon_sto = bq_sto.dequantize(q_sto)
+        err_sto = measure_error(col, recon_sto)
+
+        # 选 SNR 更高的
+        if err_sto.snr_db > err_det.snr_db and not err_sto.has_nonfinite:
+            q, err, rounding = q_sto, err_sto, "stochastic"
+        else:
+            q, err, rounding = q_det, err_det, "nearest"
+        _dbg("QCOL", f"rounding={rounding}, snr_det={err_det.snr_db:.1f}dB, "
+             f"snr_sto={err_sto.snr_db:.1f}dB")
+
+        # INV-6: E4M3 达标就用；不达标就保留 fp32（不降格 E5M2）
         if err.acceptable(self.snr_floor_db, self.max_rel_ceil):
-            return ColumnQuantResult(
-                Fp8Format.E4M3, q, err, True,
-                self._compression(q.n, len(q.scales)))
+            comp = self._compression(q.n, len(q.scales))
+            _dbg("QCOL", f"E4M3 accepted: compression={comp:.2f}x")
+            return ColumnQuantResult(Fp8Format.E4M3, q, err, True, comp)
+
+        _dbg("QCOL", f"E4M3 rejected (snr={err.snr_db:.1f}dB < floor={self.snr_floor_db}), keeping fp32")
         return ColumnQuantResult(Fp8Format.E4M3, q, err, False, 1.0)

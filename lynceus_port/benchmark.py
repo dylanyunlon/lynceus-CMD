@@ -63,25 +63,42 @@ class WorkloadConfig:
 # 表选择概率按访问频率加权, 选择率从配置的范围内随机采样.
 def generate_query_sequence(config: WorkloadConfig,
                             seed: int) -> List[QueryDescriptor]:
+    """生成查询序列.
+    改写: 加 workload phase shift——每1/3进程改变查询类型分布;
+    加热表漂移——Zipf权重每500步轮转一次."""
     rng = random.Random(seed)
     queries = []
     types_weights = list(config.query_mix.items())
     types = [t for t, _ in types_weights]
-    weights = [w for _, w in types_weights]
+    base_weights = [w for _, w in types_weights]
 
     catalog = dict(config.tables) if config.tables else {
         config.name: config.base_table_rows}
     table_names = list(catalog.keys())
 
-    # ★ 改写: Zipf-like 表选择权重 (热点表更常被查询)
     n_tables = len(table_names)
     zipf_weights = [1.0 / ((i + 1) ** config.table_skew)
                     for i in range(n_tables)]
 
     for step in range(config.num_steps):
+        # 改写: workload phase shift——3阶段不同查询分布
+        phase = step * 3 // max(config.num_steps, 1)
+        if phase == 1 and len(base_weights) > 1:
+            # 中期：加重扫描类查询
+            weights = [w * (1.5 if i == 0 else 0.8) for i, w in enumerate(base_weights)]
+        elif phase == 2 and len(base_weights) > 1:
+            # 后期：加重聚合/排序
+            weights = [w * (0.8 if i == 0 else 1.3) for i, w in enumerate(base_weights)]
+        else:
+            weights = list(base_weights)
+
         qt = rng.choices(types, weights=weights, k=1)[0]
 
-        # ★ Zipf 表选择
+        # 改写: 热表漂移——每500步把Zipf头部轮转一位
+        if step > 0 and step % 500 == 0 and n_tables > 1:
+            zipf_weights = zipf_weights[-1:] + zipf_weights[:-1]
+            _dbg("step", f"step {step}: hot table drift, new head={table_names[zipf_weights.index(max(zipf_weights))]}")
+
         table_name = rng.choices(table_names, weights=zipf_weights, k=1)[0]
         table_rows = catalog[table_name]
 
@@ -106,9 +123,8 @@ def generate_query_sequence(config: WorkloadConfig,
         )
         queries.append(q)
 
-        # ★ 改写: 每 500 步 trace 一次查询分布
         if step % 500 == 0 and step > 0:
-            _dbg("step", f"step {step}: last query → {q.dump_snapshot()}")
+            _dbg("step", f"step {step}: phase={phase}, last query → {q.dump_snapshot()}")
 
     return queries
 

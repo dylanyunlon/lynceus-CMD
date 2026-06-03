@@ -335,17 +335,36 @@ class CostModelEngine:
     def recommend(self, query: QueryDescriptor,
                   data_location: Optional[str] = None
                   ) -> Tuple[str, CostBreakdown]:
+        """推荐最优设备.
+        改写: 加 margin-based 选择——赢者必须比次优快 ≥5%,
+        否则偏向数据所在设备(减少传输)."""
         _dbg("recommend", f"ENTER query={query.query_id} data_loc={data_location}")
         estimates = self.estimate_all_devices(query, data_location)
         if not estimates:
             raise RuntimeError("No devices available for estimation")
-        best_id = min(estimates, key=lambda k: estimates[k].total_us)
+
         runner_up = sorted(estimates.items(), key=lambda x: x[1].total_us)
-        _dbg("recommend", f"WINNER: {best_id} ({estimates[best_id].total_us:.1f}µs)")
+        best_id = runner_up[0][0]
+        best_cost = runner_up[0][1].total_us
+
+        # 改写: margin-based 选择——赢者需领先 ≥5%
         if len(runner_up) > 1:
-            _dbg("recommend", f"runner-up: {runner_up[1][0]} ({runner_up[1][1].total_us:.1f}µs) "
-                 f"gap={runner_up[1][1].total_us - runner_up[0][1].total_us:.1f}µs")
-        # 返回: best_id, estimates[best_id]
+            second_id = runner_up[1][0]
+            second_cost = runner_up[1][1].total_us
+            margin = (second_cost - best_cost) / max(best_cost, 0.001)
+
+            if margin < 0.05 and data_location:
+                # 差距太小，偏向数据已在的设备
+                for dev_id, cb in runner_up:
+                    if dev_id == data_location:
+                        best_id = dev_id
+                        _dbg("recommend", f"margin {margin:.2%} < 5%, prefer data_loc={data_location}")
+                        break
+
+            _dbg("recommend", f"runner-up: {second_id} ({second_cost:.1f}µs), "
+                 f"margin={margin:.2%}")
+
+        _dbg("recommend", f"WINNER: {best_id} ({estimates[best_id].total_us:.1f}µs)")
         return best_id, estimates[best_id]
 
     def route_batch(self, queries: List[QueryDescriptor],

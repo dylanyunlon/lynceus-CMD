@@ -358,39 +358,24 @@ def _dump_schedule(stages, label=""):
         print(f"║ stage[{i}]: {str(s)[:100]}", file=sys.stderr)
     print(f"╚══════════════════════════════════════════════", file=sys.stderr, flush=True)
 
-def _compute_bubble_ratio_standalone(stage_times):
-    """独立版气泡比计算 — 用于脚本级断点测试."""
-    import math
+def _compute_bubble_ratio_standalone(stage_times, num_microbatches=1):
+    """气泡比计算.
+    改写: 加 micro-batch 粒度——Megatron 公式 bubble = (p-1)/(m+p-1),
+    m=1 时退化为 (p-1)/p;
+    加异构修正——max/mean 比值惩罚."""
     if not stage_times or len(stage_times) < 2:
         return 0.0
     p = len(stage_times)
+    m = max(1, num_microbatches)
     t_max = max(stage_times)
     t_mean = sum(stage_times) / p
     heterogeneity = t_max / t_mean if t_mean > 0 else 1.0
-    bubble = ((p - 1) / max(p, 1)) * heterogeneity
-    _dbg("BUBBLE", f"p={p} max={t_max:.2f} mean={t_mean:.2f} bubble={min(bubble,1.0):.4f}")
-    return min(bubble, 1.0)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# 流水线调度辅助工具
-# ═══════════════════════════════════════════════════════════════════════
-
-def _compute_bubble_ratio_standalone(stage_times):
-    """独立版气泡比计算 — 用于脚本级断点测试.
-    
-    公式改写: 考虑异构阶段时间, 使用 max/mean 比值修正.
-    标准公式 (Narayanan 2021): bubble = (p - 1) / m
-    改写版: bubble = standard_bubble × (t_max / t_mean)
-    """
-    if not stage_times or len(stage_times) < 2:
-        return 0.0
-    p = len(stage_times)
-    t_max = max(stage_times)
-    t_mean = sum(stage_times) / p
-    heterogeneity = t_max / t_mean if t_mean > 0 else 1.0
-    bubble = ((p - 1) / max(p, 1)) * heterogeneity
-    _dbg("BUBBLE", f"p={p} max={t_max:.2f} mean={t_mean:.2f} bubble={min(bubble,1.0):.4f}")
+    # 改写: Megatron bubble = (p-1)/(m+p-1) × heterogeneity
+    base_bubble = (p - 1) / (m + p - 1)
+    bubble = base_bubble * heterogeneity
+    _dbg("BUBBLE", f"p={p}, m={m}, max={t_max:.2f}, mean={t_mean:.2f}, "
+         f"base_bubble={base_bubble:.4f}, adjusted={min(bubble, 1.0):.4f}")
     return min(bubble, 1.0)
 
 

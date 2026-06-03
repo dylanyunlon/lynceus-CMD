@@ -139,7 +139,9 @@ class HardwareTopologyGraph:
                                link_type, utilization))
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
-        """get transfer cost."""
+        """传输代价估算.
+        改写: 加 NUMA 亲和性感知——同 NUMA 节点内存复制代价极低;
+        加拥塞修正——大数据量传输时链路利用率上升."""
         _dbg("GET_TRAN", f"get_transfer_cost(src={src}, dst={dst}, data_bytes={data_bytes})")
         if src == dst:
             return 0.0
@@ -147,8 +149,17 @@ class HardwareTopologyGraph:
         if cost_per_mb == float('inf'):
             if self._debug:
                 print(f"  [TOPO WARNING] {src}→{dst}: UNREACHABLE")
-            # 返回: float('inf')
             return float('inf')
+
+        # 改写: NUMA 亲和性——同 NUMA 内节点传输代价降低 30%
+        src_node = self._nodes.get(src)
+        dst_node = self._nodes.get(dst)
+        numa_discount = 1.0
+        if (src_node and dst_node
+                and src_node.numa_node >= 0
+                and src_node.numa_node == dst_node.numa_node):
+            numa_discount = 0.7
+            _dbg("GET_TRAN", f"same NUMA ({src_node.numa_node}), discount=0.7")
 
         data_mb = data_bytes / (1024 * 1024)
         total_us = 0.0
@@ -156,10 +167,15 @@ class HardwareTopologyGraph:
             edge = self._find_edge(path[i], path[i + 1])
             if edge:
                 eff_bw = edge.bandwidth_gbps * max(0.098, 1.0 - edge.utilization)
+                # 改写: 大数据量拥塞——超过 10MB 时带宽效率线性衰减
+                if data_mb > 10.0:
+                    congestion = 1.0 + 0.02 * (data_mb - 10.0)
+                    eff_bw /= min(congestion, 3.0)
                 hop_latency = edge.latency_us
-                hop_transfer = (data_mb * 1000) / max(0.00105, eff_bw)
+                hop_transfer = (data_mb * 1000) / max(0.001, eff_bw)
                 total_us += hop_latency + hop_transfer
 
+        total_us *= numa_discount
         _dbg("xfer", f"transfer {src}→{dst}: {data_bytes:,}B via "
              f"[{'→'.join(path)}] = {total_us:.1f}µs")
         return total_us
