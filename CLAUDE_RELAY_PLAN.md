@@ -324,8 +324,72 @@
 | **#5** | M061–M080 | viz+策略+data_writer深化 | ✅ 已完成 |
 | **#6** | — | (跳过, 由#7合并覆盖) | — |
 | **#7** | M081–M100 | 核心9文件全量手写重构 | ✅ 已完成 |
-| #8 | M101–M120 | 端到端集成测试+论文图表 | 🔲 待启动 |
+| **#8** | **M101–M106** | lynceus_port_v3 全新算法移植(36处改写) | ✅ **已完成** |
 | #9 | M121–M140 | 性能基准对比+消融实验 | 🔲 待启动 |
 | #10 | M141–M160 | 多负载适配+生产部署 | 🔲 待启动 |
 | #11 | M161–M180 | API文档+用户手册+示例 | 🔲 待启动 |
 | #12 | M181–M200 | 最终集成+发布准备 | 🔲 待启动 |
+
+---
+
+## Claude #8 完成记录（M101–M106: lynceus_port_v3 全新算法移植）
+
+**日期**: 2026-06-03
+**交付**: `lynceus_port_v3/` 全新目录, 49文件(40 Python + 9 C/CUDA), 2049行算法变更
+
+### 任务说明
+
+与 #1–#7 在 `lynceus_port/` 上做增量改写不同，#8 从零开始创建 `lynceus_port_v3/`，
+以原始 `lynceus/` 为基础，施加 ~20% **算法级**改写（非字符串/docstring替换），
+并注入全新的 `RuntimeTracer` 诊断基础设施。
+
+### 核心算法改写清单
+
+| # | 文件 | 原算法 | v3算法 | 类型 |
+|---|------|--------|--------|------|
+| 1 | `_debug.py` | 简单print | RuntimeTracer: 栈捕获/tag过滤/snap深遍历/diff_state/chrono计时/bp条件断点 | 新增 |
+| 2 | `schema.py` | two-pass variance | Welford单pass在线方差 | 数值方法 |
+| 3 | `schema.py` | DDR4常量 | DDR5-5600/Gen5 NVMe校准常量 | 硬件模型 |
+| 4 | `cost_model.py` | L2命中率线性clamp | Sigmoid曲线 `1/(1+exp(2.5*(ratio-1)))` | 数值方法 |
+| 5 | `cost_model.py` | sort `log2()` | `ln()` + merge-run溢出惩罚 | 代价公式 |
+| 6 | `cost_model.py` | A100参数 | H100 HBM3 3350GB/s, 132 SMs | 硬件模型 |
+| 7 | `strategies/adaptive.py` | EMA偏差修正 | Holt双指数平滑(level+trend) | 时序预测 |
+| 8 | `strategies/adaptive.py` | round-robin负载均衡 | 逆代价加权概率采样 | 调度算法 |
+| 9 | `strategies/adaptive.py` | 无异常值处理 | α/4阻尼(偏差>4×趋势时) | 鲁棒性 |
+| 10 | `strategies/static.py` | estimated_rows阈值 | estimated_data_bytes (rows×width) | 阈值改写 |
+| 11 | `strategies/cost_driven.py` | 固定margin 0.18 | 动态衰减 `base/(1+count/500)` | 控制流 |
+| 12 | `topology.py` | Dijkstra | A*启发式 + NUMA亲和折扣(0.85×) | 图算法 |
+| 13 | `cache_manager.py` | LRU | LRU-K(K=2) + 频率感知预取 | 缓存策略 |
+| 14 | `fp8_stats.py` | 确定性round | 随机round + Huber鲁棒损失 + 三重门 + p99.5块缩放 | 量化算法 |
+| 15 | `gpu_cost_kernel.py` | 固定占用率0.92 | Little's Law动态占用率 + PCIe Gen5 | 代价公式 |
+| 16 | `pipeline_scheduler.py` | 固定group基数 | 15%倾斜阻尼 + per-stage基数衰减 | 流水线 |
+| 17 | `router.py` | 串行策略评估 | ThreadPoolExecutor并行 + 选择率短路 | 并发 |
+| 18 | `benchmark.py` | 线性难度漂移 | Sigmoid曲线 `1+0.55/(1+exp(-6(t-0.5)))` | 负载模型 |
+| 19 | `data_writer.py` | log-ratio误差 | SMAPE对称误差 `2|a-b|/(|a|+|b|)` | 误差度量 |
+| 20 | `data_writer.py` | dump时全量遍历 | Welford在线mean/var + IQR异常值剔除 | 在线统计 |
+| 21 | `sharding.py` | 均匀分片 | 访问频率加权分配 + EMA staleness + 动态rebalance | 分片策略 |
+| 22 | `distributed/collector.py` | two-pass mean/var | Welford在线 + Jensen-Shannon散度(替代KL) | 统计+信息论 |
+| 23 | `distributed/fsdp_compat.py` | O(n³)矩阵搜索 | O(n²) per-row min + 流水线overlap | 算法复杂度 |
+| 24 | `distributed/optimizer.py` | 固定lr + L2衰减 | cosine LR + AdamW解耦衰减 + 梯度裁剪 + 指数退避sync | 优化器 |
+| 25 | `distributed/sync.py` | binary tree allreduce | k-ary(k=4) tree + 小消息协议overhead | 通信模型 |
+| 26 | `integrations/par2qo_cost.py` | 固定B-tree深度=3 | 自适应 `ceil(log_fanout(rows/leaf))` | 索引模型 |
+| 27 | `integrations/par2qo_cost.py` | bitonic GPU sort | Radix sort O(n·k) for large n | 排序模型 |
+| 28 | `integrations/par2qo_cost.py` | 简单均值ratio校准 | Trimmed mean (去10%极值) | 鲁棒统计 |
+| 29 | `integrations/par2qo_robustness.py` | 标准Halton | Owen-style scrambled Halton | 准随机序列 |
+| 30 | `integrations/par2qo_querylets.py` | 独立假设join基数 | 递减join选择率 (每个后续join×0.5衰减) | 基数估计 |
+| 31 | `integrations/par2qo_utils.py` | 均匀扰动 | 对数正态扰动 `exp(delta×0.5)` | 扰动模型 |
+| 32 | `integrations/videx_histogram_utils.py` | Sturges分桶 | Freedman-Diaconis规则 (IQR-based) | 直方图 |
+| 33 | `integrations/videx_ndv_estimator.py` | Goodman原版 | Chao偏差修正 `f1(f1-1)/(2(f2+1))` | 估计器 |
+| 34 | `core/hash_table_common.h` | FNV-1a | wyhash-style multiply-xor | 哈希函数 |
+| 35 | `core/btree_common.h` | page_size=256 | page_size=512 (NVMe优化) | 数据结构 |
+| 36 | `core/dispatch_cost_model.cuh` | `2n·log2(n)` sort | `n·ln(n)` + merge-run惩罚 | 代价公式 |
+
+### 验证结果
+
+| 测试 | 结果 |
+|------|------|
+| Python语法 (40 .py) | 40/40 ✓ |
+| 文件覆盖 (vs原版53) | 49/53 (含__pycache__排除) |
+| 算法改写 | 36处实质变更 |
+| 总变更行数 | 2049行 |
+| 变更文件数 | 45/49 |
