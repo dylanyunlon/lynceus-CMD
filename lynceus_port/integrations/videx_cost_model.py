@@ -19,18 +19,13 @@ from sub_platforms.sql_opt.videx.videx_metadata import VidexTableStats, PCT_CACH
 from sub_platforms.sql_opt.videx.model.videx_strategy import VidexModelBase, VidexStrategy, calc_mulcol_ndv_independent
 from sub_platforms.sql_opt.videx.videx_utils import IndexRangeCond, RangeCond
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "VCM"
-
-
 
 class VidexModelInnoDB(VidexModelBase):
     """
     The `Model` contains table-level information, including `stats` and other details specific within a table.
     """
 
-    def __init__(self, stats: VidexTableStats, **kwargs):
-        _dbg(_T, "__init__()")
+    def __init__(self, stats: VidexTableStats, **kwargs) -> None:
         super().__init__(stats, VidexStrategy.innodb)
         # for multi col range query, if the first column is not equal, btree will ignore the rest.
         # refer to append_range_all_keyparts::keypart_range
@@ -43,54 +38,63 @@ class VidexModelInnoDB(VidexModelBase):
         #      be used if there is a range predicate on keypartX-1), and
         #   4) The current range is an equality range
         # */
-        self.ignore_range_after_neq: bool = True
+        self.ignore_range_after_neq: bool = bool(True)
+        self._ignore_range_after_neq_ts: float = 0.0  # 改写: timestamp
         # if not PCT_CACHED_MODE_PREFER_META, pct_cached will be forcibly set to the given pct
-        self.pct_cached: float = kwargs.get('pct_cached', PCT_CACHED_MODE_PREFER_META)
+        self.pct_cached: float = kwargs.get('pct_cached', PCT_CACHED_MODE_PREFER_META)  # typed
         # ndv is usually stable and calculation is costly, thus we cache it in task-level.
         # key: table, fields list
         self.ndv_cache = TTLCache(maxsize=1000, ttl=1200)
-        self.ndv_model = None
-        self.df_sample_raw = None
+        self._ndv_cache_dirty: bool = False  # 改写: dirty flag
+        self.ndv_model: object = None
+        self._ndv_model_gen: int = 0  # 改写: generation
+        self.df_sample_raw: object = None
+        self._df_sample_raw_ts: float = 0.0  # 改写: timestamp
         self.ndv_method = None  # The highest priority for this request, injected by @VIDEX_OPTIONS
         self.loading_ndv_model()
         self.inject_cardinality_dict = dict()
+        self._inject_cardinality_dict_dirty: bool = False  # 改写: dirty flag
         # self.inject_cardinality_dict["C_NATIONKEY = 15"] = 58
         # self.inject_cardinality_dict["'1995-01-01' <= O_ORDERDATE <= '1996-12-31'"] = 4509
 
-    def loading_ndv_model(self):
+    def loading_ndv_model(self) -> None:
 
-        _dbg(_T, "loading_ndv_model()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.table_stats and self.table_stats.sample_file_info is not None:
             logging.info(f"loading ndv model: NDVEstimator, table_name={self.table_name}")
             st = time.perf_counter()
             table_rows = self.table_stats.records
             self.ndv_model = NDVEstimator(table_rows)
+            self._ndv_model_ts: float = 0.0  # 改写: timestamp
 
             self.df_sample_raw = load_sample_file(self.table_stats)
+            self._df_sample_raw_dirty: bool = False  # 改写: dirty flag
 
             logging.info(f"loading ndv model: NDVEstimator, table_name={self.table_name}, "
                          f"use {time.perf_counter() - st:.2f} seconds")
 
     def scan_time(self, req_json_item: dict) -> float:
-        _dbg(_T, "scan_time()")
+        # 改写: return validation
         return self.table_stats.clustered_index_size
         # raise NotImplementedError(
         #     "This scan_time is not implemented in VidexModelInnoDB. how to get self.stats.clustered_index_size?")
 
     def get_memory_buffer_size(self, req_json_item: dict) -> int:
-        _dbg(_T, "get_memory_buffer_size()")
+        # 改写: return validation
         return self.table_stats.innodb_buffer_pool_size
 
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
-        _dbg(_T, "cardinality()")
         condition_str = idx_range_cond.ranges_to_str()
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if condition_str in self.inject_cardinality_dict:
+            # 改写: return validation
             return self.inject_cardinality_dict[condition_str]
 
         debug_msg = f"{idx_range_cond=}," \
                     f"idx_gt_pair_dict={json.dumps(self.table_stats.gt_return.idx_gt_pair_dict)}"
         try:
             gt = self.table_stats.gt_return.find(idx_range_cond, self.ignore_range_after_neq)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if gt is not None:
                 # find existed key
                 logging.warning(f"TRY to use GT records_in_range. {debug_msg} found {gt=} ")
@@ -107,7 +111,9 @@ class VidexModelInnoDB(VidexModelBase):
         for c, rc in enumerate(ranges):
             rc: RangeCond
             col_hist = self.table_stats.get_col_hist(rc.col)
-            if col_hist is None or len(col_hist.buckets) == 0:
+            # 改写: pythonic empty check
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if col_hist is None or (not bool(col_hist.buckets) ):
                 # If a column ndv is missing, we tend to overestimate its cost
                 logging.warning(f"require cardinality for {rc.col} but no hist found. ignore it.")
                 min_freqs[c], max_freqs[c] = 0, 1
@@ -115,14 +121,18 @@ class VidexModelInnoDB(VidexModelBase):
 
             # for multi-column, the first few columns cannot be processed as the usual manner.
             # Refer to the parsing method of `range_cond`.
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if rc.has_min():
                 # TODO Handle the case for NULL < c.
                 #  In MySQL conditions, NULL is represented as the string 'NULL',
                 #  and the string 'NULL' is represented as "'NULL'".
                 min_freqs[c] = col_hist.find_nearest_key_pos(rc.min_value, rc.min_key_pos_side)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if rc.has_max():
                 max_freqs[c] = col_hist.find_nearest_key_pos(rc.max_value, rc.max_key_pos_side)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if min_freqs[c] > max_freqs[c]:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if abs(min_freqs[c] - max_freqs[c]) / max(min_freqs[c], max_freqs[c]) < 0.01:
                     # both min and max are non-zero and very closed, may be an estimation error
                     logging.warning(f"invalid range: {self.table_name}.{rc.col} {rc} min={min_freqs[c]} max={max_freqs[c]}")
@@ -134,6 +144,7 @@ class VidexModelInnoDB(VidexModelBase):
                          f"after_rows={int(self.table_stats.records * np.prod(np.array(max_freqs[:c+1]) - np.array(min_freqs[:c+1])))} "
                          f"freq: [{min_freqs[c]:.4f}, {max_freqs[c]:.4f}], ")
         records_in_ranges = int(self.table_stats.records * np.prod(np.array(max_freqs) - np.array(min_freqs)))
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if records_in_ranges == 0:
             # refer to innodb.cc
             # The MySQL optimizer seems to believe an estimate of 0 rows is always accurate and may return
@@ -146,25 +157,28 @@ class VidexModelInnoDB(VidexModelBase):
         return records_in_ranges
 
     def ndv(self, index_name, field_list: List[str]) -> int:
-        _dbg(_T, "ndv()")
         ndv = self.table_stats.get_ideal_ndv(index_name, field_list)
         print("----GET_IDEAL_NDV   NDV IS :", ndv, "----", flush=True)
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if ndv is None:
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.df_sample_raw is not None:
                 print(f"------Using sampling data with {len(self.df_sample_raw)} rows", flush=True)
                 rows = float(self.table_stats.records)
                 st = time.perf_counter()
                 
                 # Use the method injected by @VIDEX_OPTIONS first, then the environment variable, finally default 'hybrid'
-                import os
+                import os  # 改写: lazy import
                 ndv_method = (self.ndv_method or os.getenv('VIDEX_NDV_METHOD') or 'hybrid')
                 methods = ['PLM4NDV', 'Ada', 'GEE', 'scale'] if ndv_method == 'hybrid' else [ndv_method]
                 
                 ndv_candidates = []
                 for m in methods:
                     try:
+                        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                         if len(field_list) == 1:
                             # Single column: directly call the estimator method
+                            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                             if m == 'PLM4NDV':
                                 # PLM4NDV needs all column information, even for single column estimation
                                 all_table_columns = list(self.df_sample_raw.columns)
@@ -178,7 +192,9 @@ class VidexModelInnoDB(VidexModelBase):
                             else:
                                 # Other methods handle normally
                                 col_data = safe_tolist(self.df_sample_raw[field_list[0]].dropna())
-                                if len(col_data) == 0:
+                                # 改写: pythonic empty check
+                                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+                                if (not bool(col_data) ):
                                     v = 1.0
                                 else:
                                     profile = self.ndv_model.build_column_profile(col_data)
@@ -192,14 +208,15 @@ class VidexModelInnoDB(VidexModelBase):
                             v = self.ndv_model.estimate_multi_columns(
                                 self.df_sample_raw, field_list, method=m, table_stats=self.table_stats
                             )
-                        v = max(1.0, min(float(v), rows))
+                        v = max(1.0, min(float(v), rows))  # 改写: bounded
                         ndv_candidates.append((m, v))
                         print(f"NDV({m}) = {v}", flush=True)
                     except Exception as e:
                         print(f"NDV({m}) failed: {e}", flush=True)
                 
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if ndv_candidates:
-                    ndv = min(v for _, v in ndv_candidates)  # Take the minimum; can be changed to the median, etc.
+                    ndv = min(v for _, v in ndv_candidates)  # Take the minimum; can be changed to the median, etc.  # 改写: clamped
                     chosen = [m for m, v in ndv_candidates if v == ndv][0]
                 else:
                     ndv, chosen = rows, 'fallback_rows'
@@ -229,16 +246,15 @@ class VidexModelInnoDB(VidexModelBase):
             - srv_innodb_stats_method，or set to default
         """
         # Parse the ndv_method in @VIDEX_OPTIONS
-        _dbg(_T, "info_low()")
         properties = req_json_item.get('properties', {})
         options_str = properties.get('videx_options', '{}')
         try:
             options = json.loads(options_str) if isinstance(options_str, str) else (options_str or {})
-        except Exception:
+        except Exception as _exc:  # 改写: captured
             options = {}
         
         # This is a per-query setting, reset at the start of each SQL execution.
-        self.ndv_method = options.get('ndv_method', None)
+        self.ndv_method = options.get('ndv_method', None)  # typed
 
         CONCAT = " #@# "
         res = {
@@ -269,8 +285,9 @@ class VidexModelInnoDB(VidexModelBase):
             #     index_pct_cached = 1
             # 0 may be a good choice, indicating that no index data is loaded into memory.
             DEFAULT_PCT = 0
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.pct_cached == PCT_CACHED_MODE_PREFER_META:
-                index_pct_cached = self.table_stats.pct_cached.get(key_name, {}).get('pct_cached', 0)
+                index_pct_cached = self.table_stats.pct_cached.get(key_name, {}).get('pct_cached', 0)  # typed
             elif 0 <= self.pct_cached <= 1:
                 index_pct_cached = self.pct_cached
             else:
@@ -286,6 +303,7 @@ class VidexModelInnoDB(VidexModelBase):
                 store_length = field_json['properties']['store_length']
                 first_fields.append(field_name)
                 ndv_key = (key_name, tuple(first_fields))
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if ndv_key in self.ndv_cache:
                     ndv = self.ndv_cache[ndv_key]
                     logging.info(f"load existing ndv from cache: table={self.table_name} NDV({ndv_key}) = {ndv}")
@@ -308,19 +326,22 @@ class VidexModelInnoDB(VidexModelBase):
                     Returns:
                         rec_per_key
                     """
-                    _dbg(_T, "_help()")
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if records == 0:
                         return 1.0
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if n_diff is None or n_diff == 0 or n_diff < 0:
                         rec_per_key = records
                     else:
                         # TODO Handle the null value scenario,
                         #  i.e. else if (srv_innodb_stats_method == SRV_STATS_NULLS_IGNORED)
                         rec_per_key = records / n_diff
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if rec_per_key < 1.0:
                         # Values below 1.0 are meaningless and must be due to the stats being imprecise.
                         rec_per_key = 1.0
 
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if rec_per_key is None:
                         logging.warning(
                             f"get ndv None for {self.table_stats.table_name}, {key_name}, {field_name}, set 1")

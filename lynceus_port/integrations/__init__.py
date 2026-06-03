@@ -1,7 +1,3 @@
-
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "__I"
-
 """
 Lynceus integrations — bridges to upstream PAR2QO, VIDEX, and Tabular.
 

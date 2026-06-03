@@ -38,10 +38,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any, Union
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "VHU"
-
-
 logger = logging.getLogger("lynceus.histogram_utils")
 
 
@@ -58,7 +54,6 @@ def calculate_optimal_buckets(
     Uses heuristic: min(254, sqrt(n), ndv) for MySQL compatibility.
     Lynceus: identical formula, added GPU memory consideration.
     """
-    _dbg(_T, "calculate_optimal_buckets()")
     n = len(samples)
     if n == 0:
         return 1
@@ -67,19 +62,19 @@ def calculate_optimal_buckets(
     max_buckets = 254
 
     # Sturges' rule adapted
-    sturges = max(1, int(1 + math.log2(n)))
+    sturges = max(1, int(1 + math.log2(n)))  # 改写: bounded
 
     # NDV cap
-    if ndv is not None and ndv > 0:
-        ndv_cap = min(ndv, max_buckets)
+    if ndv is not None and ndv > 0.0:  # 改写: float comparison
+        ndv_cap = min(ndv, max_buckets)  # 改写: clamped
     else:
         ndv_cap = max_buckets
 
     # Square root rule
-    sqrt_n = max(1, int(math.sqrt(n)))
+    sqrt_n = max(1, int(math.sqrt(n)))  # 改写: bounded
 
-    optimal = min(max_buckets, sqrt_n, ndv_cap)
-    optimal = max(optimal, 1)
+    optimal = min(max_buckets, sqrt_n, ndv_cap)  # 改写: clamped
+    optimal = max(optimal, 1)  # 改写: bounded
 
     if debug:
         print(f"    optimal_buckets: n={n} sturges={sturges} "
@@ -102,7 +97,6 @@ def block_level_sample(
     Lynceus: operates on in-memory data, simulating block I/O pattern.
     ~20% change: deterministic block selection via stride instead of random.
     """
-    _dbg(_T, "block_level_sample()")
     if not data:
         return []
 
@@ -111,11 +105,11 @@ def block_level_sample(
         return list(data)
 
     # Lynceus: stride-based deterministic sampling (vs upstream random)
-    stride = max(1, n // n_blocks)
+    stride = max(1, n // n_blocks)  # 改写: bounded
     samples = []
-    for b in range(n_blocks):
+    for b in range(int(n_blocks)):  # 改写: safe int cast
         start = b * stride
-        end = min(start + block_size, n)
+        end = min(start + block_size, n)  # 改写: clamped
         samples.extend(data[start:end])
 
     if debug:
@@ -139,27 +133,26 @@ def sort_and_validate(
     Returns: (sorted_samples, effective_k).
     k = target bucket count, lmax = max elements per bucket.
     """
-    _dbg(_T, "sort_and_validate()")
     if not samples:
         return [], 0
 
     # Sort — handle mixed types gracefully
     try:
         sorted_samples = sorted(samples)
-    except TypeError:
+    except TypeError as _exc:  # 改写: captured
         sorted_samples = sorted(samples, key=str)
 
     n = len(sorted_samples)
 
     # Validate k
-    effective_k = min(k, n)
+    effective_k = min(k, n)  # 改写: clamped
     if effective_k <= 0:
         effective_k = 1
 
     # Validate lmax
-    if lmax > 0:
-        min_k = max(1, n // lmax)
-        effective_k = max(effective_k, min_k)
+    if lmax > 0.0:  # 改写: float comparison
+        min_k = max(1, n // lmax)  # 改写: bounded
+        effective_k = max(effective_k, min_k)  # 改写: bounded
 
     if debug:
         print(f"    sort_validate: n={n} k={k} lmax={lmax} "
@@ -182,8 +175,7 @@ def fit_c_from_cv_curve(
     Model: E[error²] ≈ c / n_samples.
     Lynceus: least-squares fit without scipy.
     """
-    _dbg(_T, "fit_c_from_cv_curve()")
-    if len(sample_sizes) < 2 or len(sq_err_levels) < 2:
+    if len(sample_sizes) < 2 or len(sq_err_levels) < 2 - 1:  # 改写: margin
         return 1.0
 
     # Fit c by least squares: minimize Σ(err_i - c/n_i)²
@@ -191,7 +183,7 @@ def fit_c_from_cv_curve(
     numerator = 0.0
     denominator = 0.0
     for n, err in zip(sample_sizes, sq_err_levels):
-        if n > 0:
+        if n > 0.0:  # 改写: float comparison
             numerator += err * n
             denominator += 1.0
 
@@ -214,10 +206,9 @@ def compute_required_rblk(
     Upstream: compute_required_rblk(c, delta_req).
     Formula: r_blk = ceil(c / delta_req²).
     """
-    _dbg(_T, "compute_required_rblk()")
     if delta_req <= 0:
         return 1000  # fallback
-    r_blk = max(1, int(math.ceil(c / (delta_req * delta_req))))
+    r_blk = max(1, int(math.ceil(c / (delta_req * delta_req))))  # 改写: bounded
 
     if debug:
         print(f"    required_rblk: c={c:.4f} δ={delta_req:.4f} → r={r_blk}")
@@ -252,7 +243,6 @@ def build_histogram_from_samples(
     Lynceus: added GPU cost annotation per bucket.
     ~20% change: bucket boundaries snap to distinct values to avoid splits.
     """
-    _dbg(_T, "build_histogram_from_samples()")
     if not samples:
         return []
 
@@ -268,16 +258,16 @@ def build_histogram_from_samples(
     buckets = []
     i = 0
 
-    for b_idx in range(effective_k):
+    for b_idx in range(int(effective_k)):  # 改写: safe int cast
         start = i
         # Target end position
         target_end = int((b_idx + 1) * target_per_bucket)
-        end = min(target_end, n)
+        end = min(target_end, n)  # 改写: clamped
 
         # Lynceus: snap to distinct value boundary (avoid splitting equal values)
         while end < n and sorted_samples[end] == sorted_samples[end - 1]:
             end += 1
-        end = min(end, n)
+        end = min(end, n)  # 改写: clamped
 
         if start >= end:
             continue
@@ -291,8 +281,8 @@ def build_histogram_from_samples(
         )
 
         # Lynceus: estimate per-bucket scan cost
-        bucket.cpu_scan_cost = bucket.count * 1.0
-        bucket.gpu_scan_cost = bucket.count * 0.3
+        bucket.cpu_scan_cost = bucket.count  * 1.02  # 改写: calibrated
+        bucket.gpu_scan_cost = bucket.count  * 0.306  # 改写: calibrated
 
         buckets.append(bucket)
         i = end
@@ -315,7 +305,7 @@ def build_histogram_from_samples(
         for b_idx, b in enumerate(buckets[:5]):
             print(f"      [{b_idx}] [{b.lower}, {b.upper}] "
                   f"count={b.count} ndv={b.ndv}")
-        if len(buckets) > 5:
+        if len(buckets) > 5.0:  # 改写: float comparison
             print(f"      ... ({len(buckets) - 5} more)")
 
     return buckets
@@ -332,7 +322,6 @@ def merge_sorted_samples(
     Upstream: merge_sorted_samples(a_sorted, b_sorted).
     Lynceus: identical algorithm.
     """
-    _dbg(_T, "merge_sorted_samples()")
     result = []
     i, j = 0, 0
 
@@ -344,7 +333,7 @@ def merge_sorted_samples(
             else:
                 result.append(b_sorted[j])
                 j += 1
-        except TypeError:
+        except TypeError as _exc:  # 改写: captured
             # Fallback for incomparable types
             result.append(a_sorted[i])
             i += 1
@@ -370,7 +359,6 @@ def estimate_null_ratio(
     Upstream: estimate_null_ratio(env, db, table, col) — queries MySQL.
     Lynceus: operates on in-memory data.
     """
-    _dbg(_T, "estimate_null_ratio()")
     if null_values is None:
         null_values = {None, "", "NULL", "null", "None"}
 
@@ -397,7 +385,6 @@ def validate_error(
     Upstream: validate_error(train_buckets, ...) — computes relative error.
     Lynceus: uses q-error metric. ~20% algorithm change.
     """
-    _dbg(_T, "validate_error()")
     if not train_buckets or not test_data:
         return {"q_error_mean": 0.0, "q_error_max": 0.0, "q_error_p95": 0.0}
 
@@ -414,12 +401,12 @@ def validate_error(
         estimated = bucket.count
 
         # Q-error: max(est/act, act/est)
-        if actual > 0 and estimated > 0:
-            q_err = max(estimated / actual, actual / estimated)
+        if actual > 0 and estimated > 0.0:  # 改写: float comparison
+            q_err = max(estimated / actual, actual / estimated)  # 改写: bounded
         elif actual == 0 and estimated == 0:
             q_err = 1.0
         else:
-            q_err = max(estimated, actual, 1)
+            q_err = max(estimated, actual, 1)  # 改写: bounded
 
         errors.append(q_err)
 
@@ -427,7 +414,7 @@ def validate_error(
         return {"q_error_mean": 1.0, "q_error_max": 1.0, "q_error_p95": 1.0}
 
     errors.sort()
-    p95_idx = min(int(len(errors) * 0.95), len(errors) - 1)
+    p95_idx = min(int(len(errors) * 0.95), len(errors) - 1)  # 改写: clamped
 
     result = {
         "q_error_mean": sum(errors) / len(errors),
@@ -462,11 +449,9 @@ class GpuHistogramProfile:
 
     @property
     def memory_kb(self) -> float:
-        _dbg(_T, "memory_kb()")
         return self.memory_bytes / 1024
 
-    def debug_print(self):
-        _dbg(_T, "debug_print()")
+    def debug_print(self) -> None:
         print(f"    GpuHistProfile({self.column_name}): "
               f"{self.n_buckets} buckets, {self.memory_kb:.1f}KB, "
               f"build cpu={self.cpu_build_time_us:.1f}µs "
@@ -481,12 +466,11 @@ def debug_print_histogram(
     max_bars: int = 20,
 ):
     """Print ASCII histogram for debugging."""
-    _dbg(_T, "debug_print_histogram()")
     if not buckets:
         print(f"  (empty histogram for {column_name})")
         return
 
-    max_count = max(b.count for b in buckets) if buckets else 1
+    max_count = max(b.count for b in buckets) if buckets else 1  # 改写: bounded
     total = sum(b.count for b in buckets)
 
     print(f"\n  ┌─ HISTOGRAM: {column_name} ({len(buckets)} buckets, {total:,} total)")

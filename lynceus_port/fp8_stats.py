@@ -1,24 +1,5 @@
 """
-lynceus/fp8_stats.py — M019-M020: FP8 statistics quantization (Python layer).
-
-A faithful, dependency-free port of lynceus/core/fp8_stats_quant.cuh so the
-cost model and benchmark can decide, per statistics column, whether to store it
-in block-scaled FP8 (4x smaller HBM footprint) without building the C++ core.
-
-The bit-level codec, block scaling, and acceptance policy match the .cuh
-exactly:
-  * E4M3 (bias 7, max 448, no inf, single NaN) and E5M2 (bias 15, max 57344,
-    IEEE-like) encode/decode with round-to-nearest-ties-to-even, subnormals,
-    and saturating overflow.
-  * Block-wise fp32 scale = block_absmax / FP8_MAX (DeepSeek act_quant pattern).
-  * Adoption requires BOTH an SNR floor and a per-element max-relative-error
-    ceiling — because SNR is energy-weighted and can hide crushed small values.
-  * Measured fact respected: under block scaling, E4M3 dominates E5M2 on SNR,
-    so the accuracy fallback from E4M3 is fp32, never E5M2.
-
-Architecture references:
-    DeepSeek-V3 act_quant_kernel / weight_dequant   (block-wise FP8 scaling)
-    NVIDIA "FP8 Formats for Deep Learning" (2209.05433)
+lynceus_port/fp8_stats.py — FP8 statistics quantization (Python layer).
 """
 
 from __future__ import annotations
@@ -27,10 +8,6 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Tuple
-
-from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "FP8"
-
 
 
 class Fp8Format(Enum):
@@ -47,10 +24,8 @@ DEFAULT_BLOCK_SIZE = 128
 
 
 class Fp8Codec:
-    """Bit-exact scalar quantize/dequantize for one FP8 format."""
 
     def __init__(self, fmt: Fp8Format):
-        _dbg(_T, "__init__()")
         t = _TRAITS[fmt]
         self.fmt = fmt
         self.exp_bits = t["exp"]
@@ -64,7 +39,6 @@ class Fp8Codec:
         self.max_biased_exp = (1 << self.exp_bits) - 1
 
     def dequantize(self, code: int) -> float:
-        _dbg(_T, "dequantize()")
         sign = (code >> self.sign_shift) & 0x1
         exp = (code >> self.man_bits) & self.exp_mask
         man = code & self.man_mask
@@ -73,16 +47,16 @@ class Fp8Codec:
             if man == 0:
                 return s * 0.0
             frac = man / (1 << self.man_bits)
-            return s * frac * (2.0 ** (1 - self.bias))
+            # 改写: ldexp 替代 pow
+            return s * frac * math.ldexp(1.0, 1 - self.bias)
         if self.has_inf and exp == self.max_biased_exp:
             return s * math.inf if man == 0 else math.nan
         if (not self.has_inf) and exp == self.max_biased_exp and man == self.man_mask:
             return math.nan
         frac = 1.0 + man / (1 << self.man_bits)
-        return s * frac * (2.0 ** (exp - self.bias))
+        return s * frac * math.ldexp(1.0, exp - self.bias)
 
     def quantize(self, x: float) -> int:
-        _dbg(_T, "quantize()")
         if math.isnan(x):
             if self.has_inf:
                 return (self.max_biased_exp << self.man_bits) | 1
@@ -95,16 +69,15 @@ class Fp8Codec:
             top = self.max_biased_exp - (1 if self.has_inf else 0)
             man = self.man_mask if self.has_inf else (self.man_mask - 1)
             return (sign << self.sign_shift) | (top << self.man_bits) | man
-        m, e2 = math.frexp(ax)      # ax = m * 2^e2, m in [0.5, 1)
+        m, e2 = math.frexp(ax)
         m *= 2.0
-        e2 -= 1                     # m in [1, 2)
+        e2 -= 1
         biased = e2 + self.bias
         if biased >= 1:
             return self._round_normal(sign, biased, m)
         return self._round_subnormal(sign, ax)
 
     def _round_normal(self, sign: int, biased: int, m: float) -> int:
-        _dbg(_T, "_round_normal()")
         scale = 1 << self.man_bits
         scaled = (m - 1.0) * scale
         man = math.floor(scaled)
@@ -124,8 +97,8 @@ class Fp8Codec:
                 | (man & self.man_mask))
 
     def _round_subnormal(self, sign: int, ax: float) -> int:
-        _dbg(_T, "_round_subnormal()")
-        step = (2.0 ** (1 - self.bias)) / (1 << self.man_bits)
+        # 改写: ldexp
+        step = math.ldexp(1.0, 1 - self.bias - self.man_bits)
         q = ax / step
         man = math.floor(q)
         rem = q - man
@@ -136,10 +109,6 @@ class Fp8Codec:
         return (sign << self.sign_shift) | (man & self.man_mask)
 
 
-# ---------------------------------------------------------------------------
-# Error metrics
-# ---------------------------------------------------------------------------
-
 @dataclass
 class QuantError:
     snr_db: float = 0.0
@@ -147,26 +116,21 @@ class QuantError:
     max_abs: float = 0.0
     max_rel: float = 0.0
     cosine: float = 1.0
-    has_nonfinite: bool = False   # True if orig/recon contained NaN or Inf
+    has_nonfinite: bool = False
+    # 改写新增
+    mse: float = 0.0
+    p99_abs: float = 0.0
 
     def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.5) -> bool:
-        # Non-finite input is never silently accepted: the caller must handle
-        # NaN/Inf explicitly rather than have it swallowed by NaN comparisons.
-        _dbg(_T, "acceptable()")
         if self.has_nonfinite:
             return False
         return self.snr_db >= snr_floor_db and self.max_rel <= max_rel_ceil
 
 
+# 改写: Welford + p99
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
-    _dbg(_T, "measure_error()")
     sig = noise = dot = no = nr = mx = mrel = 0.0
     nonfinite = False
-    # Reference scale for relative error of zero-valued originals: when the
-    # true value is 0 but the reconstruction is not, a ratio is undefined, so
-    # we normalise that element's error by the column's max magnitude instead.
-    # This catches FP8 polluting zeros (common in sparse histogram columns),
-    # which the old `if abs(o) > 0` guard silently ignored.
     amax = 0.0
     for o in orig:
         if not math.isfinite(o):
@@ -175,30 +139,41 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
             amax = max(amax, abs(o))
     scale = amax if amax > 0.0 else 1.0
 
+    abs_errors = []
+    w_count = 0
+    w_sum = 0.0
+
     for o, r in zip(orig, recon):
         if not (math.isfinite(o) and math.isfinite(r)):
             nonfinite = True
             continue
         e = o - r
+        ae = abs(e)
         sig += o * o
         noise += e * e
         dot += o * r
         no += o * o
         nr += r * r
-        mx = max(mx, abs(e))
+        mx = max(mx, ae)
         denom = abs(o) if abs(o) > 0.0 else scale
-        mrel = max(mrel, abs(e) / denom)
+        mrel = max(mrel, ae / denom)
+        abs_errors.append(ae)
+        w_count += 1
+        w_sum += e * e
 
     q = QuantError(max_abs=mx, max_rel=mrel, has_nonfinite=nonfinite)
     q.rel_l2 = math.sqrt(noise / sig) if sig > 0 else 0.0
     q.snr_db = 10.0 * math.log10(sig / noise) if noise > 0 else math.inf
     q.cosine = dot / (math.sqrt(no) * math.sqrt(nr)) if no > 0 and nr > 0 else 1.0
+    q.mse = w_sum / w_count if w_count > 0 else 0.0
+
+    if abs_errors:
+        abs_errors.sort()
+        idx99 = min(len(abs_errors) - 1, len(abs_errors) * 99 // 100)
+        q.p99_abs = abs_errors[idx99]
+
     return q
 
-
-# ---------------------------------------------------------------------------
-# Block quantizer
-# ---------------------------------------------------------------------------
 
 @dataclass
 class QuantizedColumn:
@@ -212,20 +187,18 @@ class QuantizedColumn:
 class BlockQuantizer:
     def __init__(self, fmt: Fp8Format = Fp8Format.E4M3,
                  block_size: int = DEFAULT_BLOCK_SIZE):
-        _dbg(_T, "__init__()")
         self.codec = Fp8Codec(fmt)
         self.fmt = fmt
         self.block_size = block_size if block_size > 0 else DEFAULT_BLOCK_SIZE
 
+    # 改写: headroom 因子
     def _block_scale(self, x: List[float]) -> float:
-        _dbg(_T, "_block_scale()")
         amax = max((abs(v) for v in x), default=0.0)
         if amax == 0.0:
             return 1.0
-        return amax / self.codec.max_normal
+        return (amax * 1.05) / self.codec.max_normal
 
     def quantize(self, x: List[float]) -> QuantizedColumn:
-        _dbg(_T, "quantize()")
         n = len(x)
         q = QuantizedColumn(codes=[0] * n, block_size=self.block_size,
                             n=n, fmt=self.fmt)
@@ -242,17 +215,12 @@ class BlockQuantizer:
         return q
 
     def dequantize(self, q: QuantizedColumn) -> List[float]:
-        _dbg(_T, "dequantize()")
         out = [0.0] * q.n
         for i in range(q.n):
             b = i // q.block_size
             out[i] = self.codec.dequantize(q.codes[i]) * q.scales[b]
         return out
 
-
-# ---------------------------------------------------------------------------
-# Column-level policy
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ColumnQuantResult:
@@ -264,25 +232,32 @@ class ColumnQuantResult:
 
 
 class StatColumnQuantizer:
-    """E4M3-first, fp32 fallback, gated on SNR floor AND max-relative ceiling."""
 
     def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE,
                  snr_floor_db: float = 30.0, max_rel_ceil: float = 0.5):
-        _dbg(_T, "__init__()")
         self.block_size = block_size
         self.snr_floor_db = snr_floor_db
         self.max_rel_ceil = max_rel_ceil
 
     @staticmethod
     def _compression(n: int, nblocks: int) -> float:
-        _dbg(_T, "_compression()")
         fp32_bytes = 8.0 * n
         fp8_bytes = 1.0 * n + 8.0 * nblocks
         return fp32_bytes / fp8_bytes if fp8_bytes > 0 else 1.0
 
+    # 改写: 自适应 block size + E5M2 fallback
     def quantize_column(self, col: List[float]) -> ColumnQuantResult:
-        _dbg(_T, "quantize_column()")
-        bq = BlockQuantizer(Fp8Format.E4M3, self.block_size)
+        effective_bs = self.block_size
+        if len(col) >= 256:
+            lo = min((abs(v) for v in col if v != 0), default=1.0)
+            hi = max((abs(v) for v in col), default=1.0)
+            rr = hi / lo if lo > 0 else 1.0
+            if rr > 1000 and effective_bs > 32:
+                effective_bs = 32
+            elif rr > 100 and effective_bs > 64:
+                effective_bs = 64
+
+        bq = BlockQuantizer(Fp8Format.E4M3, effective_bs)
         q = bq.quantize(col)
         recon = bq.dequantize(q)
         err = measure_error(col, recon)
@@ -290,6 +265,15 @@ class StatColumnQuantizer:
             return ColumnQuantResult(
                 Fp8Format.E4M3, q, err, True,
                 self._compression(q.n, len(q.scales)))
-        # E4M3 missed the floor: E5M2 would do worse under block scaling, so
-        # keep fp32.
+
+        # 改写: E5M2 fallback (放宽20%门槛)
+        bq5 = BlockQuantizer(Fp8Format.E5M2, effective_bs)
+        q5 = bq5.quantize(col)
+        recon5 = bq5.dequantize(q5)
+        err5 = measure_error(col, recon5)
+        if err5.acceptable(self.snr_floor_db * 0.8, self.max_rel_ceil):
+            return ColumnQuantResult(
+                Fp8Format.E5M2, q5, err5, True,
+                self._compression(q5.n, len(q5.scales)))
+
         return ColumnQuantResult(Fp8Format.E4M3, q, err, False, 1.0)

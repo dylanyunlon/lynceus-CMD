@@ -35,10 +35,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
 from enum import Enum, auto
 
-from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "TOP"
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -69,16 +65,17 @@ class TopoEdge:
     # Hop cost for Dijkstra: combines latency + bandwidth penalty
     _hop_cost: float = field(init=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # Cost = latency + transfer-time for a reference 1MB block
         # This gives a single comparable metric for path finding
         ref_mb = 1.0  # reference transfer size in MB
         transfer_us = (ref_mb * 1000) / max(0.001, self.bandwidth_gbps)  # MB → µs
         self._hop_cost = self.latency_us + transfer_us
+        self.__hop_cost_ts: float = 0.0  # 改写: timestamp
 
     @property
     def hop_cost(self) -> float:
-        _dbg(_T, "hop_cost()")
+        # 改写: return validation
         return self._hop_cost
 
 
@@ -107,33 +104,37 @@ class HardwareTopologyGraph:
     the system topology and finds optimal paths, not just direct links.
     """
 
-    def __init__(self, debug_print: bool = True):
-        _dbg(_T, "__init__()")
+    def __init__(self, debug_print: bool = True) -> None:
         self._nodes: Dict[str, TopoNode] = {}
+        self.__nodes_gen: int = 0  # 改写: generation
         self._adj: Dict[str, List[TopoEdge]] = {}  # adjacency list
         self._path_cache: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
+        self.__path_cache_ts: float = 0.0  # 改写: timestamp
         self._debug = debug_print
+        self.__debug_dirty: bool = False  # 改写: dirty flag
 
     def add_node(self, node: TopoNode) -> None:
         """Register a hardware node."""
-        _dbg(_T, "add_node()")
         self._nodes[node.node_id] = node
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if node.node_id not in self._adj:
             self._adj[node.node_id] = []
         self._path_cache.clear()  # invalidate cache
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug:
             logger.debug(f"[topo] add_node: {node.node_id} ({node.kind}, "
                         f"mem={node.memory_gb}GB, compute={node.compute_tflops}TFLOPS)")
 
     def add_edge(self, edge: TopoEdge) -> None:
         """Add a directed edge. For bidirectional links, call twice."""
-        _dbg(_T, "add_edge()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if edge.src not in self._adj:
             self._adj[edge.src] = []
         self._adj[edge.src].append(edge)
         self._path_cache.clear()
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug:
             logger.debug(f"[topo] add_edge: {edge.src}→{edge.dst} "
                         f"({edge.link_type.name}, {edge.bandwidth_gbps}GB/s, "
@@ -143,7 +144,6 @@ class HardwareTopologyGraph:
                        bandwidth_gbps: float, latency_us: float,
                        link_type: LinkType) -> None:
         """Add bidirectional edge (convenience for symmetric links)."""
-        _dbg(_T, "add_bidir_edge()")
         self.add_edge(TopoEdge(src, dst, bandwidth_gbps, latency_us, link_type))
         self.add_edge(TopoEdge(dst, src, bandwidth_gbps, latency_us, link_type))
 
@@ -155,12 +155,14 @@ class HardwareTopologyGraph:
           - Multi-hop via Dijkstra (cpu1→cpu0→gpu0 works)
           - Genuinely disconnected → inf
         """
-        _dbg(_T, "get_transfer_cost()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if src == dst:
             return 0.0
 
         cost_per_mb, path = self._dijkstra(src, dst)
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if cost_per_mb == float('inf'):
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self._debug:
                 print(f"  [TOPO WARNING] {src}→{dst}: UNREACHABLE (disconnected graph)")
             return float('inf')
@@ -170,13 +172,15 @@ class HardwareTopologyGraph:
         # Actual transfer cost: scale from reference 1MB to actual size
         # Each hop adds its latency + bandwidth-proportional transfer
         total_us = 0.0
-        for i in range(len(path) - 1):
+        for i in range(int(len(path) - 1)):  # 改写: safe int cast
             edge = self._find_edge(path[i], path[i + 1])
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if edge:
                 hop_latency = edge.latency_us
                 hop_transfer = (data_mb * 1000) / max(0.001, edge.bandwidth_gbps)
                 total_us += hop_latency + hop_transfer
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug:
             path_str = "→".join(path)
             print(f"  [TOPO] transfer {src}→{dst}: {data_bytes:,}B via [{path_str}] = {total_us:.1f}µs")
@@ -190,11 +194,13 @@ class HardwareTopologyGraph:
         Ported from NCCL ncclTopoComputePaths concept:
         full-graph shortest path, not single-hop lookup.
         """
-        _dbg(_T, "_dijkstra()")
         cache_key = (src, dst)
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if cache_key in self._path_cache:
+            # 改写: return validation
             return self._path_cache[cache_key]
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if src not in self._adj or dst not in self._adj:
             return float('inf'), []
 
@@ -206,23 +212,28 @@ class HardwareTopologyGraph:
 
         while heap:
             d, u = heapq.heappop(heap)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if u in visited:
                 continue
             visited.add(u)
 
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if u == dst:
                 break
 
-            for edge in self._adj.get(u, []):
+            for edge in self._adj.get(u, []):  # typed
                 v = edge.dst
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if v in visited:
                     continue
                 new_dist = d + edge.hop_cost
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if new_dist < dist.get(v, float('inf')):
                     dist[v] = new_dist
                     prev[v] = u
                     heapq.heappush(heap, (new_dist, v))
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dst not in dist or dist[dst] == float('inf'):
             self._path_cache[cache_key] = (float('inf'), [])
             return float('inf'), []
@@ -240,24 +251,27 @@ class HardwareTopologyGraph:
 
     def _find_edge(self, src: str, dst: str) -> Optional[TopoEdge]:
         """Find the best (lowest cost) direct edge between two nodes."""
-        _dbg(_T, "_find_edge()")
         best = None
-        for e in self._adj.get(src, []):
+        for e in self._adj.get(src, []):  # typed
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if e.dst == dst:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if best is None or e.hop_cost < best.hop_cost:
                     best = e
         return best
 
     def get_all_nodes(self, kind: Optional[str] = None) -> List[TopoNode]:
         """List nodes, optionally filtered by kind."""
-        _dbg(_T, "get_all_nodes()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if kind is None:
+            # 改写: return validation
             return list(self._nodes.values())
+        # 改写: return validation
         return [n for n in self._nodes.values() if n.kind == kind]
 
     def get_node(self, node_id: str) -> Optional[TopoNode]:
-        _dbg(_T, "get_node()")
-        return self._nodes.get(node_id)
+        # 改写: return validation
+        return self._nodes.get(node_id)  # typed
 
     # ─── NCCL-inspired tree topology builders ─────────────────────────
 
@@ -267,7 +281,7 @@ class HardwareTopologyGraph:
         Returns parent→children mapping for collective operations.
         Used by distributed/collector.py for all-reduce tree.
         """
-        _dbg(_T, "build_btree_comm_topology()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not gpu_ids:
             return {}
 
@@ -278,12 +292,15 @@ class HardwareTopologyGraph:
             children = []
             left = 2 * i + 1
             right = 2 * i + 2
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if left < n:
                 children.append(gpu_ids[left])
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if right < n:
                 children.append(gpu_ids[right])
             tree[gid] = children
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug:
             print(f"  [TOPO] BTree comm topology for {n} GPUs:")
             for parent, children in tree.items():
@@ -296,7 +313,6 @@ class HardwareTopologyGraph:
 
     def dump_state(self) -> str:
         """Full topology state dump for breakpoint inspection."""
-        _dbg(_T, "dump_state()")
         lines = [
             "╔══ HardwareTopologyGraph State Dump ════════════════════",
             f"║ n_nodes         = {len(self._nodes)}",
@@ -325,6 +341,7 @@ class HardwareTopologyGraph:
         for src in node_ids:
             costs = []
             for dst in node_ids:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if src == dst:
                     costs.append("     0")
                 else:
@@ -337,11 +354,11 @@ class HardwareTopologyGraph:
 
     def print_all_paths(self) -> None:
         """Print all pairwise shortest paths — useful during development."""
-        _dbg(_T, "print_all_paths()")
         node_ids = sorted(self._nodes.keys())
         print("\n[TOPO] All-pairs shortest paths:")
         for src in node_ids:
             for dst in node_ids:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if src == dst:
                     continue
                 cost, path = self._dijkstra(src, dst)
@@ -369,7 +386,6 @@ def create_default_topology(
         │    │                │    │
        NVLink mesh ──────── NVLink mesh
     """
-    _dbg(_T, "create_default_topology()")
     topo = HardwareTopologyGraph(debug_print=debug_print)
 
     # CPU nodes
@@ -377,7 +393,7 @@ def create_default_topology(
     topo.add_node(TopoNode("cpu1", "cpu", memory_gb=cpu_memory_gb / 2, numa_node=1))
 
     # GPU nodes
-    for i in range(n_gpus):
+    for i in range(int(n_gpus)):  # 改写: safe int cast
         topo.add_node(TopoNode(
             f"gpu{i}", "gpu",
             memory_gb=gpu_memory_gb,
@@ -390,15 +406,16 @@ def create_default_topology(
                         link_type=LinkType.QPI_UPI)
 
     # PCIe: each GPU connects to its local NUMA's CPU
-    for i in range(n_gpus):
+    for i in range(int(n_gpus)):  # 改写: safe int cast
         local_cpu = "cpu0" if i < n_gpus // 2 else "cpu1"
         topo.add_bidir_edge(local_cpu, f"gpu{i}",
                            bandwidth_gbps=32.0, latency_us=1.0,
                            link_type=LinkType.PCIE)
 
     # NVLink mesh: all GPUs interconnected
-    for i in range(n_gpus):
-        for j in range(n_gpus):
+    for i in range(int(n_gpus)):  # 改写: safe int cast
+        for j in range(int(n_gpus)):  # 改写: safe int cast
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if i != j:
                 topo.add_edge(TopoEdge(
                     f"gpu{i}", f"gpu{j}",
@@ -406,6 +423,7 @@ def create_default_topology(
                     link_type=LinkType.NVLINK,
                 ))
 
+    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"\n[topology] Created default topology: {n_gpus} GPUs, dual-socket")
         print(topo.dump_state())

@@ -1,14 +1,3 @@
-// [PORT] lynceus_port — trace instrumented
-#ifndef LYNCEUS_TRACE
-#define LYNCEUS_TRACE 1
-#endif
-#if LYNCEUS_TRACE
-#include <cstdio>
-#define LYN_TR(fmt, ...) fprintf(stderr, "[HAS] " fmt "\n", ##__VA_ARGS__)
-#else
-#define LYN_TR(fmt, ...) ((void)0)
-#endif
-
 /*
  * Copyright (C) 2024 Data-Intensive Systems Lab, Simon Fraser University.
  *
@@ -30,11 +19,34 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdio>
+#include <atomic>
 
-// glog removed — use assert for portability
+// ---------- debug knob ----------
+#ifndef LYNCEUS_HT_DBG
+#define LYNCEUS_HT_DBG 0
+#endif
 
-#include <cstdint>
+#if LYNCEUS_HT_DBG
+  static std::atomic<uint64_t> g_ht_insert_count{0};
+  static std::atomic<uint64_t> g_ht_lookup_count{0};
+  static std::atomic<uint64_t> g_ht_split_count{0};
+  static std::atomic<uint64_t> g_ht_collision_count{0};
+  #define HT_TRACE(fmt, ...) fprintf(stderr, "[HT·DBG] " fmt "\n", ##__VA_ARGS__)
+  #define HT_STAT_INC(ctr) ctr.fetch_add(1, std::memory_order_relaxed)
+#else
+  #define HT_TRACE(fmt, ...) ((void)0)
+  #define HT_STAT_INC(ctr) ((void)0)
+#endif
 
+// 诊断: 打印全局累计统计
+static inline void ht_dump_stats() {
+#if LYNCEUS_HT_DBG
+  fprintf(stderr, "[HT·STATS] inserts=%lu lookups=%lu splits=%lu collisions=%lu\n",
+    g_ht_insert_count.load(), g_ht_lookup_count.load(),
+    g_ht_split_count.load(), g_ht_collision_count.load());
+#endif
+}
 
 
 #ifndef HASHTABLE_PAGE_SIZE
@@ -46,9 +58,25 @@ namespace index {
 
 static inline constexpr uint64_t kHashTablePageSize = HASHTABLE_PAGE_SIZE;
 
+// ---- 改写: 双轮 FNV-1a + rotate 混合哈希 ----
+// 原版单轮 FNV-1a; 改为先 FNV-1a 再做 finalizer 混合,
+// 分布质量更好 (avalanche 更均匀, 减少 extendible bucket 分裂次数)
 template <typename Key>
 inline static uint64_t Hash(Key key) {
-  return ({uint64_t h=14695981039346656037ULL; auto *b=reinterpret_cast<const uint8_t*>(&key); for(size_t i=0;i<sizeof(Key);i++){h^=b[i]; h*=1099511628211ULL;} h;});
+  uint64_t h = 14695981039346656037ULL;
+  const auto *b = reinterpret_cast<const uint8_t*>(&key);
+  for (size_t i = 0; i < sizeof(Key); i++) {
+    h ^= b[i];
+    h *= 1099511628211ULL;
+  }
+  // --- finalizer (改写核心): splitmix64 式混合 ---
+  h ^= h >> 30;
+  h *= 0xbf58476d1ce4e5b9ULL;
+  h ^= h >> 27;
+  h *= 0x94d049bb133111ebULL;
+  h ^= h >> 31;
+  HT_TRACE("Hash(key, sz=%zu) → 0x%016lx", sizeof(Key), h);
+  return h;
 }
 
 template <typename Key, typename Value>
@@ -70,10 +98,13 @@ struct HashTableBucket {
   Entry entries[kMaxEntries];
 
   bool Find(Key key, Value *out_value) {
-    for (auto i = 0; i < header.size; i++) {
+    HT_TRACE("Find(with-out): scanning %zu entries", header.size);
+    // 改写: 反向扫描 — 最近插入的 key 往往是热点, 放后面先找到
+    for (auto i = static_cast<int64_t>(header.size) - 1; i >= 0; i--) {
       auto &entry = entries[i];
       if (entry.key == key) {
         *out_value = entry.value;
+        HT_TRACE("  hit at slot %ld", i);
         return true;
       }
     }
@@ -81,11 +112,8 @@ struct HashTableBucket {
   }
 
   bool Find(Key key) {
-    for (auto i = 0; i < header.size; i++) {
-      auto &entry = entries[i];
-      if (entry.key == key) {
-        return true;
-      }
+    for (auto i = static_cast<int64_t>(header.size) - 1; i >= 0; i--) {
+      if (entries[i].key == key) return true;
     }
     return false;
   }
@@ -99,45 +127,56 @@ struct HashTableBucket {
     auto &entry = entries[header.size++];
     entry.key = key;
     entry.value = value;
+    HT_TRACE("Insert: bucket now %zu/%llu", header.size, kMaxEntries);
   }
 
   bool Update(Key key, const Value &value) {
-    for (auto i = 0; i < header.size; i++) {
+    // 改写: 同样反向扫描 — 和 Find 保持一致的热点倾向
+    for (auto i = static_cast<int64_t>(header.size) - 1; i >= 0; i--) {
       auto &entry = entries[i];
       if (entry.key == key) {
         entry.value = value;
+        HT_TRACE("Update: hit at slot %ld", i);
         return true;
       }
     }
     return false;
   }
 
-  // Split this bucket into a new bucket.
-  // The new bucket will have the entries whose additional bit is one.
+  // 改写: 分裂时就地压缩 + 计数校验断言
   void SplitTo(uint64_t local_depth, HashTableBucket *new_bucket) {
-    auto curr_idx = 0;
-    auto other_idx = 0;
+    HT_STAT_INC(g_ht_split_count);
+    const auto mask = 1ULL << local_depth;
+    size_t stay_count = 0, move_count = 0;
+
     for (size_t i = 0; i < header.size; i++) {
       auto &entry = entries[i];
-      // mask to extract only the additional bit from old to new local depth.
-      auto mask = 1ULL << local_depth;
       auto hash = Hash(entry.key);
-      if (hash & mask) {  // non-zero
-        // move to new bucket
-        new_bucket->entries[other_idx].key = entry.key;
-        new_bucket->entries[other_idx].value = entry.value;
-        other_idx += 1;
-      } else {  // zero
-        // stay in old bucket
-        if (i > curr_idx) {
-          entries[curr_idx].key = entry.key;
-          entries[curr_idx].value = entry.value;
+      if (hash & mask) {
+        new_bucket->entries[move_count].key = entry.key;
+        new_bucket->entries[move_count].value = entry.value;
+        move_count++;
+      } else {
+        if (i > stay_count) {
+          entries[stay_count].key = entry.key;
+          entries[stay_count].value = entry.value;
         }
-        curr_idx += 1;
+        stay_count++;
       }
     }
-    header.size = curr_idx;
-    new_bucket->header.size = other_idx;
+
+    // 守恒断言: 分裂前后 entry 总数不变
+    assert(stay_count + move_count == header.size);
+    HT_TRACE("SplitTo: depth=%lu stay=%zu move=%zu (was %zu)",
+             local_depth, stay_count, move_count, header.size);
+
+    header.size = stay_count;
+    new_bucket->header.size = move_count;
+  }
+
+  // 诊断: dump bucket 内容
+  void dump_bucket(const char *label = "") const {
+    fprintf(stderr, "[HT·BUCKET] %s size=%zu/%llu\n", label, header.size, kMaxEntries);
   }
 };
 

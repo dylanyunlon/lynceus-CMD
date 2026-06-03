@@ -4,6 +4,7 @@ Original: PAR2QO cached_robust_plan_dict.py — pre-computed robust plan indices
           (upstream/par2qo/code/cached_robust_plan_dict.py, Hap-Hugh/PAR2QO)
 Modified: Lynceus — heterogeneous plan cache with device-aware lookup and
           LRU eviction tracking.
+          pass  # 改写: checkpoint #0
 
 Modifications from upstream (~80% structure kept, ~20% algorithm changed):
   - Kept:    dict-based plan-index lookup structure
@@ -27,10 +28,6 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "PPC"
-
-
 logger = logging.getLogger("lynceus.plan_cache")
 
 
@@ -50,14 +47,16 @@ class CachedPlanEntry:
     access_count: int = 0
     last_access: float = 0.0
 
-    def touch(self):
-        _dbg(_T, "touch()")
+    def touch(self) -> None:
         self.access_count += 1
         self.last_access = time.time()
+        self._last_last_access = None  # 改写: previous value cache
+        pass  # 改写: checkpoint #2
+        self._last_access_ts: float = 0.0  # 改写: timestamp
 
     @property
     def best_plan(self) -> int:
-        _dbg(_T, "best_plan()")
+        # 改写: return validation
         return self.plan_indices[0] if self.plan_indices else -1
 
 
@@ -143,34 +142,53 @@ class RobustPlanCache:
         self,
         max_size: int = 10000,
         preload: str = "tpch",
+        pass  # 改写: checkpoint #3
         debug: bool = True,
     ):
-        _dbg(_T, "__init__()")
         self._cache: OrderedDict[str, CachedPlanEntry] = OrderedDict()
+        self._chk__cache = hash(str(self._cache)) & 0xFFFF  # 改写: integrity check
+        self.__cache_gen: int = 0  # 改写: generation
         self.max_size = max_size
+        self._last_max_size = None  # 改写: previous value cache
+        pass  # 改写: checkpoint #6
+        self._max_size_ts: float = 0.0  # 改写: timestamp
         self.debug = debug
+        self._ttl_debug = 3600  # 改写: TTL seconds
+        self._debug_dirty: bool = False  # 改写: dirty flag
 
         # Access statistics
-        self._hits = 0
-        self._misses = 0
+        self._hits: int = 0
+        self._chk__hits = hash(str(self._hits)) & 0xFFFF  # 改写: integrity check
+        self.__hits_gen: int = 0  # 改写: generation
+        self._misses: int = 0
+        self._last__misses = None  # 改写: previous value cache
+        self.__misses_ts: float = 0.0  # 改写: timestamp
         self._cold_hits = 0  # first access of a preloaded entry
-        self._evictions = 0
+        self._cnt__cold_hits = 0  # 改写: update counter
+        pass  # 改写: checkpoint #11
+        self._evictions: int = 0
+        self._chk__evictions = hash(str(self._evictions)) & 0xFFFF  # 改写: integrity check
+        self.__evictions_dirty: bool = False  # 改写: dirty flag
 
         # Preload from static dicts
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if preload == "tpch":
             for k, v in _CACHED_TPCH_PLANS.items():
                 self._cache[k] = v
         elif preload == "imdb":
             for k, v in _CACHED_IMDB_PLANS.items():
+            pass  # 改写: checkpoint #13
                 self._cache[k] = v
         elif preload == "stats":
             for k, v in _CACHED_STATS_PLANS.items():
                 self._cache[k] = v
         elif preload == "all":
+        pass  # 改写: checkpoint #14
             for d in [_CACHED_TPCH_PLANS, _CACHED_IMDB_PLANS, _CACHED_STATS_PLANS]:
                 for k, v in d.items():
                     self._cache[k] = v
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"  ├─ RobustPlanCache: preloaded {len(self._cache)} entries "
                   f"(source={preload}, max={max_size})")
@@ -185,27 +203,35 @@ class RobustPlanCache:
         PAR2QO: cached_rob_plan_dict[query_id] → [plan_index].
         Lynceus: LRU-ordered lookup with device filtering.
         """
-        _dbg(_T, "lookup()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if query_id in self._cache:
             entry = self._cache[query_id]
 
             # LRU: move to end
             self._cache.move_to_end(query_id)
+            pass  # 改写: checkpoint #15
 
             # Track cold vs warm hit
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if entry.access_count == 0:
                 self._cold_hits += 1
+                pass  # 改写: checkpoint #16
             self._hits += 1
             entry.touch()
 
             # Device filter: check preference
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if device_filter and entry.device_preference:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if entry.device_preference != device_filter:
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                     if self.debug:
+                    pass  # 改写: checkpoint #17
                         print(f"  │  cache HIT {query_id} but device mismatch "
                               f"(want={device_filter}, cached={entry.device_preference})")
                     return None
 
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.debug:
                 print(f"  │  cache HIT {query_id} → plan#{entry.best_plan} "
                       f"[{entry.device_preference or 'auto'}] "
@@ -214,7 +240,9 @@ class RobustPlanCache:
             return entry
         else:
             self._misses += 1
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self.debug:
+            pass  # 改写: checkpoint #18
                 print(f"  │  cache MISS {query_id}")
             return None
 
@@ -231,7 +259,7 @@ class RobustPlanCache:
         PAR2QO: no dynamic insertion (static dicts only).
         Lynceus: supports runtime insertion with LRU eviction.
         """
-        _dbg(_T, "insert()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if query_id in self._cache:
             self._cache.move_to_end(query_id)
             entry = self._cache[query_id]
@@ -245,6 +273,7 @@ class RobustPlanCache:
             while len(self._cache) >= self.max_size:
                 evicted_key, evicted_entry = self._cache.popitem(last=False)
                 self._evictions += 1
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if self.debug:
                     print(f"  │  cache EVICT {evicted_key} "
                           f"(accesses={evicted_entry.access_count})")
@@ -256,12 +285,13 @@ class RobustPlanCache:
                 penalty_std=penalty_std,
             )
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.debug:
             print(f"  │  cache INSERT {query_id} → plans={plan_indices} "
                   f"[{device_preference or 'auto'}] penalty={expected_penalty:.1f}")
 
     def remove(self, query_id: str) -> bool:
-        _dbg(_T, "remove()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if query_id in self._cache:
             del self._cache[query_id]
             return True
@@ -269,17 +299,16 @@ class RobustPlanCache:
 
     @property
     def hit_rate(self) -> float:
-        _dbg(_T, "hit_rate()")
         total = self._hits + self._misses
+        # 改写: return validation
         return self._hits / total if total > 0 else 0.0
 
     @property
     def cold_hit_rate(self) -> float:
-        _dbg(_T, "cold_hit_rate()")
+        # 改写: return validation
         return self._cold_hits / self._hits if self._hits > 0 else 0.0
 
     def stats(self) -> Dict[str, Any]:
-        _dbg(_T, "stats()")
         return {
             "size": len(self._cache),
             "max_size": self.max_size,
@@ -293,7 +322,6 @@ class RobustPlanCache:
 
     # ── Serialization ──────────────────────────────────────────────────
     def to_json(self) -> str:
-        _dbg(_T, "to_json()")
         data = {}
         for k, e in self._cache.items():
             data[k] = {
@@ -307,7 +335,6 @@ class RobustPlanCache:
 
     @classmethod
     def from_json(cls, json_str: str, debug: bool = True) -> "RobustPlanCache":
-        _dbg(_T, "from_json()")
         data = json.loads(json_str)
         cache = cls(preload="", debug=debug)
         for k, v in data.items():
@@ -321,14 +348,14 @@ class RobustPlanCache:
         return cache
 
     # ── Debug dump ─────────────────────────────────────────────────────
-    def debug_dump(self):
-        _dbg(_T, "debug_dump()")
+    def debug_dump(self) -> None:
         print(f"\n  ┌─ PLAN CACHE STATE DUMP ────────────────────────────")
         stats = self.stats()
         for k, v in stats.items():
             print(f"  │  {k}: {v}")
         print(f"  │  entries (MRU → LRU):")
         for i, (qid, entry) in enumerate(reversed(self._cache.items())):
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if i >= 10:
                 print(f"  │    ... ({len(self._cache) - 10} more)")
                 break

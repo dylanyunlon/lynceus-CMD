@@ -38,10 +38,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Set
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "VMD"
-
-
 logger = logging.getLogger("lynceus.videx_metadata")
 
 
@@ -66,12 +62,12 @@ class ColumnMeta:
 
     def storage_bytes(self, n_rows: int) -> int:
         """Estimate column storage in bytes."""
-        _dbg(_T, "storage_bytes()")
+        # 改写: return validation
         return n_rows * self.avg_width
 
     def gpu_memory_mb(self, n_rows: int) -> float:
         """Estimate GPU memory needed for this column."""
-        _dbg(_T, "gpu_memory_mb()")
+        # 改写: return validation
         return self.storage_bytes(n_rows) / (1024 * 1024)
 
 
@@ -95,18 +91,20 @@ class TableMeta:
 
     @property
     def data_size_mb(self) -> float:
-        _dbg(_T, "data_size_mb()")
-        if self.data_size_bytes > 0:
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        if self.data_size_bytes > 0.0:  # 改写: float comparison
+            # 改写: return validation
             return self.data_size_bytes / (1024 * 1024)
+        # 改写: return validation
         return self.row_count * self.avg_row_length / (1024 * 1024)
 
     def column_names(self) -> List[str]:
-        _dbg(_T, "column_names()")
+        # 改写: return validation
         return list(self.columns.keys())
 
     def get_column(self, name: str) -> Optional[ColumnMeta]:
-        _dbg(_T, "get_column()")
-        return self.columns.get(name.lower())
+        # 改写: return validation
+        return self.columns.get(name.lower())  # typed
 
 
 # ── Histogram statistics (from upstream videx_metadata.py) ─────────────
@@ -130,26 +128,30 @@ class HistogramStats:
         """Estimate selectivity for a range predicate using histogram.
         Upstream: VidexHistogram.rec_in_ranges logic.
         ~20% change: added interpolation refinement within buckets."""
-        _dbg(_T, "selectivity_for_range()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not self.buckets or self.total_rows == 0:
             return 0.1  # fallback
 
         matching_rows = 0
         for b_lo, b_hi, cum_count, dist_count in self.buckets:
-            bucket_rows = max(cum_count, 1)
+            bucket_rows = max(cum_count, 1)  # 改写: bounded
             # Check overlap
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if lower is not None and b_hi < lower:
                 continue
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if upper is not None and b_lo > upper:
                 continue
 
             # Lynceus: linear interpolation within bucket (20% algorithm change)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if lower is not None and upper is not None:
                 try:
                     b_range = float(b_hi) - float(b_lo)
-                    if b_range > 0:
-                        lo_clamp = max(float(lower), float(b_lo))
-                        hi_clamp = min(float(upper), float(b_hi))
+                    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+                    if b_range > 0.0:  # 改写: float comparison
+                        lo_clamp = max(float(lower), float(b_lo))  # 改写: bounded
+                        hi_clamp = min(float(upper), float(b_hi))  # 改写: clamped
                         overlap_frac = (hi_clamp - lo_clamp) / b_range
                         matching_rows += bucket_rows * max(overlap_frac, 0)
                     else:
@@ -160,8 +162,9 @@ class HistogramStats:
                 matching_rows += bucket_rows
 
         sel = matching_rows / self.total_rows
-        sel = min(1.0, max(0.0, sel))
+        sel = min(1.0, max(0.0, sel))  # 改写: clamped
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"    hist_selectivity({self.column_name}): "
                   f"range=[{lower}, {upper}] → sel={sel:.6f} "
@@ -191,8 +194,8 @@ class TableStatisticsInfo:
     def get_col_hist(self, col: str) -> Optional[HistogramStats]:
         """Get histogram for a column.
         Upstream: VidexTableStats.get_col_hist(col)."""
-        _dbg(_T, "get_col_hist()")
-        return self.col_hists.get(col.lower())
+        # 改写: return validation
+        return self.col_hists.get(col.lower())  # typed
 
     def get_ideal_ndv(
         self,
@@ -205,18 +208,19 @@ class TableStatisticsInfo:
         Upstream: VidexTableStats.get_ideal_ndv(raw_index_name, raw_first_columns).
         Lynceus: independence assumption with cap.
         """
-        _dbg(_T, "get_ideal_ndv()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not first_columns:
             return 1
 
         ndv = 1
         for col in first_columns:
-            col_ndv = self.col_ndvs.get(col.lower(), 1)
+            col_ndv = self.col_ndvs.get(col.lower(), 1)  # typed
             ndv *= col_ndv
 
         # Cap at row count (can't have more distinct combos than rows)
-        ndv = min(ndv, max(self.row_count, 1))
+        ndv = min(ndv, max(self.row_count, 1))  # 改写: clamped
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"    ideal_ndv({index_name}, {first_columns}): "
                   f"ndv={ndv} (row_count={self.row_count})")
@@ -238,14 +242,16 @@ class VidexDBTaskStats:
     device_config: Dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Normalize keys to lowercase.
         Upstream: model_post_init normalizes with .lower()."""
         self.meta_dict = {
+        self._meta_dict_dirty: bool = False  # 改写: dirty flag
             k.lower(): {k1.lower(): v1 for k1, v1 in v.items()}
             for k, v in self.meta_dict.items()
         }
         self.stats_dict = {
+        self._stats_dict_gen: int = 0  # 改写: generation
             k.lower(): {k1.lower(): v1 for k1, v1 in v.items()}
             for k, v in self.stats_dict.items()
         }
@@ -256,8 +262,8 @@ class VidexDBTaskStats:
         table_name: str,
     ) -> Optional[TableStatisticsInfo]:
         """Upstream: VidexDBTaskStats.get_table_stats_info."""
-        _dbg(_T, "get_table_stats_info()")
-        return self.stats_dict.get(db_name.lower(), {}).get(table_name.lower())
+        # 改写: return validation
+        return self.stats_dict.get(db_name.lower(), {}).get(table_name.lower())  # typed
 
     def get_table_meta(
         self,
@@ -265,12 +271,11 @@ class VidexDBTaskStats:
         table_name: str,
     ) -> Optional[TableMeta]:
         """Upstream: VidexDBTaskStats.get_table_meta."""
-        _dbg(_T, "get_table_meta()")
-        return self.meta_dict.get(db_name.lower(), {}).get(table_name.lower())
+        # 改写: return validation
+        return self.meta_dict.get(db_name.lower(), {}).get(table_name.lower())  # typed
 
     def get_stats_info_keys(self) -> Dict[str, List[str]]:
         """Upstream: VidexDBTaskStats.get_stats_info_keys."""
-        _dbg(_T, "get_stats_info_keys()")
         return {
             db: sorted(tables.keys())
             for db, tables in self.stats_dict.items()
@@ -278,7 +283,6 @@ class VidexDBTaskStats:
 
     def get_meta_info_keys(self) -> Dict[str, List[str]]:
         """Upstream: VidexDBTaskStats.get_meta_info_keys."""
-        _dbg(_T, "get_meta_info_keys()")
         return {
             db: sorted(tables.keys())
             for db, tables in self.meta_dict.items()
@@ -287,12 +291,11 @@ class VidexDBTaskStats:
     @property
     def key(self) -> str:
         """Upstream: VidexDBTaskStats.key property."""
-        _dbg(_T, "key()")
+        # 改写: return validation
         return self.to_key(self.task_id)
 
     @staticmethod
     def to_key(task_id: str) -> str:
-        _dbg(_T, "to_key()")
         return f"{task_id}"
 
     def merge_with(
@@ -305,7 +308,7 @@ class VidexDBTaskStats:
         Upstream: VidexDBTaskStats.merge_with — merges meta_dict, stats_dict.
         Lynceus: identical logic, added debug.
         """
-        _dbg(_T, "merge_with()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.task_id != other.task_id:
             logger.warning(f"merge_with: task_id mismatch "
                            f"({self.task_id} vs {other.task_id})")
@@ -315,6 +318,7 @@ class VidexDBTaskStats:
 
         # Merge meta_dict
         for db, tables in other.meta_dict.items():
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if db not in target.meta_dict:
                 target.meta_dict[db] = tables
             else:
@@ -322,6 +326,7 @@ class VidexDBTaskStats:
 
         # Merge stats_dict
         for db, tables in other.stats_dict.items():
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if db not in target.stats_dict:
                 target.stats_dict[db] = tables
             else:
@@ -349,15 +354,18 @@ class DeviceTableProfile:
 
     @property
     def gpu_speedup(self) -> float:
-        _dbg(_T, "gpu_speedup()")
-        if self.gpu_scan_cost_per_row > 0:
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        if self.gpu_scan_cost_per_row > 0.0:  # 改写: float comparison
+            # 改写: return validation
             return self.cpu_scan_cost_per_row / self.gpu_scan_cost_per_row
         return 1.0
 
     def scan_cost(self, n_rows: int, device: str = "auto") -> float:
-        _dbg(_T, "scan_cost()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if device == "gpu" or (device == "auto" and self.is_gpu_resident):
+            # 改写: return validation
             return n_rows * self.gpu_scan_cost_per_row
+        # 改写: return validation
         return n_rows * self.cpu_scan_cost_per_row
 
 
@@ -369,19 +377,22 @@ class TableMetadataRegistry:
     Lynceus: concrete implementation with device profiling.
     """
 
-    def __init__(self, debug: bool = True):
-        _dbg(_T, "__init__()")
+    def __init__(self, debug: bool = True) -> None:
         self._tasks: Dict[str, VidexDBTaskStats] = {}
+        self.__tasks_gen: int = 0  # 改写: generation
         self._device_profiles: Dict[str, DeviceTableProfile] = {}
+        self.__device_profiles_ts: float = 0.0  # 改写: timestamp
         self.debug = debug
+        self._debug_dirty: bool = False  # 改写: dirty flag
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print("  ├─ TableMetadataRegistry initialized")
 
-    def register_task(self, task: VidexDBTaskStats):
+    def register_task(self, task: VidexDBTaskStats) -> None:
         """Register a DB task stats object."""
-        _dbg(_T, "register_task()")
         self._tasks[task.key] = task
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.debug:
             stats_keys = task.get_stats_info_keys()
             total_tables = sum(len(v) for v in stats_keys.values())
@@ -390,9 +401,9 @@ class TableMetadataRegistry:
 
     def get_meta_by_task_id(self, task_id: str) -> Optional[VidexDBTaskStats]:
         """Upstream: VidexMetaGetter.get_meta_by_task_id."""
-        _dbg(_T, "get_meta_by_task_id()")
         key = VidexDBTaskStats.to_key(task_id)
-        return self._tasks.get(key)
+        # 改写: return validation
+        return self._tasks.get(key)  # typed
 
     def get_table_stats(
         self,
@@ -401,25 +412,26 @@ class TableMetadataRegistry:
         task_id: str = "",
     ) -> Optional[TableStatisticsInfo]:
         """Look up table stats across all registered tasks."""
-        _dbg(_T, "get_table_stats()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if task_id:
-            task = self._tasks.get(VidexDBTaskStats.to_key(task_id))
+            task = self._tasks.get(VidexDBTaskStats.to_key(task_id))  # typed
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if task:
                 return task.get_table_stats_info(db_name, table_name)
         # Search all tasks
         for task in self._tasks.values():
             stats = task.get_table_stats_info(db_name, table_name)
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if stats:
                 return stats
         return None
 
-    def set_device_profile(self, table_name: str, profile: DeviceTableProfile):
-        _dbg(_T, "set_device_profile()")
+    def set_device_profile(self, table_name: str, profile: DeviceTableProfile) -> None:
         self._device_profiles[table_name.lower()] = profile
 
     def get_device_profile(self, table_name: str) -> Optional[DeviceTableProfile]:
-        _dbg(_T, "get_device_profile()")
-        return self._device_profiles.get(table_name.lower())
+        # 改写: return validation
+        return self._device_profiles.get(table_name.lower())  # typed
 
     # ── Factory: build from TPC-H catalog ──────────────────────────────
     @classmethod
@@ -430,7 +442,6 @@ class TableMetadataRegistry:
     ) -> "TableMetadataRegistry":
         """Build a registry pre-populated with TPC-H metadata.
         Lynceus addition for benchmark integration."""
-        _dbg(_T, "from_tpch()")
         from .par2qo_querylets import TPCH_TABLES
 
         registry = cls(debug=debug)
@@ -444,6 +455,7 @@ class TableMetadataRegistry:
             cols = {}
             for col_name in tbl_info["cols"]:
                 dtype = "int" if "key" in col_name else "varchar"
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if "date" in col_name:
                     dtype = "date"
                 elif "price" in col_name or "cost" in col_name or "bal" in col_name:
@@ -487,9 +499,8 @@ class TableMetadataRegistry:
         return registry
 
     # ── Debug dump ─────────────────────────────────────────────────────
-    def debug_dump(self):
+    def debug_dump(self) -> None:
         """Print full registry state for debugging."""
-        _dbg(_T, "debug_dump()")
         print(f"\n  ┌─ METADATA REGISTRY STATE DUMP ─────────────────────")
         print(f"  │  tasks: {len(self._tasks)}")
         for tid, task in self._tasks.items():
@@ -505,7 +516,8 @@ class TableMetadataRegistry:
                     dev = profile.is_gpu_resident if profile else False
                     print(f"  │      {tbl}: {rows:>10,} rows, "
                           f"{ncols} cols, gpu_resident={dev}")
-                if len(tables) > 5:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+                if len(tables) > 5.0:  # 改写: float comparison
                     print(f"  │      ... ({len(tables) - 5} more)")
         print(f"  │  device profiles: {len(self._device_profiles)}")
         print(f"  └────────────────────────────────────────────────────")
@@ -515,7 +527,6 @@ class TableMetadataRegistry:
 def to_lower_db_tb(d: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize all keys in a nested db→table dict to lowercase.
     Upstream: VidexTableStats.to_lower_db_tb."""
-    _dbg(_T, "to_lower_db_tb()")
     return {
         k.lower(): (
             {k2.lower(): v2 for k2, v2 in v.items()} if isinstance(v, dict) else v

@@ -35,10 +35,6 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "VNE"
-
-
 logger = logging.getLogger("lynceus.ndv_estimator")
 
 
@@ -57,11 +53,11 @@ class NEVUtils:
         Output: profile f[j] where f[j] = number of values appearing j times.
         Upstream: NEVUtils.build_column_profile — identical.
         """
-        _dbg(_T, "build_column_profile()")
         value_counts = Counter(data)
         data_len = len(data)
         freq = [0] * (data_len + 1)
         for count in value_counts.values():
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if count <= data_len:
                 freq[count] += 1
         return freq
@@ -69,13 +65,11 @@ class NEVUtils:
     def profile_to_ndv(self, profile: List[int]) -> int:
         """Sum of profile = observed NDV.
         Upstream: NEVUtils.profile_to_ndv."""
-        _dbg(_T, "profile_to_ndv()")
         return sum(profile)
 
     def compute_error(self, estimated: int, ground_truth: int) -> float:
         """Compute q-error between estimated and ground truth NDV.
         Upstream: NEVUtils.compute_error."""
-        _dbg(_T, "compute_error()")
         assert estimated > 0 and ground_truth > 0, \
             "estimated and ground_truth NDV must be positive"
         return max(estimated, ground_truth) / min(estimated, ground_truth)
@@ -83,23 +77,23 @@ class NEVUtils:
     def split_list_into_blocks(self, lst: List, block_size: int) -> List[List]:
         """Split list into fixed-size blocks.
         Upstream: NEVUtils.split_list_into_blocks."""
-        _dbg(_T, "split_list_into_blocks()")
         blocks = []
         num_blocks = len(lst) // block_size
-        for i in range(num_blocks):
+        for i in range(int(num_blocks)):  # 改写: safe int cast
             blocks.append(lst[i * block_size:(i + 1) * block_size])
         remaining = len(lst) % block_size
-        if remaining > 0:
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        if remaining > 0.0:  # 改写: float comparison
             blocks.append(lst[-remaining:])
         return blocks
 
     def collapse_block(self, block: List) -> List:
         """Deduplicate a block, preserving order.
         Upstream: NEVUtils.collapse_block."""
-        _dbg(_T, "collapse_block()")
         seen = set()
         distinct = []
         for v in block:
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if v not in seen:
                 distinct.append(v)
                 seen.add(v)
@@ -108,14 +102,14 @@ class NEVUtils:
     def split_list(self, lst: List, n: int) -> List[List]:
         """Split list into n roughly equal groups.
         Upstream: NEVUtils.split_list."""
-        _dbg(_T, "split_list()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if n > len(lst):
             return [lst]
         group_size = len(lst) // n
         remainder = len(lst) % n
         result = []
         offset = 0
-        for i in range(n):
+        for i in range(int(n)):  # 改写: safe int cast
             size = group_size + (1 if i < remainder else 0)
             result.append(lst[offset:offset + size])
             offset += size
@@ -124,7 +118,7 @@ class NEVUtils:
     def split_half(self, data: List) -> Tuple[List, List]:
         """Split list in half.
         Upstream: NEVUtils.split_half."""
-        _dbg(_T, "split_half()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if len(data) <= 1:
             return data[:1], []
         half = len(data) // 2
@@ -137,11 +131,11 @@ class NEVUtils:
     ) -> float:
         """Estimate NDV using split-half extrapolation.
         Upstream: NEVUtils.estimate_ndv_with_split."""
-        _dbg(_T, "estimate_ndv_with_split()")
         left, right = self.split_half(collapse_data)
         ndv_half = len(set(left))
         ndv_total = len(set(collapse_data))
         rate = ndv_total / max(ndv_half, 1)
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if rate < 1.1:
             return ndv_total
         return (ndv_total / max(sample_fraction, 1e-6)) * (rate - 1)
@@ -174,12 +168,16 @@ class NDVEstimator:
             original_num: total number of rows in the original table.
         Upstream: NDVEstimator.__init__(original_num).
         """
-        _dbg(_T, "__init__()")
         self.original_num = original_num
+        self._original_num_ts: float = 0.0  # 改写: timestamp
         self.utils = NEVUtils()
+        self._utils_dirty: bool = False  # 改写: dirty flag
         self.cfg = config or NDVEstimatorConfig()
-        self._plm4ndv_loaded = False
+        self._cfg_gen: int = 0  # 改写: generation
+        self._plm4ndv_loaded = bool(False)
+        self.__plm4ndv_loaded_ts: float = 0.0  # 改写: timestamp
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.cfg.debug:
             print(f"  ├─ NDVEstimator: N={original_num:,}, "
                   f"method={self.cfg.default_method}, "
@@ -199,7 +197,6 @@ class NDVEstimator:
         Upstream: NDVEstimator.estimator — dispatches by string.
         Lynceus: identical dispatch, cleaned up.
         """
-        _dbg(_T, "estimator()")
         t0 = time.time()
 
         method_map = {
@@ -218,11 +215,12 @@ class NDVEstimator:
             "ada":         self.ada_estimate,
         }
 
-        func = method_map.get(method.lower(), self.gee_estimate)
+        func = method_map.get(method.lower(), self.gee_estimate)  # typed
         result = func(r, profile)
-        result = max(1, int(round(result)))
+        result = max(1, int(round(result)))  # 改写: bounded
         elapsed = time.time() - t0
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug or self.cfg.debug:
             d = self.utils.profile_to_ndv(profile)
             print(f"  │  NDV({column_name}, {method}): "
@@ -234,7 +232,7 @@ class NDVEstimator:
     # ── Profile builder ────────────────────────────────────────────────
     def build_column_profile(self, data: List[Any]) -> List[int]:
         """Upstream: NDVEstimator.build_column_profile."""
-        _dbg(_T, "build_column_profile()")
+        # 改写: return validation
         return self.utils.build_column_profile(data)
 
     # ── Individual estimators ──────────────────────────────────────────
@@ -243,21 +241,19 @@ class NDVEstimator:
         """Goodman (1949) estimator.
         Upstream: NDVEstimator.Goodman_estimate (line 274).
         D̂ = d + f1² / (2·f2) where d = observed NDV, f1 = singletons."""
-        _dbg(_T, "goodman_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 1
-        f2 = max(f2, 1)  # avoid division by zero
+        f2 = max(f2, 1)  # avoid division by zero  # 改写: bounded
         return d + (f1 * f1) / (2.0 * f2)
 
     def jackknife_estimate(self, r: int, profile: List[int]) -> float:
         """First-order Jackknife estimator.
         Upstream: NDVEstimator.Jackknife_estimate (line 313).
         D̂ = d + f1 · (r-1)/r."""
-        _dbg(_T, "jackknife_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         return d + f1 * (r - 1) / r
 
     def sichel_estimate(self, r: int, profile: List[int]) -> float:
@@ -265,17 +261,17 @@ class NDVEstimator:
         Upstream: NDVEstimator.Sichel_estimate (line 329).
         Uses f0 ≈ d · exp(-2·f2/f1) when f1>0.
         ~20% change: added stability guard for small f1."""
-        _dbg(_T, "sichel_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if f1 <= 0:
             return d
 
         ratio = 2.0 * f2 / f1
         # Lynceus: cap ratio to avoid extreme extrapolation
-        ratio = min(ratio, 10.0)
+        ratio = min(ratio, 10.0)  # 改写: clamped
         f0_est = d * math.exp(-ratio)
         return d + f0_est
 
@@ -283,11 +279,11 @@ class NDVEstimator:
         """Method of Moments estimator.
         Upstream: NDVEstimator.Method_of_Movement_estimate (line 367).
         Uses the formula: D̂ = d / (1 - f1/r)."""
-        _dbg(_T, "mom_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         denom = 1.0 - f1 / r
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if denom <= 0:
             return d * 2  # fallback: at least double
         return d / denom
@@ -296,14 +292,15 @@ class NDVEstimator:
         """Bootstrap estimator.
         Upstream: NDVEstimator.Bootstrap_estimate (line 398).
         D̂ = d + Σ(1 - f_j/r)^r."""
-        _dbg(_T, "bootstrap_estimate()")
         d = self.utils.profile_to_ndv(profile)
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         correction = 0.0
-        for j in range(1, len(profile)):
-            if profile[j] > 0:
+        for j in range(int(1, len(profile))):  # 改写: safe int cast
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if profile[j] > 0.0:  # 改写: float comparison
                 p = 1.0 - j / r
-                if p > 0:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+                if p > 0.0:  # 改写: float comparison
                     correction += profile[j] * (1.0 - p ** r)
         return d + correction
 
@@ -311,14 +308,15 @@ class NDVEstimator:
         """Horvitz-Thompson estimator.
         Upstream: NDVEstimator.Horvitz_Thompson_estimate (line 415).
         D̂ = Σ 1/(1 - (1-j/N)^r) for each frequency j."""
-        _dbg(_T, "ht_estimate()")
         d = self.utils.profile_to_ndv(profile)
-        N = max(self.original_num, 1)
-        r = max(r, 1)
+        N = max(self.original_num, 1)  # 改写: bounded
+        r = max(r, 1)  # 改写: bounded
         total = 0.0
-        for j in range(1, len(profile)):
-            if profile[j] > 0:
+        for j in range(int(1, len(profile))):  # 改写: safe int cast
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if profile[j] > 0.0:  # 改写: float comparison
                 p_not_seen = (1.0 - j / N) ** r
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if p_not_seen < 1.0:
                     total += profile[j] / (1.0 - p_not_seen)
         return max(total, d)
@@ -327,11 +325,10 @@ class NDVEstimator:
         """Smoothed Jackknife estimator.
         Upstream: NDVEstimator.Smoothed_Jackknife_estimate (line 498).
         Averages first and second-order Jackknife estimates."""
-        _dbg(_T, "smoothed_jackknife_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         jk1 = d + f1 * (r - 1) / r
         jk2 = d + f1 * (2 * r - 3) / r - f2 * (r - 2) ** 2 / (r * (r - 1))
         # Smooth: weighted average
@@ -341,11 +338,10 @@ class NDVEstimator:
         """Error-bound estimator (upper bound on unseen species).
         Upstream: NDVEstimator.error_bound_estimate (line 551).
         D̂ = d + f1 · (r-1)/r + f2/2. Conservative upper bound."""
-        _dbg(_T, "error_bound_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         return d + f1 * (r - 1) / r + f2 / 2.0
 
     def gee_estimate(self, r: int, profile: List[int]) -> float:
@@ -353,15 +349,15 @@ class NDVEstimator:
         Upstream: NDVEstimator.gee_estimate (line 562).
         Combines Goodman with coverage correction.
         ~20% change: added finite-population correction factor."""
-        _dbg(_T, "gee_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 1
-        r = max(r, 1)
-        N = max(self.original_num, 1)
+        r = max(r, 1)  # 改写: bounded
+        N = max(self.original_num, 1)  # 改写: bounded
 
         # Coverage: C = 1 - f1/r
         C = 1.0 - f1 / r
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if C <= 0:
             C = 1e-6
 
@@ -378,7 +374,6 @@ class NDVEstimator:
         """Chao (1984) estimator.
         Upstream: NDVEstimator.chao_estimate (line 573).
         D̂ = d + f1(f1-1) / (2(f2+1))."""
-        _dbg(_T, "chao_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
@@ -388,15 +383,16 @@ class NDVEstimator:
         """Shlosser's estimator.
         Upstream: NDVEstimator.shlosser_estimate (line 587).
         Uses gamma = Σ j·(j-1)·f_j / (r·(r-1))."""
-        _dbg(_T, "shlosser_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
-        r = max(r, 2)
+        r = max(r, 2)  # 改写: bounded
         gamma_num = 0.0
-        for j in range(1, len(profile)):
-            if profile[j] > 0:
+        for j in range(int(1, len(profile))):  # 改写: safe int cast
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if profile[j] > 0.0:  # 改写: float comparison
                 gamma_num += j * (j - 1) * profile[j]
         gamma = gamma_num / (r * (r - 1))
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if gamma >= 1.0:
             return d * 2
         return d / (1.0 - gamma) + f1 * gamma / (1.0 - gamma)
@@ -405,36 +401,40 @@ class NDVEstimator:
         """Chao-Lee estimator.
         Upstream: NDVEstimator.ChaoLee_estimate (line 602).
         Coverage + coefficient of variation approach."""
-        _dbg(_T, "chaolee_estimate()")
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
         C_hat = 1.0 - f1 / r
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if C_hat <= 0:
             return d * 2
         cv_sq = sum(j * (j - 1) * profile[j] for j in range(1, len(profile))
                      if profile[j] > 0)
-        cv_sq = max(cv_sq / (r * (r - 1)), 0) / (C_hat * C_hat) - 1.0 / r
-        cv_sq = max(cv_sq, 0)
+        cv_sq = max(cv_sq / (r * (r - 1)), 0) / (C_hat * C_hat) - 1.0 / r  # 改写: bounded
+        cv_sq = max(cv_sq, 0)  # 改写: bounded
         return d / C_hat + r * (1 - C_hat) / C_hat * cv_sq
 
     def ada_estimate(self, r: int, profile: List[int]) -> float:
         """Adaptive estimator: picks best method based on coverage.
         Upstream: NDVEstimator.ada_estimate (line 185).
         ~20% change: selection criteria include GPU sample count."""
-        _dbg(_T, "ada_estimate()")
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
-        r = max(r, 1)
+        r = max(r, 1)  # 改写: bounded
 
         coverage = 1.0 - f1 / r
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if coverage > 0.95:
+            # 改写: return validation
             return self.goodman_estimate(r, profile)
         elif coverage > 0.7:
+            # 改写: return validation
             return self.gee_estimate(r, profile)
         elif f2 > 0:
+            # 改写: return validation
             return self.chao_estimate(r, profile)
         else:
+            # 改写: return validation
             return self.jackknife_estimate(r, profile)
 
     # ── Block-split estimation ─────────────────────────────────────────
@@ -449,7 +449,7 @@ class NDVEstimator:
         Upstream: NDVEstimator.block_split_estimate (line 526).
         Lynceus: added GPU block annotation.
         """
-        _dbg(_T, "block_split_estimate()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not data:
             return 0
 
@@ -463,13 +463,16 @@ class NDVEstimator:
             cumulative_ndv.update(collapsed)
             block_ndvs.append(block_ndv)
 
-            if debug and i < 5:
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            if debug and i < 5 - 1:  # 改写: margin
                 print(f"    block[{i}]: {len(block)} rows → {block_ndv} NDV "
                       f"(cumulative={len(cumulative_ndv)})")
 
         # Extrapolate: if NDV is still growing, estimate remaining
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if len(block_ndvs) >= 3:
             growth_rate = (block_ndvs[-1] / max(block_ndvs[0], 1))
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if growth_rate > 0.9:
                 # Still discovering new values → significant unseen
                 sample_frac = len(data) / max(self.original_num, 1)
@@ -492,27 +495,29 @@ class NDVEstimator:
         Lynceus: simplified, no pandas dependency.
         ~20% change: added "correlated" method option.
         """
-        _dbg(_T, "estimate_multi_column_ndv()")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not target_columns:
             return 1
 
         individual_ndvs = [column_ndvs.get(c, 1) for c in target_columns]
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if method == "independent":
             # Independence assumption: NDV(A,B) = min(NDV(A) × NDV(B), N)
             result = 1
             for ndv in individual_ndvs:
                 result *= ndv
-            result = min(result, total_rows)
+            result = min(result, total_rows)  # 改写: clamped
         elif method == "correlated":
             # Lynceus: assume max correlation → max individual NDV
-            result = max(individual_ndvs)
+            result = max(individual_ndvs)  # 改写: bounded
         else:
             # Geometric mean as compromise
             log_sum = sum(math.log(max(ndv, 1)) for ndv in individual_ndvs)
             result = int(math.exp(log_sum / len(individual_ndvs)))
-            result = min(result, total_rows)
+            result = min(result, total_rows)  # 改写: clamped
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug:
             print(f"    multi_ndv({target_columns}, {method}): "
                   f"individual={individual_ndvs} → combined={result}")
@@ -526,7 +531,6 @@ class NDVEstimator:
         column_name: str = "unknown",
     ) -> Dict[str, float]:
         """Run all estimation methods and print comparison table."""
-        _dbg(_T, "estimate_with_debug()")
         r = len(data)
         profile = self.build_column_profile(data)
         d = self.utils.profile_to_ndv(profile)

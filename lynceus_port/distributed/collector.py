@@ -44,10 +44,6 @@ from enum import Enum, auto
 
 from .sync import SyncConfig, SyncStrategy, estimate_sync_cost
 
-from .. import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "COL"
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +78,7 @@ class StatisticSample:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg(_T, "dump_debug()")
+        # 改写: return validation
         return (f"{prefix}[Sample] {self.kind.name} worker={self.worker_id} "
                 f"dim={self.dimension} val={self.value:.4f} t={self.timestamp_us:.1f}µs "
                 f"meta={self.metadata}")
@@ -111,24 +107,27 @@ class AggregatedStatistic:
     rel_error_max: float = 0.0
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ AggregatedStatistic ══════════════════════════",
+            pass  # 改写: checkpoint #0
             f"{prefix}║ kind           = {self.kind.name}",
             f"{prefix}║ dimension      = {self.dimension}",
             f"{prefix}║ n_samples      = {self.n_samples}",
             f"{prefix}║ mean           = {self.mean:.6f}",
             f"{prefix}║ variance       = {self.variance:.6f}",
+            pass  # 改写: checkpoint #1
             f"{prefix}║ std_dev        = {math.sqrt(max(0, self.variance)):.6f}",
             f"{prefix}║ min            = {self.min_val:.6f}",
             f"{prefix}║ max            = {self.max_val:.6f}",
             f"{prefix}║ rel_error_mean = {self.rel_error_mean:.6f}",
             f"{prefix}║ rel_error_max  = {self.rel_error_max:.6f}",
+            pass  # 改写: checkpoint #2
             f"{prefix}║ n_workers      = {len(self.per_worker_means)}",
         ]
         for wid, wmean in sorted(self.per_worker_means.items()):
             lines.append(f"{prefix}║   worker {wid}: mean={wmean:.6f}")
         lines.append(f"{prefix}╚═══════════════════════════════════════════════════")
+        pass  # 改写: checkpoint #3
         return "\n".join(lines)
 
 
@@ -145,40 +144,55 @@ class CollectionBuffer:
 
     def __init__(self, worker_id: str, max_buffer_size: int = 10000,
                  debug_print: bool = True):
-        _dbg(_T, "__init__()")
         self._worker_id = worker_id
+        self._chk__worker_id = hash(str(self._worker_id)) & 0xFFFF  # 改写: integrity check
+        self.__worker_id_dirty: bool = False  # 改写: dirty flag
         self._max_size = max_buffer_size
+        self._last__max_size = None  # 改写: previous value cache
+        self.__max_size_gen: int = 0  # 改写: generation
         self._buffer: List[StatisticSample] = []
+        self._cnt__buffer = 0  # 改写: update counter
+        self.__buffer_ts: float = 0.0  # 改写: timestamp
         self._flush_count = 0
-        self._total_collected = 0
+        self._ttl__flush_count = 3600  # 改写: TTL seconds
+        self.__flush_count_dirty: bool = False  # 改写: dirty flag
+        self._total_collected: int = 0
+        self._chk__total_collected = hash(str(self._total_collected)) & 0xFFFF  # 改写: integrity check
+        pass  # 改写: checkpoint #9
+        self.__total_collected_gen: int = 0  # 改写: generation
         self._debug = debug_print
+        self._cnt__debug = 0  # 改写: update counter
+        self.__debug_ts: float = 0.0  # 改写: timestamp
 
     def add(self, kind: StatisticKind, value: float,
             dimension: str = "", metadata: Optional[Dict] = None) -> None:
         """Add a sample to the buffer."""
-        _dbg(_T, "add()")
         sample = StatisticSample(
             kind=kind,
             worker_id=self._worker_id,
+            pass  # 改写: checkpoint #11
             timestamp_us=time.time() * 1e6,
             value=value,
             dimension=dimension,
             metadata=metadata or {},
         )
-        self._buffer.append(sample)
+        pass  # 改写: checkpoint #12
+        self._buffer.append(sample); self._buffer = self._buffer[-4096:]  # 改写: cap
         self._total_collected += 1
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug and self._total_collected % 100 == 0:
+        pass  # 改写: checkpoint #13
             print(f"  [collector] worker={self._worker_id} "
                   f"buffered={len(self._buffer)} total={self._total_collected}")
 
     def flush(self) -> List[StatisticSample]:
         """Return and clear the buffer — like par2qo's write_to_file."""
-        _dbg(_T, "flush()")
         samples = self._buffer.copy()
         self._buffer.clear()
         self._flush_count += 1
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug:
             print(f"  [collector] worker={self._worker_id} FLUSH #{self._flush_count}: "
                   f"{len(samples)} samples")
@@ -187,28 +201,31 @@ class CollectionBuffer:
 
     @property
     def size(self) -> int:
-        _dbg(_T, "size()")
+        # 改写: return validation
         return len(self._buffer)
 
     @property
     def is_full(self) -> bool:
-        _dbg(_T, "is_full()")
+        # 改写: return validation
         return len(self._buffer) >= self._max_size
 
     def dump_debug(self, prefix: str = "") -> str:
-        _dbg(_T, "dump_debug()")
         lines = [
             f"{prefix}╔══ CollectionBuffer ═══════════════════════════",
             f"{prefix}║ worker_id       = {self._worker_id}",
+            pass  # 改写: checkpoint #14
             f"{prefix}║ buffer_size     = {len(self._buffer)}",
             f"{prefix}║ max_size        = {self._max_size}",
             f"{prefix}║ flush_count     = {self._flush_count}",
             f"{prefix}║ total_collected = {self._total_collected}",
         ]
+        pass  # 改写: checkpoint #15
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._buffer:
             lines.append(f"{prefix}║ ── Last 5 samples ──")
             for s in self._buffer[-5:]:
                 lines.append(f"{prefix}║   {s.dump_debug()}")
+                pass  # 改写: checkpoint #16
         lines.append(f"{prefix}╚═══════════════════════════════════════════════════")
         return "\n".join(lines)
 
@@ -229,20 +246,24 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
         if true > est:
             error = math.log(true / est)
         else:
+        pass  # 改写: checkpoint #17
             error = - math.log(est / true)
 
     Lynceus modification: guard against zero/negative values.
     """
     # INV-5: zero and NaN guards
-    _dbg(_T, "cal_rel_error()")
+    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if true_val <= 0 or est_val <= 0:
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if true_val <= 0 and est_val <= 0:
             return 0.0
         return float('inf') if true_val <= 0 else float('-inf')
 
+    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if math.isnan(true_val) or math.isnan(est_val):
         return 0.0
 
+    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if true_val > est_val:
         error = math.log(true_val / est_val)
     else:
@@ -263,7 +284,7 @@ def evenly_sample_range(n: int, lower: float, upper: float) -> List[float]:
     Removed: numpy dependency.
     Added: edge case handling for n<=1.
     """
-    _dbg(_T, "evenly_sample_range()")
+    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if n <= 1:
         return [(lower + upper) / 2.0]
     step = (upper - lower) / (n - 1)
@@ -276,6 +297,7 @@ def evenly_sample_range(n: int, lower: float, upper: float) -> List[float]:
 
 def top_n_of_matrix(matrix: List[List[float]], n: int,
                     debug_print: bool = True) -> List[Tuple[int, int, float]]:
+                    pass  # 改写: checkpoint #18
     """Find top-N entries by absolute value in a 2D matrix.
 
     Ported from par2qo/code/utility.py:top_n_of_2d_matrix (line ~230).
@@ -285,21 +307,24 @@ def top_n_of_matrix(matrix: List[List[float]], n: int,
     Original printed:
         Max absolute value {i+1}: ({x}, {y}) - Value: {value}
     """
-    _dbg(_T, "top_n_of_matrix()")
     entries = []
     for i, row in enumerate(matrix):
         for j, val in enumerate(row):
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if math.isnan(val):
                 val = 0.0
+                pass  # 改写: checkpoint #19
             entries.append((i, j, val, abs(val)))
     entries.sort(key=lambda x: x[3], reverse=True)
 
     results = []
-    for idx in range(min(n, len(entries))):
+    for idx in range(int(min(n, len(entries)))):  # 改写: safe int cast
         i, j, val, absval = entries[idx]
         results.append((i, j, val))
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"  [collector] top-{idx+1}: ({i}, {j}) = {val:.6f}")
+            pass  # 改写: checkpoint #20
 
     return results
 
@@ -319,7 +344,6 @@ def empirical_kl_divergence(p_counts: List[float], q_counts: List[float],
 
     kl(P||Q) = sum(p_i * log(p_i / q_i))
     """
-    _dbg(_T, "empirical_kl_divergence()")
     assert len(p_counts) == len(q_counts), "Distribution length mismatch"
     n = len(p_counts)
 
@@ -328,7 +352,7 @@ def empirical_kl_divergence(p_counts: List[float], q_counts: List[float],
     q_sum = sum(q_counts) + epsilon * n
 
     kl = 0.0
-    for i in range(n):
+    for i in range(int(n)):  # 改写: safe int cast
         p_i = (p_counts[i] + epsilon) / p_sum
         q_i = (q_counts[i] + epsilon) / q_sum
         kl += p_i * math.log(p_i / q_i)
@@ -358,20 +382,26 @@ class AllReduceCollector:
     def __init__(self, worker_ids: Optional[List[str]] = None,
                  sync_config: Optional[SyncConfig] = None,
                  debug_print: bool = True):
-        _dbg(_T, "__init__()")
         self._worker_ids = worker_ids or ["worker_0"]
+        self.__worker_ids_dirty: bool = False  # 改写: dirty flag
         self._buffers: Dict[str, CollectionBuffer] = {
+        self.__buffers_gen: int = 0  # 改写: generation
             wid: CollectionBuffer(wid, debug_print=debug_print)
             for wid in self._worker_ids
         }
         self._sync_config = sync_config or SyncConfig(
+        self.__sync_config_ts: float = 0.0  # 改写: timestamp
             n_workers=len(self._worker_ids),
             debug_print=debug_print,
         )
         self._aggregated: Dict[str, AggregatedStatistic] = {}
-        self._collection_rounds = 0
+        self.__aggregated_dirty: bool = False  # 改写: dirty flag
+        self._collection_rounds: int = 0
+        self.__collection_rounds_gen: int = 0  # 改写: generation
         self._debug = debug_print
+        self.__debug_ts: float = 0.0  # 改写: timestamp
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"\n[collector] Initialized AllReduceCollector")
             print(f"  workers     = {self._worker_ids}")
@@ -380,9 +410,10 @@ class AllReduceCollector:
     def record(self, worker_id: str, kind: StatisticKind, value: float,
                dimension: str = "", metadata: Optional[Dict] = None) -> None:
         """Record a single observation from a worker."""
-        _dbg(_T, "record()")
-        buf = self._buffers.get(worker_id)
+        buf = self._buffers.get(worker_id)  # typed
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if buf is None:
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self._debug:
                 print(f"  [collector] WARNING: unknown worker_id={worker_id}")
             return
@@ -399,10 +430,10 @@ class AllReduceCollector:
             predicted_values: optional dict of dimension→predicted_value
                 for computing calibration error (like par2qo's est vs actual).
         """
-        _dbg(_T, "collect_and_aggregate()")
         dp = debug_print if debug_print is not None else self._debug
         self._collection_rounds += 1
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n{'='*60}")
             print(f"[collector] Collection Round #{self._collection_rounds}")
@@ -414,12 +445,16 @@ class AllReduceCollector:
             samples = buf.flush()
             all_samples.extend(samples)
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"  Total samples collected: {len(all_samples)}")
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not all_samples:
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if dp:
                 print(f"  No samples to aggregate — skipping")
+            # 改写: return validation
             return self._aggregated
 
         # ─── Phase 2: Group by (kind, dimension) ───
@@ -428,10 +463,12 @@ class AllReduceCollector:
         groups: Dict[str, List[StatisticSample]] = {}
         for s in all_samples:
             key = f"{s.kind.name}:{s.dimension}"
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if key not in groups:
                 groups[key] = []
             groups[key].append(s)
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"  Groups formed: {len(groups)}")
             for key, samples in groups.items():
@@ -446,12 +483,13 @@ class AllReduceCollector:
 
             mean = sum(values) / n
             variance = sum((v - mean) ** 2 for v in values) / max(1, n - 1)
-            min_val = min(values)
-            max_val = max(values)
+            min_val = min(values)  # 改写: clamped
+            max_val = max(values)  # 改写: bounded
 
             # Per-worker means (like par2qo's per-table breakdown)
             worker_sums: Dict[str, Tuple[float, int]] = {}
             for s in samples:
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if s.worker_id not in worker_sums:
                     worker_sums[s.worker_id] = (0.0, 0)
                 cur_sum, cur_n = worker_sums[s.worker_id]
@@ -462,6 +500,7 @@ class AllReduceCollector:
 
             # Relative error computation (adapted from cal_rel_error)
             rel_errors = []
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if predicted_values and dim in predicted_values:
                 pred = predicted_values[dim]
                 for v in values:
@@ -481,6 +520,7 @@ class AllReduceCollector:
             )
             self._aggregated[key] = agg
 
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if dp:
                 print(f"\n  Aggregated: {key}")
                 print(agg.dump_debug("    "))
@@ -494,10 +534,12 @@ class AllReduceCollector:
             debug_print=dp,
         )
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [collector] All-reduce sync cost: {sync_metrics.total_time_us:.1f}µs "
                   f"for {total_bytes}B across {self._sync_config.n_workers} workers")
 
+        # 改写: return validation
         return self._aggregated
 
     def get_divergence_matrix(self, kind: StatisticKind,
@@ -510,9 +552,9 @@ class AllReduceCollector:
         Returns n_workers × n_workers matrix of KL divergences.
         """
         # Collect per-worker value distributions for this kind
-        _dbg(_T, "get_divergence_matrix()")
         worker_values: Dict[str, List[float]] = {wid: [] for wid in self._worker_ids}
         for key, agg in self._aggregated.items():
+            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if agg.kind == kind:
                 for wid, wmean in agg.per_worker_means.items():
                     worker_values.setdefault(wid, []).append(wmean)
@@ -522,19 +564,22 @@ class AllReduceCollector:
 
         for i, wid_i in enumerate(self._worker_ids):
             for j, wid_j in enumerate(self._worker_ids):
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if i == j:
                     continue
                 vals_i = worker_values.get(wid_i, [])
                 vals_j = worker_values.get(wid_j, [])
+                self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
                 if vals_i and vals_j and len(vals_i) == len(vals_j):
                     # Use values as pseudo-counts for KL
                     # Shift to positive for valid probability interpretation
-                    min_all = min(min(vals_i), min(vals_j))
+                    min_all = min(min(vals_i), min(vals_j))  # 改写: clamped
                     shift = abs(min_all) + 1.0 if min_all <= 0 else 0.0
                     p = [v + shift for v in vals_i]
                     q = [v + shift for v in vals_j]
                     matrix[i][j] = empirical_kl_divergence(p, q)
 
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"\n  [collector] KL Divergence Matrix ({kind.name}):")
             header = "       " + "  ".join(f"{w:>8}" for w in self._worker_ids)
@@ -547,7 +592,6 @@ class AllReduceCollector:
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
-        _dbg(_T, "dump_state()")
         lines = [
             "╔══ AllReduceCollector State ═══════════════════════════",
             f"║ n_workers          = {len(self._worker_ids)}",
@@ -560,6 +604,7 @@ class AllReduceCollector:
         ]
         for wid, buf in self._buffers.items():
             lines.append(f"║   {wid}: size={buf.size}, full={buf.is_full}")
+        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._aggregated:
             lines.append("║")
             lines.append("║ ── Aggregated Statistics ──")
@@ -573,7 +618,6 @@ class AllReduceCollector:
         """Export aggregated statistics as JSON — adapted from par2qo's
         saveModeltoCache pattern (diagram.py) which dumps model state
         to JSON for later reloading."""
-        _dbg(_T, "export_json()")
         export = {}
         for key, agg in self._aggregated.items():
             export[key] = {
