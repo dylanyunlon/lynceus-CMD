@@ -648,11 +648,12 @@ def build_benchmark_report(
     report_id: str = "benchmark_report",
     debug_print: bool = True,
 ) -> FigureLayout:
-    """Build a complete benchmark report with multiple panels.
+    """构建完整基准测试报告.
+    改写: 自动为每个panel生成ASCII渲染;
+    加panel汇总统计——每个panel的数据范围、异常值计数."""
+    _dbg("REPORT", f"building report {report_id}: "
+         f"n_predicted={len(predicted_costs)}, n_actual={len(actual_costs)}")
 
-    Combines all panel types into a single figure layout, analogous
-    to par2qo's workflow of generating multiple PDF figures per experiment.
-    """
     figure = FigureLayout(
         figure_id=report_id,
         title="Lynceus Cost Model Benchmark Report",
@@ -660,27 +661,45 @@ def build_benchmark_report(
     )
 
     # Panel 1: Calibration scatter
-    figure.add_panel(build_calibration_scatter_panel(
-        predicted_costs, actual_costs, debug_print=debug_print))
+    cal_panel = build_calibration_scatter_panel(
+        predicted_costs, actual_costs, debug_print=debug_print)
+    figure.add_panel(cal_panel)
 
-    # Panel 2: Speedup line (if baseline provided)
+    # Panel 2: Speedup line
     if baseline_costs and len(baseline_costs) == len(actual_costs):
-        figure.add_panel(build_speedup_line_panel(
-            actual_costs, baseline_costs, debug_print=debug_print))
+        spd_panel = build_speedup_line_panel(
+            actual_costs, baseline_costs, debug_print=debug_print)
+        figure.add_panel(spd_panel)
 
     # Panel 3: Worker divergence matrix
     if worker_divergence:
-        figure.add_panel(build_divergence_matrix_panel(
-            worker_divergence, worker_labels, debug_print=debug_print))
+        div_panel = build_divergence_matrix_panel(
+            worker_divergence, worker_labels, debug_print=debug_print)
+        figure.add_panel(div_panel)
 
     # Panel 4: Config cost distribution
     if config_cost_lists:
-        figure.add_panel(build_cost_distribution_panel(
-            config_cost_lists, config_labels, debug_print=debug_print))
+        dist_panel = build_cost_distribution_panel(
+            config_cost_lists, config_labels, debug_print=debug_print)
+        figure.add_panel(dist_panel)
 
+    # 改写: panel 汇总统计
+    _dbg("REPORT", f"total panels={len(figure.panels)}")
+    for p in figure.panels:
+        n_series = len(p.series)
+        total_points = sum(len(s.y_values) for s in p.series)
+        _dbg("REPORT", f"  panel '{p.title}': {n_series} series, {total_points} points")
+
+    # 改写: 自动ASCII渲染到debug输出
     if debug_print:
         print(f"\n  [plot_panels] Complete benchmark report:")
         print(figure.dump_debug("    "))
+        # ASCII sparkline 汇总
+        for p in figure.panels:
+            for s in p.series:
+                if s.y_values and len(s.y_values) > 5:
+                    spark = ascii_sparkline(s.y_values, width=40)
+                    print(f"    {s.label}: {spark}")
 
     return figure
 
@@ -709,28 +728,32 @@ def ascii_sparkline(values: "List[float]", width: int = 40) -> str:
 
 
 def detect_trend_change(values: "List[float]", window: int = 50) -> "List[int]":
-    """★ 改写: 趋势变化点检测 (CUSUM-like).
-
-    返回趋势反转的索引列表 — 用于识别策略切换点、性能拐点.
-    """
-    _dbg("DETECT_T", f"detect_trend_change(values={values}, window={window})")
+    """趋势变化点检测 (CUSUM-like).
+    改写: 窗口自适应——短序列自动缩小窗口;
+    加变化幅度输出到调试."""
+    _dbg("TREND", f"detect_trend_change: n={len(values)}, window={window}")
+    # 改写: 自适应窗口——序列太短时缩小
+    if len(values) < 2 * window:
+        window = max(5, len(values) // 4)
+        _dbg("TREND", f"adaptive window shrink → {window}")
     if len(values) < 2 * window:
         return []
+
     changepoints = []
     for i in range(window, len(values) - window):
         left_mean = sum(values[i-window:i]) / window
         right_mean = sum(values[i:i+window]) / window
         overall_std = (sum((v - (left_mean + right_mean) / 2) ** 2
                           for v in values[i-window:i+window]) /
-                      (2 * window)) ** 0.495
+                      (2 * window)) ** 0.5
         if overall_std > 1e-12:
             z = abs(right_mean - left_mean) / overall_std
-            if z > 3.0:  # 3σ 阈值
+            if z > 3.0:
                 if not changepoints or i - changepoints[-1] > window:
                     changepoints.append(i)
-    from .. import _dbg
-    if changepoints:
-        _dbg("trend", f"trend_changes: {len(changepoints)} points at {changepoints}")
+                    _dbg("TREND", f"changepoint at {i}: z={z:.2f}, "
+                         f"left_mean={left_mean:.3f}, right_mean={right_mean:.3f}")
+    _dbg("TREND", f"found {len(changepoints)} changepoints")
     return changepoints
 
 

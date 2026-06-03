@@ -79,20 +79,26 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
         return "PAR2QO-Enhanced"
 
     def _update_variance(self, cost_us: float):
-        _dbg("_UPDATE_", f"_update_variance(cost_us={cost_us})")
+        """更新方差追踪.
+        改写: 加指数退化——老数据权重逐步衰减,
+        让近期方差更有影响力."""
         self._cost_n += 1
+        # 改写: EMA退化——n>100后等效窗口固定在100
+        effective_n = min(self._cost_n, 100)
+        alpha = 1.0 / effective_n
         delta = cost_us - self._cost_mean
-        self._cost_mean += delta / self._cost_n
+        self._cost_mean += alpha * delta
         delta2 = cost_us - self._cost_mean
-        self._cost_m2 += delta * delta2
+        self._cost_m2 = (1 - alpha) * self._cost_m2 + alpha * delta * delta2
+        _dbg("PAR2QO", f"variance update: mean={self._cost_mean:.1f}, "
+             f"cv={self._cost_cv:.4f}, n={self._cost_n}")
 
     @property
     def _cost_cv(self) -> float:
-        """变异系数 = std / mean — 代价估计的不稳定程度."""
+        """变异系数——EMA方差模式下直接用m2的平方根."""
         if self._cost_n < 2 or self._cost_mean <= 0:
             return 0.0
-        var = self._cost_m2 / (self._cost_n - 1)
-        return math.sqrt(var) / self._cost_mean
+        return math.sqrt(max(0.0, self._cost_m2)) / self._cost_mean
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:

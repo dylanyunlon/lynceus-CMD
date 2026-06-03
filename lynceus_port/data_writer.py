@@ -274,21 +274,28 @@ class ExperimentMeta:
 
 def measure_with_median(func, *args, times: int = 5,
                         debug_print: bool = True,
-                        iqr_filter: bool = True,   # ★ 改写: IQR 异常值剔除
+                        iqr_filter: bool = True,
+                        warmup: int = 1,
                         **kwargs) -> float:
-    """★ 改写: 增加 IQR 过滤 — 去除 < Q1-1.5*IQR 和 > Q3+1.5*IQR 的异常值."""
+    """中位数计时.
+    改写: 加预热轮——前warmup次不计入统计(JIT/缓存冷启动);
+    加 P50/P95/P99 百分位报告."""
+    _dbg("MEASURE", f"measure_with_median: times={times}, warmup={warmup}")
+
+    # 改写: 预热轮——跑但不统计
+    for _ in range(warmup):
+        func(*args, **kwargs)
+
     latencies = []
     for trial in range(times):
         start = time.time()
         func(*args, **kwargs)
         elapsed_us = (time.time() - start) * 1e6
         latencies.append(elapsed_us)
-        if debug_print and trial == 0:
-            print(f"  [data_writer] Trial 0: {elapsed_us:.1f}µs")
 
     latencies.sort()
 
-    # ★ IQR 过滤
+    # IQR 过滤
     if iqr_filter and len(latencies) >= 5:
         q1_idx = len(latencies) // 4
         q3_idx = 3 * len(latencies) // 4
@@ -297,9 +304,10 @@ def measure_with_median(func, *args, times: int = 5,
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
         filtered = [v for v in latencies if lo <= v <= hi]
         if filtered:
+            n_removed = len(latencies) - len(filtered)
             latencies = filtered
-            if debug_print:
-                print(f"  [data_writer] IQR filter: kept {len(filtered)}/{times} trials")
+            if n_removed > 0:
+                _dbg("MEASURE", f"IQR filter: removed {n_removed} outliers")
 
     n = len(latencies)
     if n % 2 == 1:
@@ -307,9 +315,13 @@ def measure_with_median(func, *args, times: int = 5,
     else:
         median = (latencies[n // 2 - 1] + latencies[n // 2]) / 2
 
-    if debug_print:
-        print(f"  [data_writer] Median of {n} trials: {median:.1f}µs "
-              f"(min={latencies[0]:.1f}, max={latencies[-1]:.1f})")
+    # 改写: percentile 报告
+    if debug_print and n >= 3:
+        p95_idx = min(n - 1, int(n * 0.95))
+        p99_idx = min(n - 1, int(n * 0.99))
+        _dbg("MEASURE", f"P50={median:.1f}, P95={latencies[p95_idx]:.1f}, "
+             f"P99={latencies[p99_idx]:.1f}µs (n={n})")
+
     return median
 
 

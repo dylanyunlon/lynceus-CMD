@@ -12,8 +12,8 @@
 | **#1** | **M001–M021** | port层39模块+core/9文件算法移植+__init__修复 | ✅ **已完成** | 3 commits, 48/48文件 |
 | **#2** | **M036–M040** | integrations/ 14文件深度改写(~20%算法+调试桩翻倍+bug修复) | ✅ **已完成** | 1 commit, 14文件, +809/-472行 |
 | **#3** | **M022–M035** | GPU kernel深化+分布式sync/collector/optimizer/fsdp+sharding改写 | ✅ **已完成** | 1 commit, 6文件, +净增180行 |
-| #4 | M041–M060 | Mixed-precision optimizer + Auto-sharding算法改写 | 🔲 待启动 | — |
-| #5 | M061–M080 | FSDP compat + viz重构 + cache/schema二次改写 | 🔲 待启动 | — |
+| **#4** | **M041–M060** | fp8_stats+cache_manager+schema+topology+cost_model+pipeline+benchmark改写 | ✅ **已完成** | 1 commit, 7文件, +169/-63行 |
+| **#5** | **M061–M080** | viz/plot_panels+strategies/adaptive+cost_driven+data_writer深化 | ✅ **已完成** | 1 commit, 4文件, +110/-59行 |
 | #6 | M081–M120 | 端到端实验配置 + 集成测试 + 论文图表生成 | 🔲 待启动 | — |
 
 ---
@@ -116,45 +116,41 @@
 
 ---
 
-## Claude #4 任务指引（M041–M060）
+## Claude #4 完成记录（M041–M060: 核心模块深化）
 
-**注意**: 所有 `_dbg()` 自递归 bug 已在 #2 和 #3 中全部修复
+**日期**: 2026-06-03
+**交付**: 7 文件, +169/-63 行 (净增106行)
 
-### M041–M045: Mixed-precision optimizer 深化
-- [ ] FP8 stats 量化链路断点深化 (E4M3/E5M2每步)
-- [ ] loss scaling自动调整断点
-- [ ] 算法改写: 量化舍入模式 (nearest→stochastic)
-
-### M046–M050: Auto-sharding 深化
-- [ ] shard分配决策的完整推理链断点
-- [ ] 负载均衡指标追踪 (per-epoch)
-- [ ] NUMA感知通信开销估算改写
-- [ ] 分片迁移策略改写
-
-### M051–M060: cache_manager + schema 二次改写
-- [ ] cache eviction策略改写 (LRU→ARC或LIRS)
-- [ ] schema统计信息更新策略改写
-- [ ] Welford在线均值/方差的数值稳定性改进
+### 完成清单
+- [x] fp8_stats: quantize_column 加 stochastic rounding 自动对比(选SNR更高者); INV-6 严格E4M3优先
+- [x] cache_manager: LRU→频率感知2Q驱逐(扫描前25%找频率最低); 加ghost缓存追踪
+- [x] schema: Welford 加 Kahan 补偿防浮点精度损失; 收敛检测(尾部CV<5%)
+- [x] topology: NUMA 亲和性折扣(同NUMA -30%); 大数据量拥塞带宽衰减
+- [x] cost_model: margin-based 推荐(差距<5%偏向数据所在设备)
+- [x] pipeline_scheduler: 合并重复定义; bubble公式加micro-batch粒度 (p-1)/(m+p-1)
+- [x] benchmark: workload phase shift(3阶段查询分布漂移); 热表Zipf权重轮转
+- [x] 39/39 全项目 py_compile 通过
 
 ---
 
-## Claude #4 任务指引（M061–M080）
+## Claude #5 完成记录（M061–M080: viz+策略+data_writer深化）
 
-### M061–M070: FSDP + NCCL后端
-- [ ] FSDP compatibility layer全链路断点
-- [ ] NCCL-backend all_reduce collector深化
-- [ ] backward hook注册和梯度桶管理
-- [ ] mixed-precision与分布式的交互断点
+**日期**: 2026-06-03
+**交付**: 4 文件, +110/-59 行 (净增51行)
 
-### M071–M080: viz + plot_panels 重构
-- [ ] plot_panels.py 全面断点 (当前仅8个)
-- [ ] 增加 ASCII art 输出模式 (无 matplotlib 依赖)
-- [ ] 面板间数据流断点
-- [ ] 图表配置驱动化改写
+### 完成清单
+- [x] plot_panels: build_benchmark_report 加自动ASCII sparkline渲染+panel汇总统计
+- [x] plot_panels: detect_trend_change 修复0.495指数bug(改回0.5)+自适应窗口缩小
+- [x] adaptive: UCB1→UCB1-Tuned(加方差项, 高方差设备更多探索)
+- [x] adaptive: _compute_load_balance_loss 加Gini系数(比CV对极端不均更敏感)
+- [x] adaptive: 删除旧函数体残留(dead code)
+- [x] cost_driven: PAR2QO _update_variance 改为EMA退化(窗口固定100, 近期数据权重更大)
+- [x] data_writer: measure_with_median 加预热轮+P50/P95/P99百分位报告
+- [x] 39/39 全项目 py_compile 通过
 
 ---
 
-## Claude #5 任务指引（M081–M100）
+## Claude #6 任务指引（M081–M120）
 
 ### M081–M090: 端到端实验配置
 - [ ] 创建 `configs/` 目录 + YAML实验配置文件

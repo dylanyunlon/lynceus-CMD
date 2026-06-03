@@ -68,12 +68,17 @@ class AdaptiveStrategy(RoutingStrategyBase):
         return raw_cost_us * bias
 
     def _ucb_bonus(self, device_id: str) -> float:
-        """UCB 探索项 — 访问少的设备获得负成本奖励."""
-        _dbg("_UCB_BON", f"_ucb_bonus(device_id={device_id})")
+        """UCB 探索项.
+        改写: UCB1-Tuned——加方差项，高方差设备获得更多探索."""
         total = max(1, sum(self._device_load.values()))
         visits = max(1, self._device_load.get(device_id, 0))
-        # 返回: -self._ucb_c * math.sqrt(math.log(total)
-        return -self._ucb_c * math.sqrt(math.log(total) / visits)
+        base_ucb = math.sqrt(math.log(total) / visits)
+        # 改写: 方差修正——访问少时方差大，探索更多
+        variance_bonus = min(0.25, 1.0 / (2.0 * visits))
+        tuned_ucb = -self._ucb_c * math.sqrt(
+            (math.log(total) / visits) * min(0.25, variance_bonus + base_ucb ** 2))
+        _dbg("UCB", f"dev={device_id}: visits={visits}, base={base_ucb:.3f}, tuned={tuned_ucb:.3f}")
+        return tuned_ucb
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
@@ -172,24 +177,29 @@ class AdaptiveStrategy(RoutingStrategyBase):
 # 原版使用 top-k 门控选择专家; 移植版使用 EMA 选择设备.
 
 def _compute_load_balance_loss(device_loads: dict) -> float:
-    """计算负载均衡损失 — 类比 DeepSpeed TopKGate 的 balance loss.
-    
-    改写: 使用变异系数 (CV) 衡量不均衡度.
-    CV = 0 表示完全均衡, CV > 1 表示严重不均衡.
-    """
-    if not device_loads:
-        return 0.0
-    
-    import math
+    """负载均衡度量.
+    改写: 加 Gini 系数——比 CV 对极端不均更敏感;
+    返回 max(CV, Gini) 作为损失."""
+    _dbg("LB_LOSS", f"device_loads={device_loads}")
     loads = list(device_loads.values())
-    mean_load = sum(loads) / len(loads)
-    if mean_load == 0:
+    if not loads or len(loads) < 2:
         return 0.0
-    
-    var_load = sum((l - mean_load) ** 2 for l in loads) / len(loads)
-    cv = math.sqrt(var_load) / mean_load
-    
-    _dbg("BALANCE", f"loads={device_loads} mean={mean_load:.2f} cv={cv:.4f}")
+    mean_load = sum(loads) / len(loads)
+    if mean_load < 1e-12:
+        return 0.0
+    # CV (变异系数)
+    variance = sum((x - mean_load) ** 2 for x in loads) / len(loads)
+    cv = (variance ** 0.5) / mean_load
+
+    # 改写: Gini 系数——衡量分配不均
+    sorted_loads = sorted(loads)
+    n = len(sorted_loads)
+    gini_sum = sum((2 * (i + 1) - n - 1) * sorted_loads[i] for i in range(n))
+    gini = gini_sum / (n * sum(sorted_loads)) if sum(sorted_loads) > 0 else 0.0
+
+    loss = max(cv, gini)
+    _dbg("LB_LOSS", f"CV={cv:.4f}, Gini={gini:.4f}, loss={loss:.4f}")
+    return loss
     return cv
 
 

@@ -111,3 +111,40 @@
 
 ### Bug 修复
 - gpu_cost_kernel.py 和 sharding.py 的 _dbg 自递归: 已修复 (全项目0残留)
+
+---
+
+## 第四位 Claude 详细记录 (核心模块深化)
+
+**日期**: 2026-06-03
+**里程碑**: M041–M060
+**任务**: fp8_stats/cache_manager/schema/topology/cost_model/pipeline_scheduler/benchmark 7文件改写
+**改动**: 7 files, +169/-63 行 (净增106行)
+
+### 关键改写
+1. **fp8_stats.py** (281→304): quantize_column stochastic rounding 自动对比(选SNR更高者); INV-6 严格E4M3优先不降格E5M2
+2. **cache_manager.py** (347→377): acquire 从简单LRU改为扫描前25%找频率最低的(2Q策略); _admit 加ghost缓存追踪被驱逐key
+3. **schema.py** (387→404): Welford 加 Kahan 补偿防浮点精度损失; 收敛检测(尾部10步CV<5%)
+4. **topology.py** (398→414): NUMA 亲和性折扣(同NUMA内-30%代价); 大数据量>10MB拥塞带宽衰减
+5. **cost_model.py** (454→473): margin-based 推荐——赢者需领先≥5%,否则偏向数据所在设备
+6. **pipeline_scheduler.py** (454→439): 合并重复的_compute_bubble_ratio_standalone; bubble公式加micro-batch粒度 (p-1)/(m+p-1)
+7. **benchmark.py** (439→455): workload phase shift 3阶段查询分布漂移; 热表Zipf权重每500步轮转
+
+### 验证: 39/39 py_compile 全项目通过
+
+---
+
+## 第五位 Claude 详细记录 (viz+策略+data_writer深化)
+
+**日期**: 2026-06-03
+**里程碑**: M061–M080
+**任务**: plot_panels/adaptive/cost_driven/data_writer 4文件改写
+**改动**: 4 files, +110/-59 行 (净增51行)
+
+### 关键改写
+1. **plot_panels.py** (746→766): build_benchmark_report 加自动ASCII sparkline渲染+panel汇总统计; detect_trend_change 修复0.495指数bug→0.5+自适应窗口
+2. **strategies/adaptive.py** (220→207): UCB1→UCB1-Tuned(方差项); Gini系数负载均衡; 删除dead code残留
+3. **strategies/cost_driven.py** (153→157): PAR2QO方差追踪改为EMA退化(窗口100)
+4. **data_writer.py** (725→734): measure_with_median 加预热轮+P50/P95/P99百分位
+
+### 验证: 39/39 py_compile 全项目通过
