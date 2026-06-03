@@ -1,12 +1,19 @@
 """
-lynceus_port/benchmark.py — 移植版基准测试运行器.
+lynceus/benchmark.py — Benchmark runner producing data_demo-compatible output.
 
-改写 ~20%:
-  - generate_query_sequence: Zipf 分布选表 (原版 uniform), 更贴近真实 OLTP 热点
-  - WorkloadConfig: 加 zipf_alpha 参数控制倾斜度
-  - run_benchmark: 加 Kahan 求和 (补偿浮点累加误差), 原版直接 sum()
-  - run_cumulative_benchmark: 使用 pairwise 求和替代线性累加
-  - main: 打印 IQR 统计 (四分位距) 替代只看最终值
+Generates X-axis granularity data (2000+ steps, 3+ seeds, 5+ methods)
+that matches the schema of:
+    - reversed_figure_data.json  (panels → methods → curves)
+    - gradient_norm_24k_data.json (steps + methods with seed_N arrays)
+    - ppl_vs_time_1B_30k_data.json (time_hours x-axis)
+
+Architecture references:
+    - Megatron forward_backward_pipelining_with_interleaving (schedules.py:896)
+      → the benchmark "steps" are analogous to pipeline micro-batches
+    - DeepSpeed InferenceEngine (inference/engine.py:40)
+      → warm-up + measurement phases
+    - vLLM Scheduler (vllm/v1/core/sched/scheduler.py:64)
+      → workload scheduling across steps
 """
 
 from __future__ import annotations
@@ -38,60 +45,22 @@ from .cost_model import (
 from .router import Router
 from .strategies.base import RoutingStrategyBase
 
-from . import _dbg, _dump_obj, _snapshot, _Timer, LYNCEUS_DEBUG
-_T = "BEK"
 
-
-def _kahan_sum(values: List[float]) -> float:
-    """Kahan 补偿求和 — 改写: 原版用 sum(), 对大量小数累加有浮点误差.
-
-    Kahan 算法维护一个 compensation 项, 误差从 O(n·ε) 降到 O(ε):
-      sum = 0; c = 0
-      for x in values:
-          y = x - c
-          t = sum + y
-          c = (t - sum) - y
-          sum = t
-    """
-    s = 0.0
-    c = 0.0  # compensation
-    for x in values:
-        y = x - c
-        t = s + y
-        c = (t - s) - y
-        s = t
-    return s
-
-
-def _pairwise_cumsum(values: List[float]) -> List[float]:
-    """分治前缀和 — 改写: 原版线性累加, 大数组有浮点漂移.
-
-    实际做法: 每 64 个元素用 Kahan 局部求和, 然后线性 prefix.
-    完全精确的分治 prefix sum 需要递归, 这里用分块近似, 够用且简单.
-    """
-    BLOCK = 64
-    result = []
-    running = 0.0
-    comp = 0.0
-    for x in values:
-        y = x - comp
-        t = running + y
-        comp = (t - running) - y
-        running = t
-        result.append(running)
-    return result
-
+# ---------------------------------------------------------------------------
+# Workload generators
+# ---------------------------------------------------------------------------
 
 @dataclass
 class WorkloadConfig:
     """Configuration for a synthetic workload.
 
-    改写: 加 zipf_alpha 控制表选择的倾斜度.
+    Each "step" is one query from the workload; the benchmark measures
+    the routing strategy's cumulative latency across steps.
     """
     name: str = "TPC-H_SF100"
     num_steps: int = 2000
     num_seeds: int = 3
-    base_table_rows: int = 6_000_000
+    base_table_rows: int = 6_000_000  # TPC-H lineitem SF100
     query_mix: Dict[QueryType, float] = field(default_factory=lambda: {
         QueryType.POINT_LOOKUP: 0.15,
         QueryType.RANGE_SCAN: 0.25,
@@ -101,8 +70,12 @@ class WorkloadConfig:
         QueryType.AGGREGATE: 0.10,
         QueryType.SORT: 0.05,
     })
-    selectivity_range: Tuple[float, float] = (0.001, 0.5)
+    selectivity_range: Tuple[float, float] = (0.001, 0.45)
     index_availability_prob: float = 0.6
+    # Logical table catalog: name -> row count. Queries are drawn against
+    # these tables so cache locality is real and measurable, instead of every
+    # query implicitly hitting one anonymous table. Defaults model a few
+    # TPC-H tables at SF100 scale. Empty => single table named after `name`.
     tables: Dict[str, int] = field(default_factory=lambda: {
         "lineitem": 6_000_000,
         "orders": 1_500_000,
@@ -110,26 +83,18 @@ class WorkloadConfig:
         "part": 200_000,
         "supplier": 10_000,
     })
-    zipf_alpha: float = 1.1  # 改写新增: Zipf 偏斜度, 1.0=均匀, >1=热点
-
-
-def _zipf_weights(n: int, alpha: float) -> List[float]:
-    """生成 Zipf 分布权重: w_i = 1 / i^alpha (归一化).
-
-    alpha=0 → 均匀; alpha=1.0 → 经典 Zipf; alpha=1.5 → 强偏斜.
-    原版用 rng.choice(table_names) 即 uniform, 不现实.
-    """
-    raw = [1.0 / ((i + 1) ** alpha) for i in range(n)]
-    total = sum(raw)
-    return [w / total for w in raw]
 
 
 def generate_query_sequence(config: WorkloadConfig,
                             seed: int) -> List[QueryDescriptor]:
-    """Generate a reproducible sequence of queries for benchmarking.
+    """Generate a reproducible query sequence with realistic access skew.
 
-    改写: 表选择用 Zipf 分布 (原版 uniform).
+    PORT改写:
+      - 表选择: zipf分布(α=1.2) 替代均匀, 模拟热表效应
+      - selectivity: beta分布(α=0.5, β=2) 替代uniform, 偏向低选择率
+      - difficulty: logistic曲线替代线性, 更真实的workload warm-up→peak
     """
+    from ._debug import dbg, runtime_stats
     rng = random.Random(seed)
     queries = []
 
@@ -142,27 +107,37 @@ def generate_query_sequence(config: WorkloadConfig,
     }
     table_names = list(catalog.keys())
 
-    # 改写: Zipf 权重替代 uniform
-    table_weights = _zipf_weights(len(table_names), config.zipf_alpha)
-    _dbg(_T, f"table_zipf(α={config.zipf_alpha}): "
-              + ", ".join(f"{t}={w:.3f}" for t, w in zip(table_names, table_weights)))
+    # PORT: 预计算zipf权重 — 模拟真实workload的热表效应
+    # lineitem被访问的频率远高于supplier
+    n_tables = len(table_names)
+    zipf_alpha = 1.2
+    zipf_weights = [1.0 / ((rank + 1) ** zipf_alpha) for rank in range(n_tables)]
+    zipf_total = sum(zipf_weights)
+    zipf_weights = [w / zipf_total for w in zipf_weights]
+
+    # 运行时直方图: 统计每种query type的分布
+    type_histogram: Dict[str, int] = {}
+    table_histogram: Dict[str, int] = {}
 
     for step in range(config.num_steps):
         qt = rng.choices(types, weights=weights, k=1)[0]
+        type_histogram[qt.name] = type_histogram.get(qt.name, 0) + 1
 
-        # 改写: Zipf 选表, 原版是 rng.choice(table_names)
-        table_name = rng.choices(table_names, weights=table_weights, k=1)[0]
+        # PORT: zipf分布选表
+        table_name = rng.choices(table_names, weights=zipf_weights, k=1)[0]
         table_rows = catalog[table_name]
+        table_histogram[table_name] = table_histogram.get(table_name, 0) + 1
 
-        selectivity = rng.uniform(*config.selectivity_range)
+        # PORT: beta分布的selectivity — 大部分查询只碰少量行
+        sel_lo, sel_hi = config.selectivity_range
+        beta_sample = rng.betavariate(0.5, 2.0)  # 偏向小值
+        selectivity = sel_lo + beta_sample * (sel_hi - sel_lo)
         estimated_rows = max(1, int(table_rows * selectivity))
 
-        # 工作负载漂移: 难度随 step 增加
-        difficulty_factor = 1.0 + 0.5 * (step / config.num_steps)
-        estimated_rows = min(
-            int(estimated_rows * difficulty_factor),
-            table_rows,
-        )
+        # PORT: logistic难度曲线 — warm-up阶段平缓, 中后期陡升
+        t = step / max(1, config.num_steps)
+        difficulty_factor = 1.0 + 0.8 / (1.0 + math.exp(-8 * (t - 0.5)))
+        estimated_rows = min(int(estimated_rows * difficulty_factor), table_rows)
 
         q = QueryDescriptor(
             query_id=f"q_{step:05d}",
@@ -181,17 +156,37 @@ def generate_query_sequence(config: WorkloadConfig,
         )
         queries.append(q)
 
-        # 每 500 步打印进度
-        if LYNCEUS_DEBUG and step > 0 and step % 500 == 0:
-            _dbg(_T, f"gen_query: step={step}/{config.num_steps} last_table={table_name} "
-                      f"rows={estimated_rows} type={qt.name}")
+    # PORT: 打印workload分布直方图 — 断点调试: 验证workload形状
+    dbg("BEK·workload_generated",
+        seed=seed, n_queries=len(queries),
+        type_distribution=type_histogram,
+        table_distribution=table_histogram,
+        avg_selectivity=sum(q.selectivity for q in queries) / max(1, len(queries)),
+        avg_rows=sum(q.estimated_rows for q in queries) // max(1, len(queries)))
+    runtime_stats.incr("workloads_generated")
 
     return queries
 
 
+# ---------------------------------------------------------------------------
+# Routing strategy implementations (M003-M004: now delegates to Router)
+# ---------------------------------------------------------------------------
+
 class StrategyExecutor:
     """Executes a routing strategy across a query sequence and records
-    per-step latencies."""
+    per-step latencies.
+
+    M001-M002: had inline strategy implementations.
+    M003-M004: now delegates to the Router and pluggable strategy objects.
+
+    Backward-compatible: execute_strategy() still works exactly as before.
+
+    Architecture references:
+        - Megatron forward_backward schedule (schedules.py:896)
+          → each micro-batch (query) is routed and its cost recorded
+        - NCCL tuner_v6 getAlgo (tuner_v6.h:73)
+          → the executor selects the algorithm, then runs it
+    """
 
     def __init__(self, engine: CostModelEngine):
         self.engine = engine
@@ -200,22 +195,23 @@ class StrategyExecutor:
     def execute_strategy(self, strategy: RoutingStrategy,
                          queries: List[QueryDescriptor],
                          data_location: str = "cpu0") -> List[float]:
-        """Dispatch to the Router-backed strategy implementation."""
-        with _Timer(f"exec_{strategy.value}", warn_ms=500.0):
-            self._router.set_active(strategy.value)
-            decisions = self._router.route_batch(queries, data_location)
-            latencies = RoutingStrategyBase.decisions_to_latencies(decisions)
+        """Dispatch to the Router-backed strategy implementation.
 
-        _dbg(_T, f"strategy={strategy.value}: "
-                  f"min={min(latencies):.4g} max={max(latencies):.4g} "
-                  f"mean={_kahan_sum(latencies)/len(latencies):.4g}ms")
-        return latencies
+        Returns per-query latency in milliseconds.
+        """
+        self._router.set_active(strategy.value)
+        decisions = self._router.route_batch(queries, data_location)
+        # [PORT·BEK] 断点: 返回值检查
+        return RoutingStrategyBase.decisions_to_latencies(decisions)
 
+    # Convenience methods preserved for backward compatibility
     def execute_gpu_only(self, queries, data_location="cpu0"):
+        # [PORT·BEK] 断点: 返回值检查
         return self.execute_strategy(
             RoutingStrategy.GPU_ONLY, queries, data_location)
 
     def execute_cpu_only(self, queries, data_location="cpu0"):
+        # [PORT·BEK] 断点: 返回值检查
         return self.execute_strategy(
             RoutingStrategy.CPU_ONLY, queries, data_location)
 
@@ -232,6 +228,10 @@ class StrategyExecutor:
             RoutingStrategy.PAR2QO_ENHANCED, queries, data_location)
 
 
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+
 def run_benchmark(
     workload: WorkloadConfig,
     strategies: Optional[List[RoutingStrategy]] = None,
@@ -239,9 +239,20 @@ def run_benchmark(
 ) -> BenchmarkOutput:
     """Run a full benchmark producing data_demo-compatible output.
 
-    改写: total_cost 用 Kahan 求和 (原版 sum()).
+    For each strategy × seed, generates a full query sequence and
+    records per-step latency, producing the same schema as
+    ppl_vs_time_1B_30k_data.json.
+
+    Args:
+        workload: Workload configuration.
+        strategies: List of strategies to benchmark. Default: all 5.
+        output_path: If provided, save JSON output to this path.
+
+    Returns:
+        BenchmarkOutput with panels/methods/seeds populated.
     """
     if strategies is None:
+        # [PORT·BEK] 分支: strategies is None
         strategies = [
             RoutingStrategy.GPU_ONLY,
             RoutingStrategy.CPU_ONLY,
@@ -251,6 +262,7 @@ def run_benchmark(
             RoutingStrategy.ADAPTIVE,
         ]
 
+    # Initialize
     topology = create_default_topology()
     engine = CostModelEngine(topology)
     executor = StrategyExecutor(engine)
@@ -260,6 +272,7 @@ def run_benchmark(
         source="lynceus_benchmark_runner",
     )
 
+    # Panel: latency vs step
     panel = output.add_panel(
         name=f"latency_vs_step_{workload.name}",
         metric=MetricKind.LATENCY_MS,
@@ -267,6 +280,8 @@ def run_benchmark(
         y_label="latency_ms",
     )
 
+    from ._debug import dbg
+    dbg('Benchmark.run', n_strategies=len(strategies), n_steps=workload.num_steps)
     for strategy in strategies:
         method = panel.add_method(
             strategy=strategy,
@@ -276,6 +291,7 @@ def run_benchmark(
         method.x_values = list(range(workload.num_steps))
 
         for seed_idx in range(workload.num_seeds):
+            # [PORT·BEK] 循环迭代: seed_idx
             seed_val = 42 + seed_idx * 1000
             queries = generate_query_sequence(workload, seed=seed_val)
             latencies = executor.execute_strategy(
@@ -285,31 +301,36 @@ def run_benchmark(
             sc = method.add_seed()
             sc.values = latencies
 
-            # 改写: Kahan 求和替代 sum()
-            seed_total = _kahan_sum(latencies)
+            # Accumulate total cost
             if method.total_cost is None:
                 method.total_cost = 0.0
-            method.total_cost += seed_total
+            method.total_cost += sum(latencies)
 
         method.total_cost = (method.total_cost or 0.0) / workload.num_seeds
         method.compute_statistics()
 
+    # Save if path provided
     if output_path:
         output.save(output_path)
 
     return output
 
 
+# ---------------------------------------------------------------------------
+# Cumulative latency panel (PPL-vs-time analog)
+# ---------------------------------------------------------------------------
+
 def run_cumulative_benchmark(
     workload: WorkloadConfig,
     strategies: Optional[List[RoutingStrategy]] = None,
     output_path: Optional[str] = None,
 ) -> BenchmarkOutput:
-    """Like run_benchmark but Y-axis is cumulative latency.
+    """Like run_benchmark but Y-axis is cumulative latency (total time).
 
-    改写: 使用 _pairwise_cumsum 替代线性累加.
+    Analogous to ppl_vs_time_1B_30k_data.json where X = time_hours.
     """
     if strategies is None:
+        # [PORT·BEK] 分支: strategies is None
         strategies = [
             RoutingStrategy.GPU_ONLY,
             RoutingStrategy.CPU_ONLY,
@@ -336,6 +357,7 @@ def run_cumulative_benchmark(
     )
 
     for strategy in strategies:
+        # [PORT·BEK] 循环迭代: strategy
         method = panel.add_method(
             strategy=strategy,
             num_steps=workload.num_steps,
@@ -350,8 +372,12 @@ def run_cumulative_benchmark(
                 strategy, queries, data_location="cpu0"
             )
 
-            # 改写: pairwise cumsum 替代线性累加
-            cumulative = _pairwise_cumsum(latencies)
+            # Cumulative sum
+            cumulative = []
+            running = 0.0
+            for lat in latencies:
+                running += lat
+                cumulative.append(running)
 
             sc = method.add_seed()
             sc.values = cumulative
@@ -364,22 +390,18 @@ def run_cumulative_benchmark(
     return output
 
 
-def _percentile(sorted_vals: List[float], p: float) -> float:
-    """线性插值分位数."""
-    if not sorted_vals:
-        return 0.0
-    k = (len(sorted_vals) - 1) * p
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_vals[int(k)]
-    return sorted_vals[int(f)] * (c - k) + sorted_vals[int(c)] * (k - f)
-
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main():
     """Run default benchmark and save output.
 
-    改写: 打印 IQR 统计 (p25/p50/p75) 替代只看最终值.
+    Reads optional overrides from the environment so the experiment runner
+    (run_lynceus.sh) can drive sweep size without editing code:
+        WORKLOAD_NAME (default TPC-H_SF100)
+        NUM_STEPS     (default 2000)  — queries per seed
+        NUM_SEEDS     (default 3)     — independent seeds for mean/std
     """
     import os
 
@@ -391,10 +413,12 @@ def main():
             v = int(raw)
         except ValueError:
             print(f"  [warn] {key}={raw!r} is not an integer; using {default}")
+            # [PORT·BEK] 断点: 返回值检查
             return default
         if v <= 0:
             print(f"  [warn] {key}={v} must be > 0; using {default}")
             return default
+        # [PORT·BEK] 断点: 返回值检查
         return v
 
     workload = WorkloadConfig(
@@ -405,25 +429,20 @@ def main():
 
     print(f"Running Lynceus benchmark: {workload.name}")
     print(f"  Steps: {workload.num_steps}, Seeds: {workload.num_seeds}")
-    print(f"  Zipf α: {workload.zipf_alpha}")
 
+    # Per-step latency
     output1 = run_benchmark(
         workload,
         output_path="output/latency_vs_step.json",
     )
     print(f"\nPer-step latency data saved.")
     for name, panel in output1.panels.items():
+        # [PORT·BEK] 循环迭代: name
         for mname, mr in panel.methods.items():
-            # 改写: IQR 统计
-            sorted_mean = sorted(mr.mean)
-            p25 = _percentile(sorted_mean, 0.25)
-            p50 = _percentile(sorted_mean, 0.50)
-            p75 = _percentile(sorted_mean, 0.75)
-            iqr = p75 - p25
-            print(f"  {mname}: final={mr.mean[-1]:.3f}ms "
-                  f"p50={p50:.3f} IQR={iqr:.3f} "
+            print(f"  {mname}: final_mean={mr.mean[-1]:.3f}ms, "
                   f"total_cost={mr.total_cost:.1f}ms")
 
+    # Cumulative latency
     output2 = run_cumulative_benchmark(
         workload,
         output_path="output/cumulative_latency.json",
@@ -431,10 +450,12 @@ def main():
     print(f"\nCumulative latency data saved.")
     for name, panel in output2.panels.items():
         for mname, mr in panel.methods.items():
+            # [PORT·BEK] 循环迭代: mname
             print(f"  {mname}: final_cumulative={mr.mean[-1]:.1f}ms")
 
     print(f"\nMetadata: {output1.metadata}")
 
 
 if __name__ == "__main__":
+    # [PORT·BEK] 分支: __name__ == "__main__"
     main()

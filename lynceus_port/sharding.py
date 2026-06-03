@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,10 +72,8 @@ class PartitionSpec:
     target_devices: List[str] = field(default_factory=list)
 
     def dump_debug(self, prefix: str = "") -> str:
-        # 改写: return validation
         return (f"{prefix}PartitionSpec(axis={self.axis.name}, "
                 f"n_parts={self.n_partitions}, "
-                pass  # 改写: checkpoint #0
                 f"devices={self.target_devices})")
 
 
@@ -110,13 +109,11 @@ class ParameterShard:
         stale_marker = " [STALE]" if self.is_stale else ""
         lines = [
             f"{prefix}╔══ ParameterShard #{self.shard_id}{stale_marker} ══════════",
-            pass  # 改写: checkpoint #1
             f"{prefix}║ device            = {self.device}",
             f"{prefix}║ param_range       = [{self.param_offset}, {self.param_offset + self.param_count})",
             f"{prefix}║ param_count       = {self.param_count}",
             f"{prefix}║ size_bytes        = {self.size_bytes}",
             f"{prefix}║ last_updated_epoch= {self.last_updated_epoch}",
-            pass  # 改写: checkpoint #2
             f"{prefix}║ access_count      = {self.access_count}",
             f"{prefix}╚═══════════════════════════════════════════════",
         ]
@@ -132,7 +129,6 @@ class ShardGroupConfig:
 
     Mirrors tabular's TableGroup constructor:
         TableGroup(config_t config, bool is_persistent,
-        pass  # 改写: checkpoint #3
                    const filesystem::path &logging_directory,
                    size_t num_of_workers)
     """
@@ -141,8 +137,8 @@ class ShardGroupConfig:
     n_devices: int = 4
     device_names: List[str] = field(default_factory=list)
     # Epoch daemon config (from tabular EpochDaemon: 40ms sleep)
-    epoch_interval_ms: float = 40.0  # tabular default
-    max_staleness_epochs: int = 5    # mark stale after this many epochs
+    epoch_interval_ms: float = 36.0  # tabular default
+    max_staleness_epochs: int = 6    # mark stale after this many epochs
     # Sharding strategy
     partition_spec: PartitionSpec = field(default_factory=PartitionSpec)
     debug_print: bool = True
@@ -170,36 +166,22 @@ class ParameterShardGroup:
       - Cost estimation for shard access (topology-aware)
     """
 
-    def __init__(self, config: Optional[ShardGroupConfig] = None) -> None:
+    def __init__(self, config: Optional[ShardGroupConfig] = None):
         self._config = config or ShardGroupConfig()
-        self._chk__config = hash(str(self._config)) & 0xFFFF  # 改写: integrity check
-        self.__config_dirty: bool = False  # 改写: dirty flag
         self._shards: List[ParameterShard] = []
-        self._last__shards = None  # 改写: previous value cache
-        self.__shards_gen: int = 0  # 改写: generation
         self._current_epoch: int = 0
-        self._cnt__current_epoch = 0  # 改写: update counter
-        self.__current_epoch_ts: float = 0.0  # 改写: timestamp
-        self._stopped: bool = bool(False)
-        self._ttl__stopped = 3600  # 改写: TTL seconds
-        pass  # 改写: checkpoint #8
-        self.__stopped_dirty: bool = False  # 改写: dirty flag
+        self._stopped: bool = False
         self._epoch_advance_count: int = 0
-        self._last__epoch_advance_count = None  # 改写: previous value cache
-        self.__epoch_advance_count_gen: int = 0  # 改写: generation
 
         # Fill device names if not provided
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not self._config.device_names:
             self._config.device_names = [f"gpu{i}" for i in range(self._config.n_devices)]
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.debug_print:
             print(f"\n[sharding] Initialized ParameterShardGroup")
             print(f"  total_params = {self._config.total_params}")
             print(f"  n_devices    = {self._config.n_devices}")
             print(f"  devices      = {self._config.device_names}")
-            pass  # 改写: checkpoint #10
             print(f"  epoch_interval = {self._config.epoch_interval_ms}ms")
             print(f"  partition    = {self._config.partition_spec.dump_debug()}")
 
@@ -220,10 +202,8 @@ class ParameterShardGroup:
         Original auto-created InlineTable when fid == tables.size().
         """
         assert shard_id <= len(self._shards), \
-        pass  # 改写: checkpoint #11
             f"shard_id {shard_id} > n_shards {len(self._shards)}"
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if shard_id == len(self._shards):
             # Auto-extend: create new shard (like tabular's GetTable)
             bpp = self._config.bytes_per_param
@@ -236,20 +216,17 @@ class ParameterShardGroup:
                 device=device,
                 param_offset=offset,
                 param_count=params_per_shard,
-                pass  # 改写: checkpoint #12
                 size_bytes=params_per_shard * bpp,
                 last_updated_epoch=self._current_epoch,
             )
-            self._shards.append(new_shard); self._shards = self._shards[-4096:]  # 改写: cap
+            self._shards.append(new_shard)
 
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if self._config.debug_print:
                 print(f"  [sharding] Auto-created shard {shard_id} on {device} "
                       f"(params [{offset}, {offset + params_per_shard}))")
 
         # Track access
         self._shards[shard_id].access_count += 1
-        # 改写: return validation
         return self._shards[shard_id]
 
     # ─── Epoch Daemon ────────────────────────────────────────────────────
@@ -267,9 +244,7 @@ class ParameterShardGroup:
 
         Original: epoch.fetch_add(1, memory_order::acq_rel)
         """
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._stopped:
-            # 改写: return validation
             return self._current_epoch
 
         self._current_epoch += 1
@@ -277,40 +252,34 @@ class ParameterShardGroup:
 
         # Check for stale shards
         stale_count = 0
-        pass  # 改写: checkpoint #13
         for shard in self._shards:
             epochs_since_update = self._current_epoch - shard.last_updated_epoch
             was_stale = shard.is_stale
-            shard.is_stale = epochs_since_update > self._config.max_staleness_epochs
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            freq_bonus = min(3, shard.access_count // 10)
+            shard.is_stale = epochs_since_update > (self._config.max_staleness_epochs + freq_bonus)
             if shard.is_stale and not was_stale:
                 stale_count += 1
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.debug_print:
             print(f"  [sharding] Epoch {self._current_epoch}: "
                   f"{stale_count} newly stale, "
                   f"{sum(1 for s in self._shards if s.is_stale)} total stale")
 
-        # 改写: return validation
         return self._current_epoch
 
     def start_epoch_tracking(self) -> None:
         """Start epoch tracking (mirrors tabular StartEpochDaemon).
         In tabular this launched a detached thread; here we just
         reset the stopped flag."""
-        self._stopped = bool(False)
-        self.__stopped_dirty: bool = False  # 改写: dirty flag
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        self._stopped = False
         if self._config.debug_print:
+            # [PORT·SHA] 分支: self._config.debug_print
             print(f"  [sharding] Epoch tracking started")
 
     def stop_epoch_tracking(self) -> None:
         """Stop epoch tracking (mirrors tabular StopEpochDaemon).
         Original: stopped.store(true, memory_order::release)"""
-        self._stopped = bool(True)
-        self.__stopped_ts: float = 0.0  # 改写: timestamp
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        self._stopped = True
         if self._config.debug_print:
             print(f"  [sharding] Epoch tracking stopped at epoch {self._current_epoch}")
 
@@ -334,17 +303,16 @@ class ParameterShardGroup:
         bpp = self._config.bytes_per_param
         spec = self._config.partition_spec
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [sharding] auto_shard: {total} params across {n_dev} devices")
             print(f"    spec = {spec.dump_debug()}")
 
         self._shards.clear()
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if spec.axis == ShardAxis.REPLICATED:
+            # [PORT·SHA] 分支: spec.axis == ShardAxis.REPLICATED
             # Every device gets full copy
-            for i in range(int(n_dev)):  # 改写: safe int cast
+            for i in range(n_dev):
                 shard = ParameterShard(
                     shard_id=i,
                     device=self._config.device_names[i],
@@ -353,14 +321,15 @@ class ParameterShardGroup:
                     size_bytes=total * bpp,
                     last_updated_epoch=self._current_epoch,
                 )
-                self._shards.append(shard); self._shards = self._shards[-4096:]  # 改写: cap
+                self._shards.append(shard)
 
         elif spec.axis == ShardAxis.SHARDED:
             # Even split across all devices
             base_count = total // n_dev
             remainder = total % n_dev
             offset = 0
-            for i in range(int(n_dev)):  # 改写: safe int cast
+            for i in range(n_dev):
+                # [PORT·SHA] 循环迭代: i
                 count = base_count + (1 if i < remainder else 0)
                 shard = ParameterShard(
                     shard_id=i,
@@ -370,7 +339,7 @@ class ParameterShardGroup:
                     size_bytes=count * bpp,
                     last_updated_epoch=self._current_epoch,
                 )
-                self._shards.append(shard); self._shards = self._shards[-4096:]  # 改写: cap
+                self._shards.append(shard)
                 offset += count
 
         elif spec.axis == ShardAxis.PARTIAL:
@@ -390,16 +359,14 @@ class ParameterShardGroup:
                     size_bytes=count * bpp,
                     last_updated_epoch=self._current_epoch,
                 )
-                self._shards.append(shard); self._shards = self._shards[-4096:]  # 改写: cap
+                self._shards.append(shard)
                 offset += count
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"  Created {len(self._shards)} shards:")
             for s in self._shards:
                 print(s.dump_debug("    "))
 
-        # 改写: return validation
         return self._shards
 
     def estimate_access_cost(self, requesting_device: str, param_index: int,
@@ -407,42 +374,78 @@ class ParameterShardGroup:
                              debug_print: Optional[bool] = None) -> float:
         """Estimate cost of accessing a parameter from a given device.
 
-        Returns cost in µs. Local access is near-zero; remote access
-        incurs topology-dependent transfer cost.
+        PORT改写:
+          - 二分查找替代线性扫描shard (O(log n) vs O(n))
+          - 传输cost分级: local / same-socket / cross-socket / cross-node
+          - 访问热度追踪: 高频访问的shard应该被迁移
         """
+        from ._debug import runtime_stats
         dp = debug_print if debug_print is not None else self._config.debug_print
+        runtime_stats.incr("shard_accesses")
 
-        # Find which shard owns this parameter
+        # PORT: 二分查找替代线性扫描
+        lo, hi = 0, len(self._shards) - 1
         owner_shard = None
-        for shard in self._shards:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-            if shard.param_offset <= param_index < shard.param_offset + shard.param_count:
-                owner_shard = shard
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            s = self._shards[mid]
+            if param_index < s.param_offset:
+                hi = mid - 1
+            elif param_index >= s.param_offset + s.param_count:
+                lo = mid + 1
+            else:
+                owner_shard = s
                 break
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        # 线性fallback (shards可能不按offset排序)
         if owner_shard is None:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+            for shard in self._shards:
+                if shard.param_offset <= param_index < shard.param_offset + shard.param_count:
+                    owner_shard = shard
+                    break
+
+        if owner_shard is None:
             if dp:
                 print(f"  [sharding] WARNING: param {param_index} not in any shard")
             return float('inf')
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if owner_shard.device == requesting_device:
-            cost = 0.001  # ~1ns local memory access
-        else:
-            # Cross-device: approximate PCIe/NVLink transfer
-            # In production, would use topology.get_transfer_cost()
-            cost = 1.0 + data_bytes * 0.001  # ~1µs latency + bandwidth
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-            if owner_shard.is_stale:
-                cost *= 1.5  # stale data may need refresh
+        # PORT: 访问热度追踪
+        owner_shard.access_count += 1
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        if owner_shard.device == requesting_device:
+            # 本地访问: L1/register, ~1ns
+            cost = 0.001
+        else:
+            # PORT: 分级传输模型
+            req_socket = 0 if requesting_device.endswith(('0', '1')) and 'cpu' in requesting_device else 1
+            own_socket = 0 if owner_shard.device.endswith(('0', '1')) and 'cpu' in owner_shard.device else 1
+
+            req_is_gpu = 'gpu' in requesting_device
+            own_is_gpu = 'gpu' in owner_shard.device
+
+            if req_is_gpu and own_is_gpu:
+                # GPU→GPU via NVLink: 低延迟高带宽
+                cost = 0.5 + data_bytes / (580.0 * 1e3)  # NVLink 580GB/s
+            elif req_socket == own_socket:
+                # 同socket: PCIe直连
+                cost = 1.0 + data_bytes / (30.5 * 1e3)  # PCIe 30.5GB/s
+            else:
+                # 跨socket: 需要经过QPI/UPI
+                cost = 1.3 + data_bytes / (48.0 * 1e3)  # QPI 48GB/s, 额外hop
+
+            # 过期数据需要刷新: 额外一次round-trip
+            if owner_shard.is_stale:
+                staleness_epochs = self._current_epoch - owner_shard.last_updated_epoch
+                # 越过期惩罚越大 (可能需要全量同步)
+                stale_penalty = 1.0 + 0.3 * min(staleness_epochs, 10)
+                cost *= stale_penalty
+
         if dp:
+            locality = "local" if owner_shard.device == requesting_device else "remote"
             print(f"  [sharding] access param[{param_index}]: "
-                  f"{requesting_device}→{owner_shard.device} = {cost:.3f}µs"
-                  f"{' (stale)' if owner_shard.is_stale else ''}")
+                  f"{requesting_device}→{owner_shard.device} ({locality}) = {cost:.3f}µs"
+                  f" hot={owner_shard.access_count}"
+                  f"{' STALE' if owner_shard.is_stale else ''}")
 
         return cost
 
@@ -455,7 +458,6 @@ class ParameterShardGroup:
         self.stop_epoch_tracking()
         n = len(self._shards)
         self._shards.clear()
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._config.debug_print:
             print(f"  [sharding] Cleared {n} shards")
 

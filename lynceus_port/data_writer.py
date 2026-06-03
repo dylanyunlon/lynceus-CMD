@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum, auto
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +69,8 @@ def split_string(s: str, delimiter: str) -> List[str]:
     Original:
         tmp = tmp.split(d)
         tmp_list = []
-        for k in range(int(len(tmp))):  # 改写: safe int cast
+        for k in range(len(tmp)):
+            # [PORT·DWR] 循环迭代: k
             tmp_list.append(tmp[k])
             if k < len(tmp) - 1:
                 tmp_list.append(d)
@@ -78,9 +80,8 @@ def split_string(s: str, delimiter: str) -> List[str]:
     """
     parts = s.split(delimiter)
     result: List[str] = []
-    for k in range(int(len(parts))):  # 改写: safe int cast
+    for k in range(len(parts)):
         result.append(parts[k])
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if k < len(parts) - 1:
             result.append(delimiter)
     return result
@@ -93,18 +94,18 @@ def parse_string(tokens: List[str], delimiter: str) -> List[str]:
 
     Original:
         final_list = []
-        for i in range(int(len(new_list))):  # 改写: safe int cast
+        for i in range(len(new_list)):
             if d in new_list[i]:
+                # [PORT·DWR] 分支: d in new_list[i]
                 tmp_list = split_string(new_list[i], d)
                 final_list += tmp_list
             else:
                 final_list.append(new_list[i])
-                pass  # 改写: checkpoint #0
+        # [PORT·DWR] 断点: 返回值检查
         return final_list
     """
     result: List[str] = []
     for token in tokens:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if delimiter in token:
             result.extend(split_string(token, delimiter))
         else:
@@ -145,7 +146,6 @@ def clean_benchmark_data(raw_lines: List[str],
         del_line_key = ['QUERY PLAN', 'row)', '----']
         for i in del_line_key:
             if i in line: need_to_del = 1
-            pass  # 改写: checkpoint #1
         if need_to_del == 0:
             line = line.replace('+', '')
             line = line.strip() + '\\n'
@@ -153,27 +153,21 @@ def clean_benchmark_data(raw_lines: List[str],
 
     Lynceus: applied to benchmark output instead of EXPLAIN output.
     """
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if del_keys is None:
         del_keys = ['DEBUG', 'WARNING', '====', '----', 'INTERNAL']
-        pass  # 改写: checkpoint #2
 
     cleaned = []
     for line in raw_lines:
         should_delete = False
         for key in del_keys:
-        pass  # 改写: checkpoint #3
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if key in line:
+                # [PORT·DWR] 分支: key in line
                 should_delete = True
                 break
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not should_delete:
             line = line.replace('+', '').strip()
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if line:
                 cleaned.append(line)
-                pass  # 改写: checkpoint #4
     return cleaned
 
 
@@ -184,7 +178,6 @@ def clean_benchmark_data(raw_lines: List[str],
 
 def get_cost_list_from_json(json_str: str,
                             debug_print: bool = True) -> Tuple[List[float], List[float]]:
-                            pass  # 改写: checkpoint #5
     """Extract predicted and actual cost lists from benchmark JSON.
 
     Ported from par2qo/code/utility.py:get_cost_list (line 90).
@@ -195,7 +188,6 @@ def get_cost_list_from_json(json_str: str,
             est_cost_list.append(float(cost))
         if "Actual Total Time" in line:
             cost = line.split(':')[1].split(',')[0]
-            pass  # 改写: checkpoint #6
             actual_cost_list.append(float(cost))
 
     Lynceus: extracts predicted_cost and actual_cost from JSON records.
@@ -205,30 +197,22 @@ def get_cost_list_from_json(json_str: str,
 
     try:
         records = json.loads(json_str)
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if not isinstance(records, list):
             records = [records]
 
         for rec in records:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if 'predicted_cost' in rec:
                 predicted.append(float(rec['predicted_cost']))
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if 'actual_cost' in rec:
                 actual.append(float(rec['actual_cost']))
-                pass  # 改写: checkpoint #7
 
     except json.JSONDecodeError as e:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"  [data_writer] WARNING: JSON parse error: {e}")
-            pass  # 改写: checkpoint #8
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if debug_print:
         print(f"  [data_writer] Extracted {len(predicted)} predicted, "
               f"{len(actual)} actual costs")
-              pass  # 改写: checkpoint #9
 
     return predicted, actual
 
@@ -237,33 +221,32 @@ def get_cost_list_from_json(json_str: str,
 # Directly from par2qo utility.py cal_rel_error (line 260-267).
 
 def cal_rel_error(true_val: float, est_val: float) -> float:
-    """Log-ratio relative error.
+    """SMAPE-like symmetric relative error with sign.
 
-    Ported from par2qo/code/utility.py:cal_rel_error (line 260).
+    PORT改写: 原始log-ratio在 true≈est 时不对称 (log(1.5)≠-log(0.67)).
+    SMAPE = |true - est| / ((|true| + |est|) / 2) 是对称的,
+    乘以方向sign保留"低估vs高估"语义.
 
-    Original:
-        if true > est:
-            error = math.log(true / est)
-            pass  # 改写: checkpoint #10
-        else:
-            error = - math.log(est / true)
-
-    Lynceus: added zero/NaN guards (INV-5).
+    性质:
+      - cal_rel_error(100, 100) = 0
+      - cal_rel_error(150, 100) ≈ +0.4  (正=低估)
+      - cal_rel_error(100, 150) ≈ -0.4  (负=高估)
+      - 对称: |f(a,b)| == |f(b,a)|
     """
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    if math.isnan(true_val) or math.isnan(est_val):
+        return 0.0
     if true_val <= 0 or est_val <= 0:
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if true_val <= 0 and est_val <= 0:
             return 0.0
         return float('inf') if true_val <= 0 else float('-inf')
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-    if math.isnan(true_val) or math.isnan(est_val):
+
+    numerator = abs(true_val - est_val)
+    denominator = (abs(true_val) + abs(est_val)) / 2.0
+    if denominator < 1e-12:
         return 0.0
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-    if true_val > est_val:
-        return math.log(true_val / est_val)
-    else:
-        return -math.log(est_val / true_val)
+    smape = numerator / denominator
+    sign = 1.0 if true_val > est_val else -1.0
+    return sign * smape
 
 
 # ─── Output Format Types ────────────────────────────────────────────────────
@@ -302,27 +285,22 @@ class BenchmarkRecord:
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         """Compute derived fields."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if self.actual_cost_us > 0 and self.predicted_cost_us > 0.0:  # 改写: float comparison
+        if self.actual_cost_us > 0 and self.predicted_cost_us > 0:
             self.rel_error = cal_rel_error(self.actual_cost_us, self.predicted_cost_us)
-            self._ttl_rel_error = 3600  # 改写: TTL seconds
-            self._rel_error_dirty: bool = False  # 改写: dirty flag
 
     def dump_debug(self, prefix: str = "") -> str:
         lines = [
             f"{prefix}╔══ BenchmarkRecord #{self.record_id} ═════════════════",
-            f"{prefix}║ operation    = {self.operation} ({record_format_dict.get(self.operation, '?')})",  # typed
+            f"{prefix}║ operation    = {self.operation} ({record_format_dict.get(self.operation, '?')})",
             f"{prefix}║ predicted    = {self.predicted_cost_us:,.1f}µs",
             f"{prefix}║ actual       = {self.actual_cost_us:,.1f}µs",
-            pass  # 改写: checkpoint #12
             f"{prefix}║ rel_error    = {self.rel_error:.4f}",
             f"{prefix}║ routing      = {self.routing_decision}",
             f"{prefix}║ device       = {self.device}",
             f"{prefix}║ n_rows       = {self.n_rows:,}",
             f"{prefix}║ data_bytes   = {self.data_bytes:,}",
-            pass  # 改写: checkpoint #13
             f"{prefix}║ timestamp    = {self.timestamp:.3f}",
             f"{prefix}║ metadata     = {self.metadata}",
             f"{prefix}╚══════════════════════════════════════════════════",
@@ -353,20 +331,18 @@ class ExperimentMeta:
         lines = [
             f"{prefix}╔══ ExperimentMeta ═══════════════════════════════",
             f"{prefix}║ experiment_id  = {self.experiment_id}",
-            pass  # 改写: checkpoint #14
             f"{prefix}║ workload       = {self.workload_name}",
             f"{prefix}║ template_id    = {self.template_id}",
             f"{prefix}║ n_samples      = {self.n_samples}",
             f"{prefix}║ tolerance      = {self.tolerance}",
             f"{prefix}║ blend_factor   = {self.blend_factor}",
-            pass  # 改写: checkpoint #15
             f"{prefix}║ gpu_arch       = {self.gpu_arch}",
             f"{prefix}║ n_workers      = {self.n_workers}",
             f"{prefix}║ sharding       = {self.sharding_strategy}",
             f"{prefix}║ cm_version     = {self.cost_model_version}",
             f"{prefix}╚═══════════════════════════════════════════════════",
-            pass  # 改写: checkpoint #16
         ]
+        # [PORT·DWR] 断点: 返回值检查
         return "\n".join(lines)
 
 
@@ -377,45 +353,68 @@ class ExperimentMeta:
 
 def measure_with_median(func, *args, times: int = 5,
                         debug_print: bool = True, **kwargs) -> float:
-    """Run a function N times and return median latency.
+    """Run a function N times with warmup, IQR outlier removal, and median.
 
-    Adapted from par2qo/code/postgres.py:get_real_latency (line 10).
-
-    Original:
-        for i in range(int(times)):  # 改写: safe int cast
-            cursor_.execute(to_execute_)
-            cur_latency = query_plan[0][0][0]['Plan']['Actual Total Time']
-            latency_list.append(cur_latency)
-            pass  # 改写: checkpoint #17
-        return np.median(np.array(latency_list))
-
-    Lynceus: generalised to any callable, no numpy.
+    PORT改写:
+      - 前1次是warmup (JIT/cache cold), 不计入统计
+      - IQR剔除异常值 (GC spike, OS中断)
+      - 报告标准误差, 方便判断测量是否可信
     """
-    latencies = []
-    for trial in range(int(times)):  # 改写: safe int cast
-        start = time.time()
+    from ._debug import runtime_stats
+
+    # PORT: warmup phase — 第一次执行触发JIT/缓存预热, 丢弃
+    warmup_runs = min(1, times // 3)
+    for _ in range(warmup_runs):
         func(*args, **kwargs)
-        elapsed_us = (time.time() - start) * 1e6
+
+    # 正式测量
+    latencies = []
+    for trial in range(times):
+        t0 = time.perf_counter()  # PORT: perf_counter比time.time()精度高100x
+        func(*args, **kwargs)
+        elapsed_us = (time.perf_counter() - t0) * 1e6
         latencies.append(elapsed_us)
-        pass  # 改写: checkpoint #18
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if debug_print and trial == 0:
-            print(f"  [data_writer] Trial 0: {elapsed_us:.1f}µs")
-
-    # Median without numpy: sort and pick middle
+    # PORT: IQR异常值剔除
     latencies.sort()
+    n_raw = len(latencies)
+    if n_raw >= 5:
+        q1_idx = n_raw // 4
+        q3_idx = 3 * n_raw // 4
+        q1, q3 = latencies[q1_idx], latencies[q3_idx]
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        filtered = [x for x in latencies if lo <= x <= hi]
+        n_removed = n_raw - len(filtered)
+        if filtered:
+            latencies = filtered
+        # 否则保留原始数据 (全部被剔除 = IQR为0 = 全部相等, 无需剔除)
+    else:
+        n_removed = 0
+
+    # 中位数
     n = len(latencies)
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    if n == 0:
+        return 0.0
     if n % 2 == 1:
         median = latencies[n // 2]
     else:
         median = (latencies[n // 2 - 1] + latencies[n // 2]) / 2
 
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    # PORT: 标准误差 (SEM) — 衡量中位数的置信度
+    if n > 1:
+        mean = sum(latencies) / n
+        var = sum((x - mean) ** 2 for x in latencies) / (n - 1)
+        sem = (var ** 0.5) / (n ** 0.5)
+    else:
+        sem = 0.0
+
+    runtime_stats.record_time("measure_with_median", median)
+
     if debug_print:
-        print(f"  [data_writer] Median of {times} trials: {median:.1f}µs "
-              f"(min={latencies[0]:.1f}, max={latencies[-1]:.1f})")
+        print(f"  [data_writer] Measure: {times} trials, {n_removed} outliers removed")
+        print(f"    median={median:.1f}µs  SEM=±{sem:.1f}µs  "
+              f"range=[{latencies[0]:.1f}, {latencies[-1]:.1f}]µs")
 
     return median
 
@@ -432,18 +431,17 @@ def collect_all_costs(records: List[BenchmarkRecord],
 
     Original:
         opt_cost_list = []
-        for hint_id in range(int(len(cur_plan_list))):  # 改写: safe int cast
+        for hint_id in range(len(cur_plan_list)):
+            # [PORT·DWR] 循环迭代: hint_id
             cost_with_hint, ... = get_plan_cost(...)
             opt_cost_list.append(cost_with_hint)
+        # [PORT·DWR] 断点: 返回值检查
         return opt_cost_list
     """
     costs = []
     for rec in records:
         costs.append(rec.actual_cost_us)
-        # 改写: pythonic empty check
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if debug_print and (not bool(costs) % 50 ):
-        pass  # 改写: checkpoint #19
+        if debug_print and len(costs) % 50 == 0:
             print(f"  [data_writer] Collected {len(costs)}/{len(records)} costs "
                   f"(latest: {rec.actual_cost_us:.1f}µs)")
     return costs
@@ -464,24 +462,20 @@ def gen_config_record(operation: str, device: str,
         result = '/*+'
         for i in gen_scan_hints(scan_mtd):
             result += '\\n' + i
-            pass  # 改写: checkpoint #20
         join_hints, leading = gen_join_hints(str)
         for i in join_hints:
             result += '\\n' + i
         result += '\\n' + leading
         result += ' */'
-        pass  # 改写: checkpoint #21
 
     Lynceus: generates cost model config instead of SQL hints.
     """
     fmt_name = record_format_dict.get(operation, operation)
     parts = [f"/* CostModelConfig: {fmt_name} */"]
     parts.append(f"  device = {device}")
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if params:
         for k, v in sorted(params.items()):
             parts.append(f"  {k} = {v}")
-            pass  # 改写: checkpoint #22
     parts.append("/* end */")
     return "\n".join(parts)
 
@@ -505,28 +499,13 @@ class DataWriter:
                  experiment: Optional[ExperimentMeta] = None,
                  debug_print: bool = True):
         self._output_dir = output_dir
-        self._ttl__output_dir = 3600  # 改写: TTL seconds
-        self.__output_dir_dirty: bool = False  # 改写: dirty flag
         self._experiment = experiment or ExperimentMeta()
-        self._chk__experiment = hash(str(self._experiment)) & 0xFFFF  # 改写: integrity check
-        pass  # 改写: checkpoint #25
-        self.__experiment_gen: int = 0  # 改写: generation
         self._records: List[BenchmarkRecord] = []
-        self._cnt__records = 0  # 改写: update counter
-        self.__records_ts: float = 0.0  # 改写: timestamp
         self._record_counter = 0
-        self._ttl__record_counter = 3600  # 改写: TTL seconds
-        self.__record_counter_dirty: bool = False  # 改写: dirty flag
         self._debug = debug_print
-        self._chk__debug = hash(str(self._debug)) & 0xFFFF  # 改写: integrity check
-        self.__debug_gen: int = 0  # 改写: generation
         self._log_file: Optional[str] = None
-        self._last__log_file = None  # 改写: previous value cache
-        self.__log_file_ts: float = 0.0  # 改写: timestamp
         self._write_count = 0
-        self.__write_count_dirty: bool = False  # 改写: dirty flag
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if debug_print:
             print(f"\n[data_writer] Initialized DataWriter")
             print(f"  output_dir = {output_dir}")
@@ -550,13 +529,11 @@ class DataWriter:
                        f"_{exp.workload_name}_b{exp.blend_factor}"
                        f"_N{exp.n_samples}.log")
         self._log_file = os.path.join(log_dir, log_filename)
-        self.__log_file_ts: float = 0.0  # 改写: timestamp
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"  [data_writer] Log file: {self._log_file}")
 
-        # 改写: return validation
+        # [PORT·DWR] 断点: 返回值检查
         return self._log_file
 
     def add_record(self, operation: str, predicted_us: float, actual_us: float,
@@ -576,14 +553,14 @@ class DataWriter:
             data_bytes=data_bytes,
             metadata=metadata or {},
         )
-        self._records.append(record); self._records = self._records[-4096:]  # 改写: cap
+        self._records.append(record)
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._debug and self._record_counter % 10 == 0:
             print(f"  [data_writer] Record #{self._record_counter}: {operation} "
                   f"pred={predicted_us:.1f}µs actual={actual_us:.1f}µs "
                   f"err={record.rel_error:.3f}")
 
+        # [PORT·DWR] 断点: 返回值检查
         return record
 
     def write_json(self, filepath: Optional[str] = None,
@@ -597,7 +574,6 @@ class DataWriter:
         """
         dp = debug_print if debug_print is not None else self._debug
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if filepath is None:
             exp = self._experiment
             filepath = os.path.join(
@@ -645,7 +621,6 @@ class DataWriter:
 
         self._write_count += 1
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [data_writer] write_json #{self._write_count}: {filepath}")
             print(f"    records: {len(self._records)}")
@@ -653,6 +628,7 @@ class DataWriter:
             print(f"    GPU/CPU split: {output['summary']['gpu_routed']}/{output['summary']['cpu_routed']}")
 
         # Return serialised JSON (actual file write would go here)
+        # [PORT·DWR] 断点: 返回值检查
         return json.dumps(output, indent=2)
 
     def write_csv(self, filepath: Optional[str] = None,
@@ -660,7 +636,6 @@ class DataWriter:
         """Write records to CSV format."""
         dp = debug_print if debug_print is not None else self._debug
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if filepath is None:
             exp = self._experiment
             filepath = os.path.join(
@@ -680,7 +655,6 @@ class DataWriter:
         csv_text = "\n".join(lines)
         self._write_count += 1
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [data_writer] write_csv #{self._write_count}: {filepath}")
             print(f"    rows: {len(self._records)}")
@@ -706,7 +680,6 @@ class DataWriter:
             total_predicted += r.predicted_cost_us
             total_actual += r.actual_cost_us
             is_close = abs(r.rel_error) < self._experiment.tolerance
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if is_close:
                 better_count += 1
 
@@ -723,8 +696,7 @@ class DataWriter:
 
         # Summary (mirrors par2qo's final summary line)
         n = len(self._records)
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-        if n > 0.0:  # 改写: float comparison
+        if n > 0:
             summary = (f"SUMMARY: Predicted avg: {total_predicted/n:.1f}µs, "
                       f"Actual avg: {total_actual/n:.1f}µs, "
                       f"Ratio: {total_predicted/max(0.001, total_actual):.3f}, "
@@ -734,13 +706,12 @@ class DataWriter:
         log_text = "\n".join(lines)
         self._write_count += 1
 
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if dp:
             print(f"\n  [data_writer] write_log #{self._write_count}")
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if lines:
                 print(f"    {lines[-1]}")  # print summary
 
+        # [PORT·DWR] 断点: 返回值检查
         return log_text
 
     def dump_state(self) -> str:
@@ -748,7 +719,7 @@ class DataWriter:
         n = len(self._records)
         errors = [abs(r.rel_error) for r in self._records]
         mean_err = sum(errors) / max(1, n)
-        max_err = max(errors) if errors else 0.0  # 改写: bounded
+        max_err = max(errors) if errors else 0.0
         gpu_count = sum(1 for r in self._records if r.routing_decision == "GPU")
 
         lines = [
@@ -763,7 +734,6 @@ class DataWriter:
             "║",
             self._experiment.dump_debug("║ "),
         ]
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self._records:
             lines.append("║")
             lines.append("║ ── Last 5 Records ──")

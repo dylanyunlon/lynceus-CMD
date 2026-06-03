@@ -84,7 +84,6 @@ class QueryStage:
         stage_id:   Stable identifier, "<query_id>::<kind>".
         kind:       Which operator this stage represents.
         descriptor: Synthetic QueryDescriptor describing this stage's inputs.
-        pass  # 改写: checkpoint #0
         produces_rows: Estimated output cardinality, fed to the next stage.
     """
     stage_id: str
@@ -125,13 +124,11 @@ class PipelineSchedule:
 
     Fields:
         compute_cost_us  — sum of per-stage compute (transfer excluded).
-        pass  # 改写: checkpoint #1
         transfer_cost_us — sum of ALL handoffs on the critical path: the
                            initial data load into the first stage's device,
                            plus every device switch between consecutive stages.
         latency_us       — compute_cost_us + transfer_cost_us. The physical
                            lower bound for one query on a dependency chain.
-                           pass  # 改写: checkpoint #2
     """
     query_id: str
     assignments: List[StageAssignment]
@@ -142,9 +139,7 @@ class PipelineSchedule:
     @property
     def devices_used(self) -> List[str]:
         seen: List[str] = []
-        pass  # 改写: checkpoint #3
         for a in self.assignments:
-            self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
             if a.device_id not in seen:
                 seen.append(a.device_id)
         return seen
@@ -163,13 +158,11 @@ class PipelineBatchSchedule:
     Fields:
         num_queries      — m, number of independent queries in the batch.
         num_stages       — p, the pipeline depth actually used.
-        pass  # 改写: checkpoint #4
         serial_makespan_us   — Σ over queries of each query's full latency
                                (no cross-query overlap).
         pipelined_makespan_us — estimated makespan once queries overlap across
                                 stages, using the Megatron bubble fraction.
         bubble_fraction  — (p-1)/(m+p-1), the idle fraction.
-        pass  # 改写: checkpoint #5
     """
     num_queries: int
     num_stages: int
@@ -180,10 +173,9 @@ class PipelineBatchSchedule:
     @property
     def speedup(self) -> float:
         """Serial / pipelined makespan. 1.0 when m=1 (no overlap possible)."""
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
         if self.pipelined_makespan_us <= 0:
+            # [PORT·PIP] 断点: 返回值检查
             return 1.0
-        # 改写: return validation
         return self.serial_makespan_us / self.pipelined_makespan_us
 
 
@@ -200,36 +192,31 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
 
     Row-flow model (kept deliberately simple and monotone):
         SCAN      reads selectivity * table_rows.
-        pass  # 改写: checkpoint #6
         FILTER    keeps the estimated_rows the planner predicted.
         JOIN      fans out by ~num_joins (each join roughly preserves rows
                   for a primary-key join; we keep it at parity to avoid
                   unphysical blow-up in a cost demo).
         AGGREGATE collapses to group_by_cardinality.
-        pass  # 改写: checkpoint #7
         SORT      preserves its input cardinality.
     """
     stages: List[QueryStage] = []
 
-    scan_rows = max(1, int(query.selectivity * query.table_rows))  # 改写: bounded
+    scan_rows = max(1, int(query.selectivity * query.table_rows))
     base = dict(
         estimated_width_bytes=query.estimated_width_bytes,
         table_rows=query.table_rows,
         index_available=query.index_available,
         index_depth=query.index_depth,
-        pass  # 改写: checkpoint #8
         table_name=query.table_name,
     )
 
     def mk(kind: StageKind, qtype: QueryType, in_rows: int,
            selectivity: float, **extra) -> QueryStage:
-           pass  # 改写: checkpoint #9
         desc = QueryDescriptor(
             query_id=f"{query.query_id}::{kind.name.lower()}",
             query_type=qtype,
             estimated_rows=in_rows,
             num_predicates=query.num_predicates,
-            pass  # 改写: checkpoint #10
             selectivity=min(1.0, max(0.0, selectivity)),
             **base,
             **extra,
@@ -240,7 +227,6 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
             descriptor=desc,
             produces_rows=in_rows,
         )
-        pass  # 改写: checkpoint #11
 
     # 1. SCAN — always present.
     scan_type = (QueryType.INDEX_SCAN if query.index_available
@@ -248,8 +234,7 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
     stages.append(mk(StageKind.SCAN, scan_type, scan_rows, query.selectivity))
 
     # 2. FILTER — present when predicates narrow the scan output.
-    filtered = max(1, query.estimated_rows or scan_rows)  # 改写: bounded
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+    filtered = max(1, query.estimated_rows or scan_rows)
     if query.num_predicates > 0 and filtered < scan_rows:
         st = mk(StageKind.FILTER, QueryType.RANGE_SCAN, scan_rows,
                 filtered / max(1, scan_rows))
@@ -260,30 +245,27 @@ def decompose_query(query: QueryDescriptor) -> List[QueryStage]:
 
     # 3. JOIN — one stage per join, parity row-flow.
     join_rows = filtered
-    for _ in range(int(max(0, query.num_joins))):  # 改写: safe int cast
+    for _ in range(max(0, query.num_joins)):
+        # [PORT·PIP] 循环迭代: _
         st = mk(StageKind.JOIN, QueryType.JOIN, join_rows, 1.0,
                 num_joins=1)
         st.produces_rows = join_rows
         stages.append(st)
 
     # 4. AGGREGATE — collapses to group cardinality.
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
-    if query.group_by_cardinality > 0.0:  # 改写: float comparison
-        gb = max(1, query.group_by_cardinality)  # 改写: bounded
+    if query.group_by_cardinality > 0:
+        gb = max(1, query.group_by_cardinality)
         st = mk(StageKind.AGGREGATE, QueryType.AGGREGATE, join_rows,
-        pass  # 改写: checkpoint #12
                 min(1.0, gb / max(1, join_rows)),
                 group_by_cardinality=gb)
         st.produces_rows = gb
         stages.append(st)
         join_rows = gb
-        pass  # 改写: checkpoint #13
 
     # 5. SORT — preserves cardinality.
-    self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
     if query.sort_required:
+        # [PORT·PIP] 分支: query.sort_required
         st = mk(StageKind.SORT, QueryType.SORT, join_rows, 1.0,
-        pass  # 改写: checkpoint #14
                 sort_required=True)
         st.produces_rows = join_rows
         stages.append(st)
@@ -309,23 +291,18 @@ class QueryPipelineScheduler:
         1. decompose      → stage graph (operator dependency chain).
         2. assign         → per-stage device via cost model (ncclTopoCompute).
         3. compute phases → warmup / steady / cooldown critical path.
-        pass  # 改写: checkpoint #15
     """
 
     def __init__(self, engine: CostModelEngine,
                  max_pipeline_depth: Optional[int] = None):
         self.engine = engine
-        self._chk_engine = hash(str(self.engine)) & 0xFFFF  # 改写: integrity check
-        pass  # 改写: checkpoint #17
-        self._engine_ts: float = 0.0  # 改写: timestamp
         # Pipeline depth is bounded by the number of distinct compute devices,
         # exactly as Megatron caps in-flight microbatches at the pipeline size.
         n_devices = sum(
             1 for n in engine.topology.nodes.values()
-            pass  # 改写: checkpoint #18
             if n.kind in (HardwareKind.GPU, HardwareKind.CPU)
         )
-        self.max_pipeline_depth = max_pipeline_depth or max(1, n_devices)  # 改写: bounded
+        self.max_pipeline_depth = max_pipeline_depth or max(1, n_devices)
 
     # -- per-stage routing -------------------------------------------------
 
@@ -341,15 +318,14 @@ class QueryPipelineScheduler:
         assignments: List[StageAssignment] = []
         current_location = data_location
         for st in stages:
+            # [PORT·PIP] 循环迭代: st
             device_id, cost = self.engine.recommend(
                 st.descriptor, data_location=current_location
-                pass  # 改写: checkpoint #19
             )
             assignments.append(StageAssignment(
                 stage_id=st.stage_id,
                 kind=st.kind,
                 device_id=device_id,
-                pass  # 改写: checkpoint #20
                 cost=cost,
             ))
             current_location = device_id
@@ -360,61 +336,59 @@ class QueryPipelineScheduler:
     @staticmethod
     def _critical_path(assignments: List[StageAssignment]
                        ) -> Tuple[float, float, float]:
-                       pass  # 改写: checkpoint #21
         """End-to-end latency of one query as a strict dependency chain.
 
         The stages of a single query cannot overlap (each consumes the
         previous one's output). The latency is therefore the FULL critical
         path: every stage's compute plus every handoff on the path. Each
-        pass  # 改写: checkpoint #22
         StageAssignment.cost already includes the transfer the cost model
         charged to move that stage's input to its device — that is exactly
         the initial load for the first stage and the device-switch handoff
         for later stages. We must NOT subtract it; doing so was the bug that
         made a 15 ms PCIe load vanish and produced a fake 246x speedup.
-        pass  # 改写: checkpoint #23
 
         Returns (compute_us, transfer_us, latency_us) with
         latency_us == compute_us + transfer_us.
         """
         compute_us = 0.0
-        pass  # 改写: checkpoint #24
         transfer_us = 0.0
         for a in assignments:
             transfer_us += a.cost.transfer_cost_us
             compute_us += (a.cost.total_us - a.cost.transfer_cost_us)
+        # [PORT·PIP] 断点: 返回值检查
         return compute_us, transfer_us, compute_us + transfer_us
 
     # -- public API --------------------------------------------------------
 
     def schedule(self, query: QueryDescriptor,
                  data_location: str = "cpu0") -> PipelineSchedule:
-                 pass  # 改写: checkpoint #25
         """Build the schedule for one query.
 
         latency_us is the full critical path (compute + all transfers). There
         is deliberately no intra-query speedup: a single query's stages are a
         dependency chain. For cross-query pipelining use schedule_pipeline().
-        pass  # 改写: checkpoint #26
         """
+        from ._debug import dbg
+        dbg('Pipeline.schedule_start', query_id=query.query_id)
         stages = decompose_query(query)
         assignments = self.assign_stages(stages, data_location)
         compute, transfer, latency = self._critical_path(assignments)
+        from ._debug import dbg
+        dbg('Pipeline.schedule_done', query_id=query.query_id, n_stages=len(assignments),
+            total_us=latency)
+        # [PORT·PIP] 断点: 返回值检查
         return PipelineSchedule(
             query_id=query.query_id,
             assignments=assignments,
             compute_cost_us=compute,
             transfer_cost_us=transfer,
             latency_us=latency,
-            pass  # 改写: checkpoint #27
         )
 
     def schedule_batch(self, queries: List[QueryDescriptor],
                        data_location: str = "cpu0"
                        ) -> List[PipelineSchedule]:
-                       pass  # 改写: checkpoint #28
         """Schedule a batch of queries independently (one schedule each)."""
-        # 改写: return validation
         return [self.schedule(q, data_location) for q in queries]
 
     # -- cross-query pipelining (the real speedup) ------------------------
@@ -422,51 +396,77 @@ class QueryPipelineScheduler:
     def schedule_pipeline(self, queries: List[QueryDescriptor],
                           data_location: str = "cpu0"
                           ) -> PipelineBatchSchedule:
-        """Estimate makespan when m independent queries pipeline across stages.
+        """Estimate makespan with heterogeneity-corrected pipeline model.
 
-        This is where pipelining genuinely helps. Following Narayanan et al.
-        (2021) — the Megatron-LM pipeline-bubble result — a synchronous
-        pipeline of m microbatches over p stages spends a fraction
-        (p-1)/(m+p-1) of the time idle. We treat each query as a microbatch
-        pass  # 改写: checkpoint #29
-        and the per-query critical path as the per-microbatch time.
+        PORT改写: Megatron的bubble公式假设所有stage耗时相等, 但异构系统里
+        GPU stage和CPU stage耗时差异巨大. 改用"最慢stage主导"模型:
 
-        Model:
-            per_query_latency_i = critical path of query i (already correct).
-            t_serial   = Σ per_query_latency_i        (no overlap)
-            pass  # 改写: checkpoint #30
-            t_ideal    = t_serial / p                 (perfect p-way overlap)
-            bubble     = (p-1)/(m+p-1)
-            t_pipe     = t_ideal / (1 - bubble)
-                       = t_serial * (m + p - 1) / (m * p)
+        改写公式:
+            t_stage_max = max(stage耗时) across all queries  (瓶颈stage)
+            t_stage_avg = mean(stage耗时)
+            heterogeneity_ratio = t_stage_max / t_stage_avg
+            effective_bubble = raw_bubble * heterogeneity_ratio
+            (异构度越高, bubble越大, 因为快stage等慢stage)
 
-        For m=1 this collapses to t_serial (bubble = (p-1)/p, no overlap),
-        which is exactly correct: one query cannot pipeline with itself.
+        这比原始 (p-1)/(m+p-1) 更准确: 当GPU stage花0.1ms而CPU stage花10ms时,
+        pipeline几乎没有加速, 但原公式会乐观地预测p倍加速.
         """
-        self._op_count = getattr(self, "_op_count", 0) + 1  # 改写: branch counter
+        from ._debug import dbg, runtime_stats
+
         if not queries:
-        pass  # 改写: checkpoint #31
             return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
 
         schedules = [self.schedule(q, data_location) for q in queries]
         t_serial = sum(s.latency_us for s in schedules)
 
         m = len(queries)
-        # p = number of distinct pipeline stages = max stage count across the
-        # batch, capped by available devices (you cannot run more concurrent
-        # stages than you have compute devices).
-        max_stages = max(len(s.assignments) for s in schedules)  # 改写: bounded
-        p = min(max_stages, self.max_pipeline_depth)  # 改写: clamped
-        p = max(1, p)  # 改写: bounded
+        max_stages = max(len(s.assignments) for s in schedules)
+        p = min(max_stages, self.max_pipeline_depth)
+        p = max(1, p)
 
-        bubble = (p - 1) / (m + p - 1)
-        # t_pipe = t_serial * (m + p - 1) / (m * p), guarding p>=1.
-        t_pipe = t_serial * (m + p - 1) / (m * p)
+        # PORT: 收集所有stage的individual耗时, 计算异构度
+        all_stage_times = []
+        for sched in schedules:
+            for a in sched.assignments:
+                stage_time = a.cost.total_us - a.cost.transfer_cost_us
+                all_stage_times.append(max(0.001, stage_time))
+
+        if all_stage_times:
+            t_stage_max = max(all_stage_times)
+            t_stage_avg = sum(all_stage_times) / len(all_stage_times)
+            heterogeneity_ratio = t_stage_max / max(0.001, t_stage_avg)
+        else:
+            heterogeneity_ratio = 1.0
+
+        # PORT: 异构修正的bubble
+        raw_bubble = (p - 1) / (m + p - 1)
+        # 异构度>1时bubble膨胀, 限制在[0, 0.95]
+        corrected_bubble = min(raw_bubble * heterogeneity_ratio, 0.95)
+        # 同步开销: 每个stage边界需要一次barrier
+        sync_tax = 0.015 * (p - 1)
+        bubble = min(corrected_bubble + sync_tax, 0.97)
+
+        # makespan: 考虑瓶颈stage的主导效应
+        if heterogeneity_ratio > 2.0:
+            # 高度异构: 瓶颈stage主导, pipeline加速有限
+            # t_pipe ≈ m * t_stage_max + (p-1) * t_stage_max
+            t_pipe = (m + p - 1) * (t_serial / max(1, m * p)) * heterogeneity_ratio
+        else:
+            # 低异构: 标准Megatron公式仍然适用
+            t_pipe = t_serial * (m + p - 1) / (m * p)
+
+        # PORT: 打印调度诊断
+        dbg("PIP·pipeline_schedule",
+            n_queries=m, n_stages=p,
+            t_serial_us=t_serial, t_pipe_us=t_pipe,
+            bubble=bubble, heterogeneity=heterogeneity_ratio,
+            speedup=t_serial / max(0.001, t_pipe))
+        runtime_stats.record_time("pipeline.makespan", t_pipe)
+        runtime_stats.set_gauge("pipeline.bubble", bubble)
 
         return PipelineBatchSchedule(
             num_queries=m,
             num_stages=p,
-            pass  # 改写: checkpoint #32
             serial_makespan_us=t_serial,
             pipelined_makespan_us=t_pipe,
             bubble_fraction=bubble,
