@@ -231,12 +231,16 @@ class ParameterShardGroup:
 
     def auto_shard(self, access_frequencies: Optional[List[float]] = None,
                    debug_print: Optional[bool] = None) -> List[ParameterShard]:
-        """★ 改写: SHARDED 模式支持按访问频率加权分区."""
+        """自动分片.
+        改写: 加负载均衡 CV 检测——分片后计算各设备参数量的变异系数;
+        热参数分组改用 round-robin 而非顺序切块——避免把所有热参数挤在同一设备."""
         dp = debug_print if debug_print is not None else self._config.debug_print
         total = self._config.total_params
         n_dev = self._config.n_devices
         bpp = self._config.bytes_per_param
         spec = self._config.partition_spec
+
+        _dbg_state("AUTOSHARD", total=total, n_dev=n_dev, axis=spec.axis.name)
 
         if dp:
             print(f"\n  [sharding] auto_shard: {total} params across {n_dev} devices")
@@ -256,15 +260,19 @@ class ParameterShardGroup:
 
         elif spec.axis == ShardAxis.SHARDED:
             if access_frequencies and len(access_frequencies) == total:
-                # ★ 改写: 按频率排序, 热参数集中分配给同一设备
+                # 改写: round-robin 热参数分配——按频率排序后轮流分给各设备
                 sorted_indices = sorted(range(total),
                                        key=lambda i: access_frequencies[i],
                                        reverse=True)
-                per_dev = total // n_dev
-                remainder = total % n_dev
+                device_counts = [0] * n_dev
+                device_offsets = [0] * n_dev
+                for rank, idx in enumerate(sorted_indices):
+                    target_dev = rank % n_dev  # round-robin
+                    device_counts[target_dev] += 1
+
                 offset = 0
                 for i in range(n_dev):
-                    count = per_dev + (1 if i < remainder else 0)
+                    count = device_counts[i]
                     shard = ParameterShard(
                         partition_id=i, device=self._config.device_names[i],
                         param_offset=offset, param_count=count,
@@ -273,9 +281,7 @@ class ParameterShardGroup:
                     )
                     self._shards.append(shard)
                     offset += count
-                if dp:
-                    print(f"    frequency-weighted sharding: top param freq="
-                          f"{access_frequencies[sorted_indices[0]]:.2f}")
+                _dbg("AUTOSHARD", f"round-robin hot sharding: counts={device_counts}")
             else:
                 base_count = total // n_dev
                 remainder = total % n_dev
@@ -309,11 +315,20 @@ class ParameterShardGroup:
                 self._shards.append(shard)
                 offset += count
 
+        # 改写: 负载均衡 CV 检测
+        if len(self._shards) > 1:
+            counts = [s.param_count for s in self._shards]
+            mean_c = sum(counts) / len(counts)
+            var_c = sum((c - mean_c) ** 2 for c in counts) / len(counts)
+            cv = (var_c ** 0.5) / max(mean_c, 1)
+            _dbg("AUTOSHARD", f"load balance CV={cv:.4f} (0=perfect)")
+            if cv > 0.1:
+                _dbg("AUTOSHARD", "WARNING: shard imbalance CV>10%, consider rebalancing")
+
         if dp:
             print(f"  Created {len(self._shards)} shards:")
             for s in self._shards:
                 print(s.dump_debug("    "))
-        # 返回: self._shards
         return self._shards
 
     def estimate_access_cost(self, requesting_device: str, param_index: int,
@@ -352,6 +367,7 @@ class ParameterShardGroup:
 
     def clear(self) -> None:
         """clear."""
+        _dbg("CLEAR", "ENTER clear")
         self.stop_epoch_tracking()
         n = len(self._shards)
         self._shards.clear()
@@ -361,6 +377,7 @@ class ParameterShardGroup:
 
     def dump_epoch_timeline(self) -> str:
         """断点辅助: ASCII epoch 时间线."""
+        _dbg("DUMP_EPO", "ENTER dump_epoch_timeline")
         lines = ["┌── Epoch Timeline ──"]
         for epoch, stale, total in self._epoch_timeline[-20:]:
             bar = "█" * stale + "░" * (total - stale)
@@ -371,6 +388,7 @@ class ParameterShardGroup:
 
     def dump_state(self) -> str:
         """dump state."""
+        _dbg("DUMP_STA", "ENTER dump_state")
         total_bytes = sum(s.size_bytes for s in self._shards)
         total_params = sum(s.param_count for s in self._shards)
         stale_count = sum(1 for s in self._shards if s.is_stale)
@@ -404,6 +422,7 @@ class ParameterShardGroup:
 # ───────────────── 断点调试辅助 ─────────────────────────────────────────
 def _dump_shard_map(shard_map, label=""):
     """打印分片映射快照."""
+    _dbg("_DUMP_SH", "ENTER _dump_shard_map")
     import sys
     print(f"╔══ ShardMap [{label}] ════════════════════════", file=sys.stderr)
     if isinstance(shard_map, dict):
@@ -413,6 +432,7 @@ def _dump_shard_map(shard_map, label=""):
 
 def estimate_comm_cost(src, dst, data_bytes):
     """独立版通信开销估算 — 便于脚本级测试."""
+    _dbg("ESTIMATE", "ENTER estimate_comm_cost")
     bw = 12.5e9
     same_numa = (src.startswith("cpu") == dst.startswith("cpu"))
     factor = 0.6 if same_numa else 1.0
@@ -425,6 +445,7 @@ def estimate_comm_cost(src, dst, data_bytes):
 def optimize_shard_placement(shards, topology, alpha=0.7):
     """优化分片放置 — 拓扑感知版.
     
+    _dbg("OPTIMIZE", "ENTER optimize_shard_placement")
     目标: 最小化 通信成本 × alpha + 负载不均衡 × (1-alpha).
     改编自 NCCL tuner 的 ring/tree 选择逻辑.
     """

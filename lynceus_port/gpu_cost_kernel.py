@@ -49,11 +49,18 @@ import os as _os, sys as _sys
 _LYNCEUS_DBG = _os.environ.get("LYNCEUS_DEBUG", "1")
 
 def _dbg(tag: str, msg: str):
-    _dbg("_DBG", "_dbg entered")
+    """调试输出 — 修复自递归."""
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
-_tr = _dbg  # 兼容旧调用
+def _dbg_state(tag, **kwargs):
+    """键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
+
+_tr = _dbg
 
 
 logger = logging.getLogger(__name__)
@@ -174,6 +181,7 @@ class BTreeGPUConfig:
     @property
     def fanout(self) -> int:
         """Node max_resident_blocks — from tabular inline_btree.h:
+        _dbg("FANOUT", "ENTER fanout")
         max_resident_blocks = (node_size - header) / (key + value)"""
         _dbg("FANOUT", "fanout entered")
         return max(2, (self.node_size_bytes - self.header_bytes)
@@ -279,44 +287,56 @@ class GPUCostKernel:
     def estimate_seq_scan(self, n_rows: int, row_size_bytes: int = 128,
                           selectivity: float = 1.0,
                           debug_print: Optional[bool] = None) -> KernelCostEstimate:
-        """Estimate cost of sequential scan on GPU.
-
-        Each thread processes one row. Memory-bound: HBM link_throughput
-        determines throughput.
-        """
+        """估计 GPU 顺序扫描代价.
+        改写: L1/L2/HBM 三层内存模型 — 根据工作集大小分配流量;
+        SM 占用率修正 — 低占用率时有效带宽下降."""
         dp = debug_print if debug_print is not None else self._debug
         total_bytes = n_rows * row_size_bytes
         output_rows = int(n_rows * selectivity)
 
-        # Memory time: read all rows from HBM
-        memory_us = (total_bytes / (1024**3)) / self._arch_config.hbm_bandwidth_gbps * 1e6
+        _dbg_state("SEQSCAN", n_rows=n_rows, row_size=row_size_bytes,
+                   selectivity=selectivity, total_MB=total_bytes/(1024**2))
 
-        # Compute time: one comparison per row (trivial)
-        # Each thread does ~10 ops (load, compare, conditional store)
+        # 改写: 三层内存模型 — 根据工作集大小决定热/温/冷流量比例
+        l2_size = self._arch_config.n_sms * 256 * 1024  # ~256KB L2 per SM slice
+        if total_bytes <= l2_size:
+            # 全部命中 L2
+            effective_bw = self._arch_config.l2_bandwidth_gbps
+            _dbg("SEQSCAN", f"workset fits L2 ({total_bytes/(1024**2):.1f}MB <= {l2_size/(1024**2):.1f}MB)")
+        else:
+            # 部分 L2 命中，其余走 HBM
+            l2_fraction = min(1.0, l2_size / max(1, total_bytes))
+            effective_bw = (l2_fraction * self._arch_config.l2_bandwidth_gbps
+                          + (1 - l2_fraction) * self._arch_config.hbm_bandwidth_gbps)
+            _dbg("SEQSCAN", f"L2 hit ratio={l2_fraction:.2f}, effective_bw={effective_bw:.0f} GB/s")
+
+        memory_us = (total_bytes / (1024**3)) / max(0.01, effective_bw) * 1e6
+
         total_ops = n_rows * 10
-        ops_per_us = self._arch_config.fp32_tflops * 1e6  # ops per µs
+        ops_per_us = self._arch_config.fp32_tflops * 1e6
         compute_us = total_ops / max(1, ops_per_us)
 
-        # Occupancy: threads = n_rows, up to max hardware threads
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_rows, max_threads)
         occupancy = threads / max_threads
 
-        # Bottleneck analysis
+        # 改写: 低占用率惩罚 — 占用率<50%时有效带宽线性衰减
+        if occupancy < 0.5:
+            occ_penalty = 0.5 + occupancy  # [0.5, 1.0]
+            memory_us /= max(0.1, occ_penalty)
+            _dbg("SEQSCAN", f"low occupancy penalty: occ={occupancy:.2f}, penalty={occ_penalty:.2f}")
+
         critical_stage = "memory" if memory_us > compute_us else "compute"
-        total_us = max(memory_us, compute_us) + 5.0  # + launch overhead
+        total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
-            op=KernelOp.SEQ_SCAN,
-            compute_us=compute_us,
-            memory_us=memory_us,
-            threads_used=threads,
-            sm_occupancy=occupancy,
-            memory_bytes_accessed=total_bytes,
-            critical_stage=critical_stage,
+            op=KernelOp.SEQ_SCAN, compute_us=compute_us, memory_us=memory_us,
+            threads_used=threads, sm_occupancy=occupancy,
+            memory_bytes_accessed=total_bytes, critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
+        _dbg("SEQSCAN", f"result: {total_us:.1f}us ({critical_stage}-bound), occ={occupancy:.2f}")
 
         if dp:
             print(f"\n  [gpu_cost] SEQ_SCAN: {n_rows:,} rows × {row_size_bytes}B "
@@ -327,32 +347,33 @@ class GPUCostKernel:
 
     def estimate_btree_lookup(self, n_keys: int, n_lookups: int,
                               debug_print: Optional[bool] = None) -> KernelCostEstimate:
-        """Estimate cost of B-tree index lookups on GPU.
-
-        Adapted from tabular inline_btree.h search path:
-          height = ceil(log_fanout(N))
-          per lookup: height × (binary search in node + L2 cache miss)
-
-        On GPU, each thread handles one lookup. Memory accesses are
-        mostly random (L2 cache misses), which is the critical_stage.
-        """
+        """估计 GPU B-tree 查找代价.
+        改写: 每层区分缓存状态(顶层L2/底层HBM);
+        加 warp divergence 惩罚——不同线程走不同分支时效率降低."""
         dp = debug_print if debug_print is not None else self._debug
 
         height = self._btree_config.tree_height(n_keys)
         fanout = self._btree_config.fanout
 
-        # Per lookup: height levels × (binary search + node load)
-        # Binary search in node: log2(fanout) comparisons
+        _dbg_state("BTLOOK", n_keys=n_keys, n_lookups=n_lookups,
+                   height=height, fanout=fanout)
+
         comparisons_per_lookup = height * math.ceil(math.log2(max(2, fanout)))
         total_comparisons = n_lookups * comparisons_per_lookup
 
-        # Memory: each level = one node read (mostly L2 misses for random access)
-        bytes_per_lookup = height * self._btree_config.node_size_bytes
-        total_bytes = n_lookups * bytes_per_lookup
-        # Random access: use L2 link_throughput (not HBM sequential)
-        memory_us = (total_bytes / (1024**3)) / self._arch_config.l2_bandwidth_gbps * 1e6
+        # 改写: 每层区分缓存状态——顶层2层命中L2，底层走HBM随机读
+        top_levels = min(2, height)
+        bottom_levels = max(0, height - 2)
+        bytes_top = n_lookups * top_levels * self._btree_config.node_size_bytes
+        bytes_bottom = n_lookups * bottom_levels * self._btree_config.node_size_bytes
+        mem_top_us = (bytes_top / (1024**3)) / self._arch_config.l2_bandwidth_gbps * 1e6
+        mem_bottom_us = (bytes_bottom / (1024**3)) / self._arch_config.l2_bandwidth_gbps * 0.3 * 1e6  # random L2 miss ~30% effective
+        memory_us = mem_top_us + mem_bottom_us
+        total_bytes = bytes_top + bytes_bottom
 
-        # Compute: comparisons
+        _dbg("BTLOOK", f"mem layers: top={top_levels}(L2)={mem_top_us:.1f}us, "
+             f"bottom={bottom_levels}(HBM)={mem_bottom_us:.1f}us")
+
         ops_per_us = self._arch_config.fp32_tflops * 1e6
         compute_us = total_comparisons / max(1, ops_per_us)
 
@@ -360,20 +381,23 @@ class GPUCostKernel:
         threads = min(n_lookups, max_threads)
         occupancy = threads / max_threads
 
+        # 改写: warp divergence 惩罚——B-tree随机分支导致同一warp内线程走不同路径
+        # 每级分支的 divergence 概率 ≈ 1 - 1/fanout
+        divergence_factor = 1.0 + 0.3 * (1.0 - 1.0 / max(2, fanout)) * bottom_levels
+        compute_us *= divergence_factor
+        _dbg("BTLOOK", f"warp divergence factor={divergence_factor:.3f}")
+
         critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
-            op=KernelOp.INDEX_SCAN,
-            compute_us=compute_us,
-            memory_us=memory_us,
-            threads_used=threads,
-            sm_occupancy=occupancy,
-            memory_bytes_accessed=total_bytes,
-            critical_stage=critical_stage,
+            op=KernelOp.INDEX_SCAN, compute_us=compute_us, memory_us=memory_us,
+            threads_used=threads, sm_occupancy=occupancy,
+            memory_bytes_accessed=total_bytes, critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
+        _dbg("BTLOOK", f"result: {total_us:.1f}us ({critical_stage}-bound)")
 
         if dp:
             print(f"\n  [gpu_cost] BTREE_LOOKUP: {n_lookups:,} lookups in {n_keys:,} keys "
@@ -385,45 +409,49 @@ class GPUCostKernel:
 
     def estimate_hash_probe(self, n_build: int, n_probe: int,
                             debug_print: Optional[bool] = None) -> KernelCostEstimate:
-        """Estimate cost of hash probe on GPU.
-
-        Adapted from tabular hash_table_common.h:
-          n_buckets = n_build / load_factor
-          avg_chain = 1 / (1 - load_factor)
-          per probe: hash + chain walk
-        """
+        """估计 GPU hash probe 代价.
+        改写: 加 atomic contention 模型——高负载因子时多线程同时访问同一bucket,
+        产生 atomic 争用惩罚."""
         dp = debug_print if debug_print is not None else self._debug
 
         n_buckets = self._hash_config.bucket_count(n_build)
         avg_chain = self._hash_config.avg_chain_length()
 
-        # Per probe: 1 hash + avg_chain comparisons + avg_chain cache misses
+        _dbg_state("HPROBE", n_build=n_build, n_probe=n_probe,
+                   n_buckets=n_buckets, avg_chain=avg_chain)
+
         comparisons = n_probe * avg_chain
         bytes_per_probe = int(avg_chain) * self._hash_config.bucket_size_bytes
         total_bytes = n_probe * bytes_per_probe
 
         memory_us = (total_bytes / (1024**3)) / self._arch_config.l2_bandwidth_gbps * 1e6
         ops_per_us = self._arch_config.fp32_tflops * 1e6
-        compute_us = (comparisons * 10) / max(1, ops_per_us)  # ~10 ops per comparison
+        compute_us = (comparisons * 10) / max(1, ops_per_us)
 
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_probe, max_threads)
         occupancy = threads / max_threads
 
+        # 改写: atomic contention 模型——当 probe/buckets > 32 (一个warp大小)时
+        # 同一 bucket 可能被多个 thread 同时访问，产生串行化
+        probes_per_bucket = n_probe / max(1, n_buckets)
+        if probes_per_bucket > 32:
+            contention_factor = 1.0 + math.log2(probes_per_bucket / 32) * 0.15
+            memory_us *= contention_factor
+            _dbg("HPROBE", f"atomic contention: probes/bucket={probes_per_bucket:.1f}, "
+                 f"factor={contention_factor:.3f}")
+
         critical_stage = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
 
         est = KernelCostEstimate(
-            op=KernelOp.HASH_PROBE,
-            compute_us=compute_us,
-            memory_us=memory_us,
-            threads_used=threads,
-            sm_occupancy=occupancy,
-            memory_bytes_accessed=total_bytes,
-            critical_stage=critical_stage,
+            op=KernelOp.HASH_PROBE, compute_us=compute_us, memory_us=memory_us,
+            threads_used=threads, sm_occupancy=occupancy,
+            memory_bytes_accessed=total_bytes, critical_stage=critical_stage,
             total_us=total_us,
         )
         self._estimate_history.append(est)
+        _dbg("HPROBE", f"result: {total_us:.1f}us ({critical_stage}-bound)")
 
         if dp:
             print(f"\n  [gpu_cost] HASH_PROBE: {n_probe:,} probes into {n_build:,} "
@@ -474,14 +502,11 @@ class GPUCostKernel:
     def compare_cpu_vs_gpu(self, op: KernelOp, n_rows: int,
                            cpu_time_us: float,
                            debug_print: bool = True) -> Dict[str, Any]:
-        """Compare CPU vs GPU cost for an operation.
+        """CPU vs GPU 路由决策.
+        改写: 加 10% hysteresis 防抖——避免临界点附近频繁切换设备;
+        PCIe 带宽按代数区分 (Gen4=32GB/s, Gen5=64GB/s)."""
+        _dbg_state("COMPARE", op=op.name, n_rows=n_rows, cpu_time_us=cpu_time_us)
 
-        This drives the core routing decision in Lynceus:
-        should this operation run on CPU or GPU?
-
-        Includes transfer cost (INV-1: transfer cost can't disappear).
-        """
-        # Estimate GPU cost based on operation type
         if op == KernelOp.SEQ_SCAN:
             gpu_est = self.estimate_seq_scan(n_rows, debug_print=False)
         elif op == KernelOp.INDEX_SCAN:
@@ -493,13 +518,26 @@ class GPUCostKernel:
         else:
             gpu_est = self.estimate_seq_scan(n_rows, debug_print=False)
 
-        # INV-1: Add PCIe transfer cost (data must move to GPU)
-        data_bytes = n_rows * 128  # assume 128B/row
-        transfer_us = (data_bytes / (1024**3)) / 32.0 * 1e6  # PCIe 4.0 x16 ~32 GB/s
+        # INV-1: PCIe 传输代价
+        data_bytes = n_rows * 128
+        # 改写: 按 GPU 代数区分 PCIe 带宽
+        pcie_bw = 64.0 if self._arch_config.arch in (GPUArch.SM90_H100,) else 32.0
+        transfer_us = (data_bytes / (1024**3)) / pcie_bw * 1e6
 
         gpu_total_with_transfer = gpu_est.total_us + transfer_us
-        speedup = cpu_time_us / max(0.00105, gpu_total_with_transfer)
-        winner = "GPU" if gpu_total_with_transfer < cpu_time_us else "CPU"
+
+        # 改写: 10% hysteresis 防抖——GPU 必须比 CPU 快 >10% 才切换
+        # 避免临界点附近每次请求在 CPU/GPU 之间反复跳转
+        hysteresis = 0.10
+        if gpu_total_with_transfer < cpu_time_us * (1 - hysteresis):
+            winner = "GPU"
+        elif cpu_time_us < gpu_total_with_transfer * (1 - hysteresis):
+            winner = "CPU"
+        else:
+            winner = "CPU"  # 平局偏向 CPU (无传输开销)
+            _dbg("COMPARE", f"within hysteresis band, defaulting to CPU")
+
+        speedup = cpu_time_us / max(0.001, gpu_total_with_transfer)
 
         result = {
             "op": op.name,
@@ -511,21 +549,25 @@ class GPUCostKernel:
             "speedup": speedup,
             "winner": winner,
             "bottleneck": gpu_est.critical_stage,
+            "pcie_gen": "Gen5" if pcie_bw > 50 else "Gen4",
         }
+        _dbg("COMPARE", f"winner={winner}, speedup={speedup:.2f}x, "
+             f"gpu={gpu_total_with_transfer:.1f}us vs cpu={cpu_time_us:.1f}us")
 
         if debug_print:
             print(f"\n  [gpu_cost] CPU vs GPU comparison ({op.name}, {n_rows:,} rows):")
             print(f"    CPU:          {cpu_time_us:,.1f}µs")
             print(f"    GPU compute:  {gpu_est.total_us:,.1f}µs")
-            print(f"    GPU transfer: {transfer_us:,.1f}µs (INV-1: included)")
+            print(f"    GPU transfer: {transfer_us:,.1f}µs (INV-1, {result['pcie_gen']})")
             print(f"    GPU total:    {gpu_total_with_transfer:,.1f}µs")
-            print(f"    Speedup:      {speedup:.2f}x")
+            print(f"    Speedup:      {speedup:.2f}x (hysteresis={hysteresis*100:.0f}%)")
             print(f"    → Winner:     {winner}")
 
         return result
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
+        _dbg("DUMP_STA", "ENTER dump_state")
         lines = [
             "╔══ GPUCostKernel State ═══════════════════════════════",
             f"║ arch             = {self._arch_config.arch.name}",
@@ -586,6 +628,7 @@ class GPUCostKernel:
 
     def dump_history_summary(self) -> str:
         """断点辅助: 打印所有历史估计的摘要."""
+        _dbg("DUMP_HIS", "ENTER dump_history_summary")
         lines = ["┌── GPU Cost Kernel History ──"]
         for i, est in enumerate(self._estimate_history):
             lines.append(f"│ [{i}] {est.op.name}: {est.total_us:.1f}µs "

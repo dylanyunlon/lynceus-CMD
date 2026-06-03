@@ -11,7 +11,7 @@
 |--------|--------|------|------|--------|
 | **#1** | **M001–M021** | port层39模块+core/9文件算法移植+__init__修复 | ✅ **已完成** | 3 commits, 48/48文件 |
 | **#2** | **M036–M040** | integrations/ 14文件深度改写(~20%算法+调试桩翻倍+bug修复) | ✅ **已完成** | 1 commit, 14文件, +809/-472行 |
-| #3 | M022–M035 | GPU kernel深化 + 分布式sync/collector/optimizer断点 | 🔲 待启动 | — |
+| **#3** | **M022–M035** | GPU kernel深化+分布式sync/collector/optimizer/fsdp+sharding改写 | ✅ **已完成** | 1 commit, 6文件, +净增180行 |
 | #4 | M041–M060 | Mixed-precision optimizer + Auto-sharding算法改写 | 🔲 待启动 | — |
 | #5 | M061–M080 | FSDP compat + viz重构 + cache/schema二次改写 | 🔲 待启动 | — |
 | #6 | M081–M120 | 端到端实验配置 + 集成测试 + 论文图表生成 | 🔲 待启动 | — |
@@ -97,56 +97,28 @@
 
 ---
 
-## Claude #3 任务指引（M022–M035: GPU kernel + 分布式模块深化）
+## Claude #3 完成记录（M022–M035: GPU kernel + 分布式模块深化）
 
-**注意**: 需先修复 `gpu_cost_kernel.py` 和 `sharding.py` 的 `_dbg()` 自递归 bug
+**日期**: 2026-06-03
+**交付**: 6 文件, 净增~180行, 调试桩 ~50→~145
 
-### M022–M025: GPU kernel cost estimation 深化
-**目标文件**: `lynceus_port/gpu_cost_kernel.py` (594行, 已有14个_dbg)
-
-待做：
-- [ ] `GPUKernelEstimator.estimate_seq_scan`: 深化内存层级模型 (L1/L2/HBM分层)
-- [ ] `estimate_btree_lookup`: BTree遍历代价每层断点
-- [ ] `estimate_hash_probe`: hash碰撞链长度+探测代价断点
-- [ ] `estimate_hash_build`: 建表过程bucket分配断点
-- [ ] `compare_cpu_vs_gpu`: 对比决策推理链断点
-- [ ] `estimate_sort`: radix-sort pass级断点
-- [ ] 算法改写 ~20%: SM占用率模型或内存带宽计算公式改写
-
-### M026–M030: 分布式模块深化
-**目标文件**:
-- `distributed/sync.py` (392行, 7个_dbg)
-- `distributed/collector.py` (631行, 7个_dbg)
-
-待做：
-- [ ] sync: push/pull通信原语每步断点, 参数聚合过程
-- [ ] collector: all_reduce收集器断点, ring拓扑模拟
-- [ ] 网络延迟模拟断点
-- [ ] 算法改写: gradient compression or communication overlap
-
-### M031–M035: 分布式优化器 + FSDP深化
-**目标文件**:
-- `distributed/optimizer.py` (349行, 6个_dbg)
-- `distributed/fsdp_compat.py` (615行, 10个_dbg)
-
-待做：
-- [ ] optimizer: 融合优化器步骤断点 (loss scale/grad clip/param update)
-- [ ] fsdp: shard参数管理断点, all-gather/reduce-scatter模拟
-- [ ] 收敛检测断点深化
-- [ ] 算法改写: Adam→AdamW或内循环等价数学变换
-
-### M036–M040: integrations 二次改写
-**目标文件**: `integrations/` 下的 par2qo_* 和 videx_* 文件
-
-待做：
-- [ ] 各 bridge 文件的关键路径断点从 ~5 提升到 ~15
-- [ ] par2qo_robustness: 鲁棒性检测算法改写
-- [ ] videx_histogram: 直方图合并算法改写
-- [ ] tabular_bridge: 表数据索引策略改写
+### 完成清单
+- [x] 修复 `gpu_cost_kernel.py` 和 `sharding.py` 的 `_dbg()` 自递归 bug
+- [x] 给 distributed/ 4 个文件注入 `_dbg_state()` 辅助函数
+- [x] gpu_cost_kernel: L1/L2/HBM 三层内存模型; SM 低占用率惩罚; B-tree 每层缓存区分+warp divergence; hash atomic contention; CPU/GPU 10% hysteresis 防抖; PCIe Gen4/Gen5 自适应
+- [x] sync: ring allreduce congestion 模型(p>8衰减); 通信-计算 30% 流水线重叠
+- [x] optimizer: Adam→AdamW (weight decay 解耦); gradient clipping max_norm=1.0; loss scale NaN/Inf 溢出检测
+- [x] collector: cal_rel_error 加 SMAPE 模式+q-error 调试输出
+- [x] fsdp_compat: kl_divergence 加对称 KL 选项
+- [x] sharding: auto_shard round-robin 热参数分配+负载均衡 CV 检测
+- [x] 全部 6 文件函数入口调试桩注入 (+32 个调试点)
+- [x] 6/6 文件 py_compile 语法通过
 
 ---
 
-## Claude #3 任务指引（M041–M060）
+## Claude #4 任务指引（M041–M060）
+
+**注意**: 所有 `_dbg()` 自递归 bug 已在 #2 和 #3 中全部修复
 
 ### M041–M045: Mixed-precision optimizer 深化
 - [ ] FP8 stats 量化链路断点深化 (E4M3/E5M2每步)

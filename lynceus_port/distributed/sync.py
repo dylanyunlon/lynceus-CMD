@@ -42,7 +42,15 @@ def _dbg(tag: str, msg: str):
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
-_tr = _dbg  # 兼容旧调用
+_tr = _dbg
+
+def _dbg_state(tag, **kwargs):
+    """键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
+  # 兼容旧调用
 
 
 logger = logging.getLogger(__name__)
@@ -110,14 +118,12 @@ class SyncMetrics:
 # Ported from NCCL ring all-reduce: each worker sends n/p data in 2(p-1) steps
 
 def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
-    """Model NCCL ring all-reduce cost.
-
-    From NCCL implementation:
-      Phase 1 (reduce-scatter): (p-1) steps, each sends data_bytes/p
-      Phase 2 (all-gather):     (p-1) steps, each sends data_bytes/p
-      Total comm: 2 * (p-1)/p * data_bytes / link_throughput + 2*(p-1) * wire_delay
-    """
-    _dbg("ESTIMATE", f"estimate_ring_allreduce(data_bytes={data_bytes}, config={config})")
+    """NCCL ring all-reduce 代价模型.
+    _dbg("ESTIMATE", "ENTER estimate_ring_allreduce")
+    改写: 加流水线重叠——通信与计算可部分重叠(overlap_ratio);
+    加 congestion 模型——多环同时跑时有效带宽下降."""
+    _dbg_state("RING_AR", data_bytes=data_bytes, n_workers=config.n_workers,
+               bw_gbps=config.inter_node_bw_gbps)
     p = config.n_workers
     if p <= 1:
         return SyncMetrics(
@@ -127,21 +133,28 @@ def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
         )
 
     chunk_bytes = data_bytes / p
-    chunk_mb = chunk_bytes / (1024 * 1024)
 
-    # Bandwidth term: 2 * (p-1)/p * data / bw
-    bw_term_us = 2.0 * (p - 1) / p * (data_bytes / (1024 * 1024)) * 1000 / config.inter_node_bw_gbps
+    # 改写: congestion 模型——p>8 时链路争用导致有效带宽衰减
+    if p > 8:
+        congestion_factor = 1.0 + 0.05 * math.log2(p / 8)
+        effective_bw = config.inter_node_bw_gbps / congestion_factor
+        _dbg("RING_AR", f"congestion: p={p}, factor={congestion_factor:.3f}, "
+             f"effective_bw={effective_bw:.1f} Gbps")
+    else:
+        effective_bw = config.inter_node_bw_gbps
 
-    # Latency term: 2 * (p-1) steps
+    bw_term_us = 2.0 * (p - 1) / p * (data_bytes / (1024 * 1024)) * 1000 / effective_bw
     lat_term_us = 2.0 * (p - 1) * config.inter_node_lat_us
-
     communication_us = bw_term_us + lat_term_us
 
-    # Local reduction: sum/average across chunks (CPU-bound, ~1ns per float)
-    n_elements = data_bytes // 4  # assume float32
-    computation_us = n_elements * 0.00105  # 1ns per element → µs
+    n_elements = data_bytes // 4
+    computation_us = n_elements * 0.001
 
-    total = communication_us + computation_us
+    # 改写: 流水线重叠——通信和计算可部分重叠(~30%)
+    overlap_ratio = 0.30
+    overlap_savings = min(computation_us, communication_us) * overlap_ratio
+    total = communication_us + computation_us - overlap_savings
+    _dbg("RING_AR", f"overlap savings={overlap_savings:.1f}us, total={total:.1f}us")
 
     metrics = SyncMetrics(
         strategy=SyncStrategy.ALLREDUCE_RING,
@@ -154,9 +167,8 @@ def estimate_ring_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     if config.debug_print:
         print(f"\n  [SYNC] Ring AllReduce: {p} workers, {data_bytes:,}B")
         print(f"    bw_term={bw_term_us:.1f}µs, lat_term={lat_term_us:.1f}µs, "
-              f"compute={computation_us:.1f}µs → total={total:.1f}µs")
-        print(f"    chunk_size={chunk_bytes:,.0f}B/worker, "
-              f"steps=2×{p-1}={2*(p-1)}")
+              f"compute={computation_us:.1f}µs, overlap={overlap_savings:.1f}µs "
+              f"→ total={total:.1f}µs")
 
     return metrics
 
@@ -215,6 +227,7 @@ def estimate_tree_allreduce(data_bytes: int, config: SyncConfig) -> SyncMetrics:
 def estimate_push_pull(data_bytes: int, config: SyncConfig) -> SyncMetrics:
     """Model BytePS push-pull parameter server cost.
 
+    _dbg("ESTIMATE", "ENTER estimate_push_pull")
     Push phase: each worker sends data_bytes to PS (parallel, limited by PS NIC)
     Pull phase: PS broadcasts averaged data back to workers
     PS throughput critical_stage: min(n_ps * NIC_bw, n_workers * worker_bw)

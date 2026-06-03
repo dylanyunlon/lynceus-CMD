@@ -52,7 +52,15 @@ def _dbg(tag: str, msg: str):
     if _LYNCEUS_DBG != "0":
         print(f"[{_MOD_TAG}·{tag}] {msg}", file=_sys.stderr, flush=True)
 
-_tr = _dbg  # 兼容旧调用
+_tr = _dbg
+
+def _dbg_state(tag, **kwargs):
+    """键值对状态快照."""
+    if _LYNCEUS_DBG == "0":
+        return
+    parts = [f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v!r}" for k, v in kwargs.items()]
+    _dbg(tag, " | ".join(parts))
+  # 兼容旧调用
 
 
 logger = logging.getLogger(__name__)
@@ -179,6 +187,7 @@ class CollectionBuffer:
 
     def flush(self) -> List[StatisticSample]:
         """Return and clear the buffer — like par2qo's write_to_file."""
+        _dbg("FLUSH", "ENTER flush")
         samples = self._buffer.copy()
         self._buffer.clear()
         self._flush_count += 1
@@ -191,10 +200,12 @@ class CollectionBuffer:
 
     @property
     def size(self) -> int:
+        _dbg("SIZE", "ENTER size")
         return len(self._buffer)
 
     @property
     def is_full(self) -> bool:
+        _dbg("IS_FULL", "ENTER is_full")
         return len(self._buffer) >= self._max_size
 
     def dump_debug(self, prefix: str = "") -> str:
@@ -221,21 +232,15 @@ class CollectionBuffer:
 #   else: error = -log(est/true)
 # We add NaN/zero guards per INV-5.
 
-def cal_rel_error(true_val: float, est_val: float) -> float:
-    """Calculate relative error using log-ratio.
+def cal_rel_error(true_val: float, est_val: float,
+                  mode: str = "log_ratio") -> float:
+    """计算相对误差.
+    改写: 支持两种模式——
+      log_ratio (原始): log(true/est)
+      smape: 2|true-est|/(|true|+|est|), 对称且有界[0,2]
+    改写: 加 q-error 输出到调试日志."""
+    _dbg_state("RELERR", true_val=true_val, est_val=est_val, mode=mode)
 
-    Ported from par2qo/code/utility.py:cal_rel_error (line ~260).
-    Added: zero/NaN guards (INV-5 compliance).
-
-    Original:
-        if true > est:
-            error = math.log(true / est)
-        else:
-            error = - math.log(est / true)
-
-    Lynceus modification: guard against zero/negative values.
-    """
-    _dbg("CAL_REL_", f"cal_rel_error(true_val={true_val}, est_val={est_val})")
     # INV-5: zero and NaN guards
     if true_val <= 0 or est_val <= 0:
         if true_val <= 0 and est_val <= 0:
@@ -245,6 +250,15 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
     if math.isnan(true_val) or math.isnan(est_val):
         return 0.0
 
+    # 改写: q-error (对称最大比) 用于调试输出
+    q_error = max(true_val / est_val, est_val / true_val)
+    _dbg("RELERR", f"q_error={q_error:.3f}")
+
+    if mode == "smape":
+        # 改写: SMAPE — 对称且有界 [0, 2]
+        return 2.0 * abs(true_val - est_val) / (abs(true_val) + abs(est_val))
+
+    # 原始 log_ratio 模式
     if true_val > est_val:
         error = math.log(true_val / est_val)
     else:
@@ -261,6 +275,7 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
 def evenly_sample_range(n: int, lower: float, upper: float) -> List[float]:
     """Generate N evenly-spaced samples in [lower, upper].
 
+    _dbg("EVENLY_S", "ENTER evenly_sample_range")
     Ported from par2qo/code/utility.py:evenly_sample_card (line ~120).
     Removed: numpy dependency.
     Added: edge case handling for n<=1.
@@ -543,6 +558,7 @@ class AllReduceCollector:
 
     def dump_state(self) -> str:
         """Full state dump for breakpoint inspection."""
+        _dbg("DUMP_STA", "ENTER dump_state")
         lines = [
             "╔══ AllReduceCollector State ═══════════════════════════",
             f"║ n_workers          = {len(self._worker_ids)}",
@@ -566,6 +582,7 @@ class AllReduceCollector:
 
     def export_json(self) -> str:
         """Export aggregated statistics as JSON — adapted from par2qo's
+        _dbg("EXPORT_J", "ENTER export_json")
         saveModeltoCache pattern (diagram.py) which dumps model state
         to JSON for later reloading."""
         export = {}
@@ -617,6 +634,7 @@ class AllReduceCollector:
 
     def dump_worker_heatmap(self) -> str:
         """断点辅助: 各 worker 按统计类别的样本数热力图."""
+        _dbg("DUMP_WOR", "ENTER dump_worker_heatmap")
         lines = ["┌── Worker × StatKind Heatmap ──"]
         kinds = list(StatisticKind)
         hdr = "│ worker   " + "  ".join(f"{k.name:>8}" for k in kinds)

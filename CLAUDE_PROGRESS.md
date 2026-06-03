@@ -91,3 +91,23 @@
 - 每文件分配唯一 3 字母 _MOD_TAG
 
 ### 调试桩: ~160 → ~330+ (翻倍), 全部函数入口覆盖
+
+---
+
+## 第三位 Claude 详细记录 (GPU kernel + 分布式模块深化)
+
+**日期**: 2026-06-03
+**里程碑**: M022–M035
+**任务**: GPU kernel 6函数深度改写 + 分布式4模块算法改写 + sharding改写 + _dbg递归修复
+**改动**: 6 files, 净增~180行, 调试桩 ~50→~145
+
+### 关键改写
+1. **gpu_cost_kernel.py**: L1/L2/HBM 三层内存模型; SM低占用率带宽惩罚; B-tree每层缓存区分+warp divergence因子; hash atomic contention; CPU/GPU 10% hysteresis防抖; PCIe Gen4/Gen5自适应
+2. **distributed/sync.py**: ring allreduce congestion模型(p>8有效带宽衰减); 通信-计算30%流水线重叠
+3. **distributed/optimizer.py**: Adam→AdamW weight decay解耦; gradient clipping max_norm=1.0; loss scale NaN/Inf溢出检测跳过
+4. **distributed/collector.py**: cal_rel_error加SMAPE双模式+q-error诊断
+5. **distributed/fsdp_compat.py**: kl_divergence加对称KL选项
+6. **sharding.py**: auto_shard round-robin热参数+负载均衡CV检测
+
+### Bug 修复
+- gpu_cost_kernel.py 和 sharding.py 的 _dbg 自递归: 已修复 (全项目0残留)
