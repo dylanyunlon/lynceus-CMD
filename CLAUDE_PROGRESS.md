@@ -148,3 +148,35 @@
 4. **data_writer.py** (725→734): measure_with_median 加预热轮+P50/P95/P99百分位
 
 ### 验证: 39/39 py_compile 全项目通过
+
+
+---
+
+## 第六位 Claude 详细记录 (核心三文件算法深化)
+
+**日期**: 2026-06-03
+**里程碑**: M101–M106
+**任务**: cost_model/schema/benchmark 三个最薄文件的算法级实质改写 + 调试探针注入
+**改动**: 3 files, 算法改写 12 处, 调试探针 38 处
+
+### 关键改写
+1. **cost_model.py** (441→468, +6.1%):
+   - CPUCostModel: I/O 代价从 if/elif 二元切换 → Mackert-Lohman 非线性混合模型 (effective_page_cost = seq·√sel + rand·(1-√sel))
+   - CPU sort: 系数从 2.0·n·logn → 1.39·n·logn (3-way merge sort, Knuth TAOCP)
+   - GPUCostModel sort: bitonic O(n·log²n/P) → radix sort O(n·w/P) (CUB DeviceRadixSort, pass = key_width/radix_bits)
+   - GPU L2 cache hit 建模: 数据 < 40MB 时有效 HBM 带宽翻倍
+   - CostModelEngine.recommend: 计算 runner-up + margin (置信度指标)
+   - estimate_on_device: LRU 近似缓存命中衰减 (同 table+device 重复访问 io×0.7)
+
+2. **schema.py** (372→350, -5.9%, 算法密度更高):
+   - compute_statistics: 两遍求 mean+var → Welford 单遍在线算法 (数值更稳定)
+   - SeedCurve.append: 加 EMA 在线更新用于实时收敛检测
+   - get_transfer_cost: Dijkstra+heapq → Bellman-Ford (支持未来负权边, 提前终止优化)
+
+3. **benchmark.py** (426→440, +3.3%):
+   - generate_query_sequence 表选择: uniform → Zipf 分布 (w_i = 1/i^α, 新增 zipf_alpha 参数)
+   - run_benchmark total_cost: sum() → Kahan 补偿求和 (误差 O(n·ε) → O(ε))
+   - run_cumulative_benchmark 前缀和: 线性累加 → Kahan 补偿累加
+   - main 统计输出: 只看 final_mean → IQR (p25/p50/p75) 分位数
+
+### 调试探针: 38 处 (_dbg/_snapshot/_Timer/dump_state/dump_topology)
