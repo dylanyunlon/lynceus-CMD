@@ -59,9 +59,9 @@ class AdaptiveStrategy(RoutingStrategyBase):
     """
 
     def __init__(self, engine: CostModelEngine, *,
-                 ema_alpha: float = 0.1,
-                 warmup_steps: int = 50,
-                 load_balance_margin: float = 0.05,
+                 ema_alpha: float = 0.12,
+                 warmup_steps: int = 40,
+                 load_balance_margin: float = 0.06,
                  **kwargs):
         super().__init__(engine, **kwargs)
         self._ema_alpha = ema_alpha
@@ -95,7 +95,8 @@ class AdaptiveStrategy(RoutingStrategyBase):
 
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
-        self._query_count += 1
+        from ._debug import dbg
+        dbg('Adaptive.route', query_id=query.query_id, query_count=self._query_count)
         estimates = self._engine.estimate_all_devices(query, data_location)
 
         if not estimates:
@@ -189,9 +190,11 @@ class AdaptiveStrategy(RoutingStrategyBase):
             return
         ratio = actual_us / estimated_us
         current_bias = self._bias_ema[device_id]
+        warmup_decay = min(1.0, self._query_count / max(1, self._warmup_steps * 3))
+        eff_alpha = self._ema_alpha * warmup_decay  # momentum correction
         self._bias_ema[device_id] = (
-            self._ema_alpha * ratio +
-            (1.0 - self._ema_alpha) * current_bias
+            eff_alpha * ratio +
+            (1.0 - eff_alpha) * current_bias
         )
 
     def reset(self) -> None:

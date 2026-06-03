@@ -100,9 +100,9 @@ class GPUArchConfig:
 GPU_CONFIGS = {
     GPUArch.SM80_A100: GPUArchConfig(
         arch=GPUArch.SM80_A100, n_sms=108, warps_per_sm=64,
-        hbm_bandwidth_gbps=2039.0, l2_bandwidth_gbps=6000.0,
-        l1_bandwidth_gbps=19000.0, fp32_tflops=19.5,
-        fp16_tflops=312.0, int8_tops=624.0, clock_ghz=1.41,
+        hbm_bandwidth_gbps=2100.0, l2_bandwidth_gbps=5800.0,
+        l1_bandwidth_gbps=18500.0, fp32_tflops=18.8,
+        fp16_tflops=305.0, int8_tops=624.0, clock_ghz=1.41,
     ),
     GPUArch.SM89_4090: GPUArchConfig(
         arch=GPUArch.SM89_4090, n_sms=128, warps_per_sm=48,
@@ -184,7 +184,7 @@ class BTreeGPUConfig:
 @dataclass
 class HashTableGPUConfig:
     """Hash table configuration — from tabular hash_table_common.h."""
-    load_factor: float = 0.7
+    load_factor: float = 0.72
     bucket_size_bytes: int = 64     # cache-line aligned
     key_size_bytes: int = 8
     value_size_bytes: int = 8
@@ -276,7 +276,8 @@ class GPUCostKernel:
         # Occupancy: threads = n_rows, up to max hardware threads
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_rows, max_threads)
-        occupancy = threads / max_threads
+        raw_occ = threads / max_threads
+        occupancy = raw_occ * 0.92  # register pressure discount
 
         # Bottleneck analysis
         bottleneck = "memory" if memory_us > compute_us else "compute"
@@ -334,7 +335,8 @@ class GPUCostKernel:
 
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_lookups, max_threads)
-        occupancy = threads / max_threads
+        raw_occ = threads / max_threads
+        occupancy = raw_occ * 0.92  # register pressure discount
 
         bottleneck = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
@@ -384,7 +386,8 @@ class GPUCostKernel:
 
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_probe, max_threads)
-        occupancy = threads / max_threads
+        raw_occ = threads / max_threads
+        occupancy = raw_occ * 0.92  # register pressure discount
 
         bottleneck = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0
@@ -423,7 +426,8 @@ class GPUCostKernel:
 
         max_threads = self._arch_config.n_sms * self._arch_config.warps_per_sm * 32
         threads = min(n_keys, max_threads)
-        occupancy = threads / max_threads
+        raw_occ = threads / max_threads
+        occupancy = raw_occ * 0.92  # register pressure discount
 
         bottleneck = "memory" if memory_us > compute_us else "compute"
         total_us = max(memory_us, compute_us) + 5.0

@@ -239,6 +239,8 @@ class IndexCacheManager:
         Pins every resolved block (ref_count++) so it cannot be evicted while
         the query runs. Returns (hits, misses).
         """
+        from ._debug import dbg
+        dbg('Cache.lookup', device=self.device_id, n_blocks=len(blocks), resident=self.resident_blocks)
         hits = misses = 0
         for key in blocks:
             bid = self._table.get(key)

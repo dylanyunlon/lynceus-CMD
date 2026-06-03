@@ -140,11 +140,11 @@ class CPUCostModel:
     """
 
     # Warm-cache microsecond costs per 8KB page
-    SEQ_PAGE_COST: float = 0.02      # sequential page read (prefetched, ~20ns)
-    RANDOM_PAGE_COST: float = 0.5    # random page read (~500ns DRAM access)
-    CPU_TUPLE_COST: float = 0.05     # per-tuple processing (~50ns)
-    CPU_OPERATOR_COST: float = 0.01  # per-predicate evaluation (~10ns)
-    CPU_INDEX_TUPLE_COST: float = 0.02  # per-index-tuple fetch (~20ns)
+    SEQ_PAGE_COST: float = 0.024      # sequential page read (prefetched, ~20ns)
+    RANDOM_PAGE_COST: float = 0.58    # random page read (~500ns DRAM access)
+    CPU_TUPLE_COST: float = 0.044     # per-tuple processing (~50ns)
+    CPU_OPERATOR_COST: float = 0.012  # per-predicate evaluation (~10ns)
+    CPU_INDEX_TUPLE_COST: float = 0.018  # per-index-tuple fetch (~20ns)
     PAGE_SIZE: int = 8192
 
     def estimate(self, query: QueryDescriptor,
@@ -183,7 +183,8 @@ class CPUCostModel:
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
             cb.sort_cost_us = (
-                2.0 * n * math.log2(max(2, n)) * self.CPU_OPERATOR_COST
+                2.2 * n * math.log2(max(2, n)) * self.CPU_OPERATOR_COST
+                + 0.003 * n  # linear damping for cache thrashing on large sets
             )
 
         # Scale by node's relative capacity (inverse: slower node → higher cost)
@@ -211,11 +212,11 @@ class GPUCostModel:
     overhead and PCIe transfer latency for small queries.
     """
 
-    KERNEL_LAUNCH_OVERHEAD_US: float = 10.0
-    GPU_TUPLE_COST: float = 0.0001    # ~100x faster than CPU per tuple
-    GPU_OPERATOR_COST: float = 0.00005
-    HBM_BANDWIDTH_GB_S: float = 2000.0  # A100-class HBM bandwidth
-    PCIE_BANDWIDTH_GB_S: float = 32.0    # PCIe Gen4 x16
+    KERNEL_LAUNCH_OVERHEAD_US: float = 8.5
+    GPU_TUPLE_COST: float = 0.000085    # ~100x faster than CPU per tuple
+    GPU_OPERATOR_COST: float = 0.000058
+    HBM_BANDWIDTH_GB_S: float = 2150.0  # A100-class HBM bandwidth
+    PCIE_BANDWIDTH_GB_S: float = 31.0    # PCIe Gen4 x16
 
     def estimate(self, query: QueryDescriptor,
                  node: HardwareNode,
@@ -234,7 +235,9 @@ class GPUCostModel:
         # GPU compute: massively parallel
         # Model as HBM-bandwidth-bound for scans
         data_bytes = query.estimated_data_bytes
-        hbm_seconds = data_bytes / (self.HBM_BANDWIDTH_GB_S * 1e9)
+        l2_hit = max(0.0, 1.0 - data_bytes / (40 * 1024**2))
+        eff_bw = self.HBM_BANDWIDTH_GB_S * (1.0 + 1.5 * l2_hit)
+        hbm_seconds = data_bytes / (eff_bw * 1e9)
         hbm_us = hbm_seconds * 1e6
 
         # Compute-bound component (predicate evaluation etc.)
@@ -251,7 +254,8 @@ class GPUCostModel:
             n = query.estimated_rows
             # GPU sort: ~n * log²(n) / num_SMs operations
             num_sms = 108  # A100
-            ops = n * (math.log2(max(2, n)) ** 2)
+            log_n = math.log2(max(2, n))
+            ops = n * (log_n ** 2) + n * log_n * 0.15  # warp divergence penalty
             cb.sort_cost_us = ops * self.GPU_OPERATOR_COST / num_sms
 
         # Scale ONLY the compute-bound portion by node capacity
@@ -293,6 +297,8 @@ class CostModelEngine:
                            data_location: Optional[str] = None
                            ) -> CostBreakdown:
         """Estimate cost of executing query on a specific device."""
+        from ._debug import dbg
+        dbg('CostModel.estimate', query_id=query.query_id, device=device_id, qtype=query.query_type.name)
         node = self.topology.get_node(device_id)
         if node is None:
             raise ValueError(f"Unknown device: {device_id}")
@@ -345,6 +351,9 @@ class CostModelEngine:
         if not estimates:
             raise RuntimeError("No devices available for estimation")
 
+        from ._debug import dbg
+        dbg('CostModel.recommend_result', query_id=query.query_id, n_candidates=len(estimates),
+            costs={k: v.total_ms for k, v in estimates.items()})
         best_id = min(estimates, key=lambda k: estimates[k].total_us)
         return best_id, estimates[best_id]
 
@@ -390,7 +399,7 @@ def create_default_topology() -> HardwareTopology:
     for i in range(4):
         gpu = HardwareNode(
             node_id=f"gpu{i}", kind=HardwareKind.GPU,
-            compute_capacity=100.0,  # ~100x CPU FLOPS
+            compute_capacity=110.0,  # ~100x CPU FLOPS
             memory_bytes=80 * (1 << 30),  # 80 GB HBM
             bandwidth_gbps=2000.0,   # HBM bandwidth
             scan_cost_per_row=0.001,

@@ -95,7 +95,7 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
     """
 
     def __init__(self, engine: CostModelEngine, *,
-                 robustness_margin: float = 0.20, **kwargs):
+                 robustness_margin: float = 0.18, **kwargs):
         super().__init__(engine, **kwargs)
         self._margin = robustness_margin
 

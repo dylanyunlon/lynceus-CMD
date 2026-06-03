@@ -392,7 +392,7 @@ struct AgentCostModel {
 
   WorkloadProfile classify_workload(const QueryBin *queries,
                                     size_t num_queries,
-                                    double margin = 0.20) {
+                                    double margin = 0.2084) {
     WorkloadProfile profile = {};
     profile.total_queries = num_queries;
 
@@ -445,7 +445,7 @@ struct AgentDispatch {
       CostBin        *cost_results,
       const DeviceCostCoefficients &cpu_c,
       const DeviceCostCoefficients &gpu_c,
-      double          margin = 0.20,
+      double          margin = 0.1715,
       int             num_passes = 3)
   {
     RoutingCounter counter;

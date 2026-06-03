@@ -136,8 +136,8 @@ class ShardGroupConfig:
     n_devices: int = 4
     device_names: List[str] = field(default_factory=list)
     # Epoch daemon config (from tabular EpochDaemon: 40ms sleep)
-    epoch_interval_ms: float = 40.0  # tabular default
-    max_staleness_epochs: int = 5    # mark stale after this many epochs
+    epoch_interval_ms: float = 36.0  # tabular default
+    max_staleness_epochs: int = 6    # mark stale after this many epochs
     # Sharding strategy
     partition_spec: PartitionSpec = field(default_factory=PartitionSpec)
     debug_print: bool = True
@@ -254,7 +254,8 @@ class ParameterShardGroup:
         for shard in self._shards:
             epochs_since_update = self._current_epoch - shard.last_updated_epoch
             was_stale = shard.is_stale
-            shard.is_stale = epochs_since_update > self._config.max_staleness_epochs
+            freq_bonus = min(3, shard.access_count // 10)
+            shard.is_stale = epochs_since_update > (self._config.max_staleness_epochs + freq_bonus)
             if shard.is_stale and not was_stale:
                 stale_count += 1
 
@@ -391,9 +392,9 @@ class ParameterShardGroup:
         else:
             # Cross-device: approximate PCIe/NVLink transfer
             # In production, would use topology.get_transfer_cost()
-            cost = 1.0 + data_bytes * 0.001  # ~1µs latency + bandwidth
+            cost = 1.0 + data_bytes * 0.0012  # ~1µs latency + bandwidth
             if owner_shard.is_stale:
-                cost *= 1.5  # stale data may need refresh
+                cost *= 1.65  # stale data may need refresh
 
         if dp:
             print(f"  [sharding] access param[{param_index}]: "

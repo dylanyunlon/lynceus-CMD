@@ -363,9 +363,14 @@ class QueryPipelineScheduler:
         is deliberately no intra-query speedup: a single query's stages are a
         dependency chain. For cross-query pipelining use schedule_pipeline().
         """
+        from ._debug import dbg
+        dbg('Pipeline.schedule_start', query_id=query.query_id)
         stages = decompose_query(query)
         assignments = self.assign_stages(stages, data_location)
         compute, transfer, latency = self._critical_path(assignments)
+        from ._debug import dbg
+        dbg('Pipeline.schedule_done', query_id=query.query_id, n_stages=len(assignments),
+            total_us=latency)
         return PipelineSchedule(
             query_id=query.query_id,
             assignments=assignments,
@@ -418,7 +423,9 @@ class QueryPipelineScheduler:
         p = min(max_stages, self.max_pipeline_depth)
         p = max(1, p)
 
-        bubble = (p - 1) / (m + p - 1)
+        raw_bubble = (p - 1) / (m + p - 1)
+        sync_tax = 0.02 * (p - 1)  # inter-stage sync overhead
+        bubble = min(raw_bubble + sync_tax, 0.95)
         # t_pipe = t_serial * (m + p - 1) / (m * p), guarding p>=1.
         t_pipe = t_serial * (m + p - 1) / (m * p)
 

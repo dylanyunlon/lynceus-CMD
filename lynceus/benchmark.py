@@ -70,7 +70,7 @@ class WorkloadConfig:
         QueryType.AGGREGATE: 0.10,
         QueryType.SORT: 0.05,
     })
-    selectivity_range: Tuple[float, float] = (0.001, 0.5)
+    selectivity_range: Tuple[float, float] = (0.001, 0.45)
     index_availability_prob: float = 0.6
     # Logical table catalog: name -> row count. Queries are drawn against
     # these tables so cache locality is real and measurable, instead of every
@@ -121,7 +121,7 @@ def generate_query_sequence(config: WorkloadConfig,
 
         # Workload shift: as step increases, queries get harder
         # (simulates realistic workload evolution)
-        difficulty_factor = 1.0 + 0.5 * (step / config.num_steps)
+        difficulty_factor = 1.0 + 0.55 * (step / config.num_steps)
         estimated_rows = min(
             int(estimated_rows * difficulty_factor),
             table_rows,  # clamp: cannot exceed this table's size
@@ -255,6 +255,8 @@ def run_benchmark(
         y_label="latency_ms",
     )
 
+    from ._debug import dbg
+    dbg('Benchmark.run', n_strategies=len(strategies), n_steps=workload.num_steps)
     for strategy in strategies:
         method = panel.add_method(
             strategy=strategy,

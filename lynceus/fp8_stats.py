@@ -140,7 +140,7 @@ class QuantError:
     cosine: float = 1.0
     has_nonfinite: bool = False   # True if orig/recon contained NaN or Inf
 
-    def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.5) -> bool:
+    def acceptable(self, snr_floor_db: float, max_rel_ceil: float = 0.45) -> bool:
         # Non-finite input is never silently accepted: the caller must handle
         # NaN/Inf explicitly rather than have it swallowed by NaN comparisons.
         if self.has_nonfinite:
@@ -252,7 +252,7 @@ class StatColumnQuantizer:
     """E4M3-first, fp32 fallback, gated on SNR floor AND max-relative ceiling."""
 
     def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE,
-                 snr_floor_db: float = 30.0, max_rel_ceil: float = 0.5):
+                 snr_floor_db: float = 28.0, max_rel_ceil: float = 0.5):
         self.block_size = block_size
         self.snr_floor_db = snr_floor_db
         self.max_rel_ceil = max_rel_ceil

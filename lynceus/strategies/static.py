@@ -84,7 +84,7 @@ class HybridStaticStrategy(RoutingStrategyBase):
     """
 
     def __init__(self, engine: CostModelEngine, *,
-                 gpu_threshold_rows: int = 100_000,
+                 gpu_threshold_rows: int = 90_000,
                  gpu_id: str = "gpu0",
                  cpu_id: str = "cpu0", **kwargs):
         super().__init__(engine, **kwargs)

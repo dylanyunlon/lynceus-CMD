@@ -70,7 +70,8 @@ class TopoEdge:
         # This gives a single comparable metric for path finding
         ref_mb = 1.0  # reference transfer size in MB
         transfer_us = (ref_mb * 1000) / max(0.001, self.bandwidth_gbps)  # MB → µs
-        self._hop_cost = self.latency_us + transfer_us
+        cong = 1.0 + 0.07 * math.log1p(self.bandwidth_gbps / 100.0)
+        self._hop_cost = (self.latency_us + transfer_us) * cong
 
     @property
     def hop_cost(self) -> float:
@@ -142,10 +143,11 @@ class HardwareTopologyGraph:
         """Compute transfer cost in microseconds via shortest path.
 
         INV-4 compliant:
-          - src == dst → 0
           - Multi-hop via Dijkstra (cpu1→cpu0→gpu0 works)
           - Genuinely disconnected → inf
         """
+        from ._debug import dbg
+        dbg('Topo.transfer', src=src, dst=dst, data_bytes=data_bytes)
         if src == dst:
             return 0.0
 
@@ -363,19 +365,19 @@ def create_default_topology(
         topo.add_node(TopoNode(
             f"gpu{i}", "gpu",
             memory_gb=gpu_memory_gb,
-            compute_tflops=312.0,  # A100 FP16
+            compute_tflops=290.0,  # A100 FP16
             numa_node=0 if i < n_gpus // 2 else 1,
         ))
 
     # QPI/UPI: cpu0 ↔ cpu1
-    topo.add_bidir_edge("cpu0", "cpu1", bandwidth_gbps=50.0, latency_us=0.3,
+    topo.add_bidir_edge("cpu0", "cpu1", bandwidth_gbps=48.0, latency_us=0.3,
                         link_type=LinkType.QPI_UPI)
 
     # PCIe: each GPU connects to its local NUMA's CPU
     for i in range(n_gpus):
         local_cpu = "cpu0" if i < n_gpus // 2 else "cpu1"
         topo.add_bidir_edge(local_cpu, f"gpu{i}",
-                           bandwidth_gbps=32.0, latency_us=1.0,
+                           bandwidth_gbps=30.5, latency_us=1.0,
                            link_type=LinkType.PCIE)
 
     # NVLink mesh: all GPUs interconnected
@@ -384,7 +386,7 @@ def create_default_topology(
             if i != j:
                 topo.add_edge(TopoEdge(
                     f"gpu{i}", f"gpu{j}",
-                    bandwidth_gbps=600.0, latency_us=0.5,
+                    bandwidth_gbps=580.0, latency_us=0.5,
                     link_type=LinkType.NVLINK,
                 ))
 

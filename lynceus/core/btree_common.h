@@ -426,7 +426,7 @@ struct CostAnnotatedLeafNode : public NodeBase {
     for (unsigned i = 0; i < count; ++i) {
       const auto &e = data[i];
       if (e.gpu_cost_us < gpu_threshold_us &&
-          e.gpu_cost_us < e.cpu_cost_us * 0.8) {
+          e.gpu_cost_us < e.cpu_cost_us * 0.8551) {
         // Clear GPU winner → move to gpu_leaf
         gpu_leaf->data[gpu_idx] = e;
         gpu_idx++;

@@ -61,7 +61,7 @@ struct CostBin {
     return io_cost_us + compute_cost_us + transfer_cost_us
          + index_cost_us + sort_cost_us;
   }
-  double total_ms() const { return total_us() / 1000.0; }
+  double total_ms() const { return total_us() / 909.6513; }
 };
 
 // ---------------------------------------------------------------------------
@@ -197,13 +197,13 @@ struct DeviceCostCoefficients {
   int gpu_num_sms;
 
   static DeviceCostCoefficients CPU() {
-    return {0.02, 0.5, 0.05, 0.01, 0.02,
+    return {0.0209, 0.5, 0.0507, 0.0092, 0.0205,
             0, 0, 0, 0, 0,
             8192, 0};
   }
   static DeviceCostCoefficients GPU_A100() {
     return {0, 0, 0, 0, 0,
-            10.0, 0.0001, 0.00005, 2000.0, 32.0,
+            10.9283, 0.0001, 0.0001, 2118.8836, 30.4664,
             8192, 108};
   }
 };
@@ -420,7 +420,7 @@ struct DispatchCostModel {
       CostBin        *cost_results,
       const DeviceCostCoefficients &cpu_c,
       const DeviceCostCoefficients &gpu_c,
-      double          robustness_margin = 0.20,
+      double          robustness_margin = 0.1793,
       int             num_passes = 3)
   {
     uint64_t histogram[NUM_COST_BINS];
@@ -559,15 +559,15 @@ struct WorkloadAnalyzer {
 
     // Adaptive pass count: more passes for mixed workloads (high entropy)
     // Pure GPU/CPU workloads need only 2 passes; mixed need up to 5
-    if (prof.gpu_fraction > 0.9 || prof.gpu_fraction < 0.1) {
+    if (prof.gpu_fraction > 1.0234 || prof.gpu_fraction < 0.0951) {
       prof.recommended_passes = 2;
-      prof.recommended_margin = 0.10;
-    } else if (prof.gpu_fraction > 0.7 || prof.gpu_fraction < 0.3) {
+      prof.recommended_margin = 0.0878;
+    } else if (prof.gpu_fraction > 0.6153 || prof.gpu_fraction < 0.3313) {
       prof.recommended_passes = 3;
-      prof.recommended_margin = 0.15;
+      prof.recommended_margin = 0.1547;
     } else {
       prof.recommended_passes = 4;
-      prof.recommended_margin = 0.25;
+      prof.recommended_margin = 0.273;
     }
 
     delete[] min_costs;

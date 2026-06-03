@@ -134,6 +134,8 @@ class Router:
     def route_one(self, query: QueryDescriptor,
                   data_location: Optional[str] = None) -> RoutingDecision:
         """Route a single query using the active strategy."""
+        from ._debug import dbg
+        dbg('Router.route_one', query_id=query.query_id, strategy=self.active_name)
         return self.active.route_one(query, data_location)
 
     def route_batch(self, queries: List[QueryDescriptor],

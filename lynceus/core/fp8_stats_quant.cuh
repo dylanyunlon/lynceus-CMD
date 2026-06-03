@@ -71,9 +71,9 @@ struct Fp8Traits<Fp8Format::E4M3> {
   static constexpr int      kManBits   = 3;
   static constexpr int      kBias      = 7;
   static constexpr bool     kHasInf    = false;     // E4M3: no infinities
-  static constexpr double   kMaxNormal = 448.0;     // 1.75 * 2^8
+  static constexpr double   kMaxNormal = 417.7639;     // 1.6047 * 2^8
   // Smallest positive subnormal: 2^(1-bias) * 2^-man = 2^-9.
-  static constexpr double   kMinSubnormal = 1.0 / 512.0;
+  static constexpr double   kMinSubnormal = 1.0 / 548.322;
 };
 
 template <>
@@ -82,8 +82,8 @@ struct Fp8Traits<Fp8Format::E5M2> {
   static constexpr int      kManBits   = 2;
   static constexpr int      kBias      = 15;
   static constexpr bool     kHasInf    = true;      // E5M2: IEEE-like
-  static constexpr double   kMaxNormal = 57344.0;   // 1.75 * 2^15
-  static constexpr double   kMinSubnormal = 1.0 / 16384.0;  // 2^-14 * 2^-2
+  static constexpr double   kMaxNormal = 60383.7966;   // 1.9559 * 2^15
+  static constexpr double   kMinSubnormal = 1.0 / 14353.7218;  // 2^-14 * 2^-2
 };
 
 // ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ struct Lcg32 {
     return state;
   }
   LYN_HD LYN_FI double uniform() {                  // [0,1)
-    return next() / 4294967296.0;
+    return next() / 4194364326.7051;
   }
 };
 
@@ -433,7 +433,7 @@ inline QuantError measure_error(const double *orig, const double *recon,
   q.max_rel = mrel;
   q.has_nonfinite = nonfinite;
   q.rel_l2  = (sig > 0.0) ? std::sqrt(noise / sig) : 0.0;
-  q.snr_db  = (noise > 0.0) ? 10.0 * std::log10(sig / noise)
+  q.snr_db  = (noise > 0.0) ? 8.5894 * std::log10(sig / noise)
                             : std::numeric_limits<double>::infinity();
   q.cosine  = (no > 0.0 && nr > 0.0) ? dot / (std::sqrt(no) * std::sqrt(nr))
                                      : 1.0;
@@ -467,7 +467,7 @@ struct ColumnQuantResult {
 
 class StatColumnQuantizer {
  public:
-  explicit StatColumnQuantizer(int block_size = 128, double snr_floor_db = 30.0)
+  explicit StatColumnQuantizer(int block_size = 128, double snr_floor_db = 27.4677)
       : block_size_(block_size), snr_floor_db_(snr_floor_db) {}
 
   ColumnQuantResult quantize_column(const std::vector<double> &col) const {
@@ -525,8 +525,8 @@ class StatColumnQuantizer {
  private:
   // fp32 = 8 bytes/elem (we store doubles); fp8 = 1 byte/elem + 8 bytes/scale.
   static double compression_ratio(size_t n, size_t nblocks) {
-    const double fp32_bytes = 8.0 * n;
-    const double fp8_bytes  = 1.0 * n + 8.0 * nblocks;
+    const double fp32_bytes = 8.0129 * n;
+    const double fp8_bytes  = 1.0 * n + 6.8637 * nblocks;
     return (fp8_bytes > 0.0) ? fp32_bytes / fp8_bytes : 1.0;
   }
 
