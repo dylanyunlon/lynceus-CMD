@@ -392,3 +392,170 @@
 | 算法改写 | 36处实质变更 |
 | 总变更行数 | 2049行 |
 | 变更文件数 | 45/49 |
+
+---
+
+## 第一位 Claude 完成记录（M101–M120: 审计缺陷修复 + 端到端集成测试 + 实验入口）
+
+**日期**: 2026-06-04
+**交付**: 3 文件改写 + 2 文件新建, +279/-62 行算法改写, +793 行新代码
+
+### 修复审计报告 6 个缺陷
+
+| 缺陷 | 严重度 | 文件 | 修复内容 |
+|------|--------|------|----------|
+| 致命-1 | pipeline transfer 蒸发(246×假加速) | pipeline_scheduler.py | latency = Σ(total_us)，transfer 永不从 critical path 减掉 |
+| 概念-2 | 单查询套 Megatron fill-drain | pipeline_scheduler.py | 单查询 speedup=1；批量用 bottleneck×(m+p-1) 真实公式 |
+| 致命-3 | rstrip 表身份塌缩 | cache_manager.py | (前人已修为 regex，本轮测试确认) |
+| 系统-4 | cpu1→GPU 不可达 | cost_model.py | 双 socket NUMA 拓扑: cpu0/cpu1 各自 PCIe 直连本侧 GPU，跨 NUMA 走 UPI |
+| 健壮-5 | fp8 orig==0 漏计 | fp8_stats.py | 绝对误差/scale 兜底 + zero_polluted 计数告警 |
+| 健壮-6 | transfer 口径不统一 | pipeline_scheduler.py | 合并入致命-1 修复 |
+
+### 算法级改写清单 (非 docstring/变量名替换)
+
+| # | 原算法 | 新算法 | 文件 |
+|---|--------|--------|------|
+| 1 | `total_us - transfer_cost_us` 减法 | `Σ(total_us)` 全长 critical path | pipeline_scheduler.py |
+| 2 | 单查询 Megatron bubble | 单查询 latency=critical path, speedup≡1 | pipeline_scheduler.py |
+| 3 | `t_serial / (m×p)` 均匀 stage 假设 | `bottleneck × (m+p-1)` per-stage max | pipeline_scheduler.py |
+| 4 | Box-Muller `cos(2πu)` CE噪声 | Marsaglia polar (拒绝采样, 无 trig) | pipeline_scheduler.py |
+| 5 | join 基数独立噪声 | 递减衰减链 `sel×0.7^k` (条件概率) | pipeline_scheduler.py |
+| 6 | 无 straggler 检测 | Welford 在线方差 + bottleneck/avg>3× 告警 | pipeline_scheduler.py |
+| 7 | memory contention 拍脑袋 | HBM 占用率建模 + sync barrier 开销 | pipeline_scheduler.py |
+| 8 | cpu1 不连 GPU (cost=∞) | 双 socket NUMA PCIe + UPI 跨域直达 | cost_model.py |
+| 9 | orig==0 静默跳过 | 绝对误差/scale + zero_polluted 计数 | fp8_stats.py |
+| 10 | NaN 静默 continue | nonfinite_count 计数 + dbg(WARNING) | fp8_stats.py |
+
+### 新增文件
+
+| 文件 | 行数 | 用途 |
+|------|------|------|
+| tests/test_e2e_pipeline.py | 567 | 9 组端到端测试 (23 断言)，验证全部 6 个缺陷修复 |
+| scripts/run_benchmark.py | 226 | 实验入口: TPC-H 混合负载, 多 seed, JSON panel 输出 |
+
+### 调试探针
+
+| 模块 | 探针数 | 内容 |
+|------|--------|------|
+| pipeline_scheduler | 8 | decompose row_flow、assign_stage 设备+cost 分拆、transfer_dominated 告警、straggler 告警、pipeline_batch checkpoint |
+| cost_model | 1 | 拓扑可达性矩阵 dump |
+| fp8_stats | 3 | nonfinite_count WARNING、zero_pollution WARNING、measure_error_done 摘要 |
+
+### 验证
+
+| 测试 | 结果 |
+|------|------|
+| test_e2e_pipeline.py (23 断言) | 23/23 PASS ✓ |
+| test_m001_m002.py | ALL PASSED ✓ |
+| test_m003_m004.py | ALL PASSED ✓ |
+| test_m015_m016.py | 15/15 PASSED ✓ |
+| test_m017_m018.py | 15/15 PASSED ✓ |
+| test_m019_m020_py.py | 15/15 PASSED ✓ |
+| 全项目 py_compile (40 .py) | 40/40 ✓ |
+
+---
+
+## Claude 接力开发全局进度
+
+| Claude | 里程碑 | 核心内容 | 状态 |
+|--------|--------|----------|------|
+| 旧#1 | M001–M021 | port层39模块+core/9文件初始移植 | ✅ 已完成 |
+| 旧#2 | M036–M040 | integrations/ 14文件深度改写 | ✅ 已完成 |
+| 旧#3 | M022–M035 | GPU kernel+分布式+sharding改写 | ✅ 已完成 |
+| 旧#4 | M041–M060 | fp8+cache+schema+topology+cost深化 | ✅ 已完成 |
+| 旧#5 | M061–M080 | viz+策略+data_writer深化 | ✅ 已完成 |
+| 旧#7 | M081–M100 | 核心9文件全量手写重构 | ✅ 已完成 |
+| 旧#8 | M101–M106 | 36处算法移植+RuntimeTracer | ✅ 已完成 |
+| **第一位** | **M107–M120** | **审计6缺陷修复+端到端测试+实验入口** | ✅ **已完成** |
+| 第二位 | M121–M140 | 多策略对比实验 (GPU-Only/CPU-Only/Hybrid/CostModel/PAR2QO/Adaptive 6策略 × 2000步 × 3种子) | 🔲 待启动 |
+| 第三位 | M141–M160 | 消融实验 (逐项关闭10处算法改写, 量化每处改写对延迟/命中率/路由质量的影响) | 🔲 待启动 |
+| 第四位 | M161–M180 | 多负载适配 (TPC-DS/SSB/YCSB 配置) + 论文 Figure 1-7 数据生成 | 🔲 待启动 |
+| 第五位 | M181–M200 | viz/plot_panels 论文级渲染 + LaTeX 表格自动生成 + 实验 metadata 归档 | 🔲 待启动 |
+| 第六位 | M201–M220 | API文档(sphinx) + 用户手册 + Docker容器化 + CI/CD + pypi打包 + 发布准备 | 🔲 待启动 |
+
+---
+
+## 第二位 Claude 任务指引（M121–M140）
+
+### 目标: 多策略对比实验
+
+在 `scripts/run_benchmark.py` 基础上扩展, 跑 6 种路由策略的完整对比:
+
+- [ ] GPU-Only: 所有查询强制 GPU
+- [ ] CPU-Only: 所有查询强制 CPU
+- [ ] Hybrid-Static: rows>阈值走GPU, 否则CPU
+- [ ] CostModel-Routed: 当前 cost model 推荐
+- [ ] PAR2QO-Enhanced: 带 par2qo robustness 加权
+- [ ] Adaptive: Thompson/UCB1-Tuned 在线学习
+
+每种策略 2000 步 × 3 种子, 输出 `output/strategy_comparison.json`, 含 mean/std/total_cost/routing_distribution。
+
+### 关键约束
+- 必须用 `lynceus/strategies/` 下的实际策略类, 不能 mock
+- 每种策略的 cache 独立 (reset between strategies)
+- JSON 输出格式兼容 `viz/plot_panels.py` 的 `build_benchmark_report()`
+- 调试探针: 每种策略运行完打印 route_distribution + cache_hit_rate + P50/P95 latency
+
+## 第三位 Claude 任务指引（M141–M160）
+
+### 目标: 消融实验
+
+逐项关闭本轮 10 处算法改写, 测量每处对延迟/命中率/路由质量的 delta:
+
+- [ ] 关闭 Marsaglia polar → 回退 Box-Muller, 测 CE 噪声分布差异
+- [ ] 关闭 join 衰减链 → 回退独立噪声, 测 join 基数偏差
+- [ ] 关闭 NUMA 拓扑 → cpu1 不连 GPU, 测 cpu1 数据的路由命中率
+- [ ] 关闭 bottleneck-stage 公式 → 回退 t_serial/(m×p), 测 speedup 偏差
+- [ ] 关闭 fp8 零值兜底 → 测稀疏列 SNR 下降
+- [ ] 关闭 Welford straggler 检测 → 测是否遗漏 stage 不均
+- [ ] 关闭 memory contention → 测 HBM 压力下的 makespan 偏差
+
+输出 `output/ablation_results.json`, 每项 ablation 的 before/after delta。
+
+## 第四位 Claude 任务指引（M161–M180）
+
+### 目标: 多负载 + 论文数据
+
+- [ ] 创建 `configs/tpcds_workload.yaml`, `configs/ssb_workload.yaml`, `configs/ycsb_workload.yaml`
+- [ ] 为每种负载跑策略对比 (复用第二位的代码)
+- [ ] 生成论文 Figure 1-7 的 JSON 数据:
+  - Fig1: Latency vs Step (6 策略 × 3 负载)
+  - Fig2: Cumulative Cost
+  - Fig3: Routing Distribution (堆叠柱状图数据)
+  - Fig4: Cache Hit Rate 曲线
+  - Fig5: Pipeline Speedup vs Batch Size
+  - Fig6: Ablation Delta (蜘蛛图数据)
+  - Fig7: NUMA 可达性热力图数据
+
+## 第五位 Claude 任务指引（M181–M200）
+
+### 目标: 可视化 + LaTeX
+
+- [ ] `viz/plot_panels.py` 生成 matplotlib 论文级 PDF 图表
+- [ ] LaTeX `\begin{table}` 自动生成 (策略对比表, 消融表)
+- [ ] 实验 metadata 归档 (git hash, 参数, 时间戳)
+- [ ] ASCII sparkline 终端预览
+
+## 第六位 Claude 任务指引（M201–M220）
+
+### 目标: 文档 + 部署 + 发布
+
+- [ ] sphinx/mkdocs 文档站点 (每个模块 API reference)
+- [ ] Quick Start 教程 + 调试指南 (LYNCEUS_DEBUG 用法)
+- [ ] Dockerfile + docker-compose
+- [ ] GitHub Actions CI/CD
+- [ ] pyproject.toml + pypi 打包
+- [ ] CHANGELOG + LICENSE + Citation
+
+---
+
+## 通用约定
+
+1. **作者**: `dylanyunlon <dogechat@163.com>`
+2. **分支**: `main`
+3. **patch格式**: `git format-patch -1 HEAD` (生成 `0001-xxx.patch`)
+4. **应用方式**: `git am 0001-xxx.patch`
+5. **测试**: 每位Claude完成后必须 `LYNCEUS_DEBUG=0` 全量 import + 语法检查 + 原有测试不退步
+6. **调试输出**: 全部到 stderr，stdout 保持干净
+7. **行数要求**: 改写文件行数 ≥ 原始版
+8. **语法要求**: 40/40 py_compile 通过

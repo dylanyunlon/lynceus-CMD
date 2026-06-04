@@ -145,7 +145,12 @@ class QuantError:
 
 
 def measure_error(orig: List[float], recon: List[float]) -> QuantError:
-    """改动: Kahan compensated summation for sig/noise/dot/no/nr。"""
+    """改动: Kahan compensated summation for sig/noise/dot/no/nr.
+    FIX(INV-5): orig==0 用绝对误差兜底; NaN 输入显式标记到 has_nonfinite+计数。
+    FIX(INV-6): 零值污染检测 — 原值为0但量化后非零的误差不再被遗漏。
+    """
+    from ._debug import dbg
+
     # Kahan accumulators: (sum, compensation)
     sig_s, sig_c = 0.0, 0.0
     noise_s, noise_c = 0.0, 0.0
@@ -154,11 +159,14 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     nr_s, nr_c = 0.0, 0.0
     mx = mrel = 0.0
     nonfinite = False
+    nonfinite_count = 0       # FIX: 计数而非仅 bool
+    zero_polluted_count = 0   # FIX: orig==0 被量化为非零的计数
 
     amax = 0.0
     for o in orig:
         if not math.isfinite(o):
             nonfinite = True
+            nonfinite_count += 1
         else:
             amax = max(amax, abs(o))
     scale = amax if amax > 0.0 else 1.0
@@ -172,6 +180,7 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
     for o, r in zip(orig, recon):
         if not (math.isfinite(o) and math.isfinite(r)):
             nonfinite = True
+            nonfinite_count += 1
             continue
         e = o - r
         sig_s, sig_c = kahan_add(sig_s, sig_c, o * o)
@@ -180,13 +189,36 @@ def measure_error(orig: List[float], recon: List[float]) -> QuantError:
         no_s, no_c = kahan_add(no_s, no_c, o * o)
         nr_s, nr_c = kahan_add(nr_s, nr_c, r * r)
         mx = max(mx, abs(e))
-        denom = abs(o) if abs(o) > 0.0 else scale
-        mrel = max(mrel, abs(e) / denom)
+        # FIX(INV-5): orig==0 时用绝对误差 / scale 做 relative 兜底
+        # 这保证了零值被量化成 ±subnormal×scale 时误差不被遗漏
+        if abs(o) > 0.0:
+            mrel = max(mrel, abs(e) / abs(o))
+        else:
+            # orig==0: 绝对误差除以全局 scale 做归一化 relative
+            mrel = max(mrel, abs(e) / scale)
+            if abs(r) > 0.0:
+                zero_polluted_count += 1
+
+    # FIX: NaN 输入时在调试输出里明确警告
+    if nonfinite_count > 0:
+        dbg("FP8·nonfinite_input_WARNING",
+            nonfinite_count=nonfinite_count,
+            total=len(orig),
+            pct=f"{100.0 * nonfinite_count / max(1, len(orig)):.1f}%")
+    if zero_polluted_count > 0:
+        dbg("FP8·zero_pollution_WARNING",
+            zero_polluted=zero_polluted_count,
+            msg="orig==0 quantized to nonzero — sparse column may be corrupted")
 
     q = QuantError(max_abs=mx, max_rel=mrel, has_nonfinite=nonfinite)
     q.rel_l2 = math.sqrt(noise_s / sig_s) if sig_s > 0 else 0.0
     q.snr_db = 10.0 * math.log10(sig_s / noise_s) if noise_s > 0 else math.inf
     q.cosine = dot_s / (math.sqrt(no_s) * math.sqrt(nr_s)) if no_s > 0 and nr_s > 0 else 1.0
+
+    dbg("FP8·measure_error_done",
+        max_abs=f"{q.max_abs:.6e}", max_rel=f"{q.max_rel:.6e}",
+        snr_db=f"{q.snr_db:.1f}", cosine=f"{q.cosine:.6f}",
+        zero_polluted=zero_polluted_count, nonfinite=nonfinite_count)
     return q
 
 

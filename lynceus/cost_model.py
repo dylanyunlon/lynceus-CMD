@@ -323,17 +323,38 @@ def create_default_topology() -> HardwareTopology:
         gpus.append(gpu)
     for n in [cpu0, cpu1] + gpus:
         topo.add_node(n)
-    for gpu in gpus:
+    # --- FIX(INV-4): 双socket拓扑 — cpu0/cpu1 各自直连本侧GPU ---
+    # 原版只连 cpu0→GPU, cpu1→GPU 不可达(cost=inf), 砍掉一半NUMA加速。
+    # 真实服务器: gpu0,gpu1 在 NUMA-0 (挂cpu0), gpu2,gpu3 在 NUMA-1 (挂cpu1)。
+    # 跨NUMA走 UPI 互联, 带宽低于本地 PCIe, 但绝不是 inf。
+    half = len(gpus) // 2
+    for idx, gpu in enumerate(gpus):
+        local_cpu = "cpu0" if idx < half else "cpu1"
+        remote_cpu = "cpu1" if idx < half else "cpu0"
+        # 本地 PCIe 直连 (32 GB/s, ~1µs)
         topo.add_edge(TopologyEdge(
-            src="cpu0", dst=gpu.node_id,
+            src=local_cpu, dst=gpu.node_id,
             bandwidth_gbps=32.0, latency_us=1.0,
             link_type=HardwareKind.PCIE,
         ))
         topo.add_edge(TopologyEdge(
-            src=gpu.node_id, dst="cpu0",
+            src=gpu.node_id, dst=local_cpu,
             bandwidth_gbps=32.0, latency_us=1.0,
             link_type=HardwareKind.PCIE,
         ))
+        # 跨NUMA: remote_cpu → UPI → local_cpu → PCIe → GPU
+        # 建模为直达边但带宽受 UPI 瓶颈限制 (~22 GB/s), 延迟 +0.3µs
+        topo.add_edge(TopologyEdge(
+            src=remote_cpu, dst=gpu.node_id,
+            bandwidth_gbps=22.0, latency_us=1.3,
+            link_type=HardwareKind.PCIE,
+        ))
+        topo.add_edge(TopologyEdge(
+            src=gpu.node_id, dst=remote_cpu,
+            bandwidth_gbps=22.0, latency_us=1.3,
+            link_type=HardwareKind.PCIE,
+        ))
+    # NVLink 全互联 (GPU ↔ GPU)
     for i, g1 in enumerate(gpus):
         for j, g2 in enumerate(gpus):
             if i != j:
@@ -342,6 +363,7 @@ def create_default_topology() -> HardwareTopology:
                     bandwidth_gbps=600.0, latency_us=0.5,
                     link_type=HardwareKind.NVLINK,
                 ))
+    # UPI 双向互联 (cpu0 ↔ cpu1)
     topo.add_edge(TopologyEdge(
         src="cpu0", dst="cpu1", bandwidth_gbps=50.0, latency_us=0.3,
         link_type=HardwareKind.NETWORK,
@@ -350,4 +372,16 @@ def create_default_topology() -> HardwareTopology:
         src="cpu1", dst="cpu0", bandwidth_gbps=50.0, latency_us=0.3,
         link_type=HardwareKind.NETWORK,
     ))
+
+    # --- 调试探针: 打印拓扑可达性矩阵 ---
+    from ._debug import dbg
+    all_nodes = sorted(topo.nodes.keys())
+    reachability = {}
+    for s in all_nodes:
+        row = {}
+        for d in all_nodes:
+            c = topo.get_transfer_cost(s, d, 1_000_000)  # 1MB probe
+            row[d] = f"{c:.1f}" if c < 1e9 else "INF"
+        reachability[s] = row
+    dbg("TOPO·reachability_matrix", nodes=all_nodes, matrix=reachability)
     return topo

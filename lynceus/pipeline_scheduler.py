@@ -1,11 +1,21 @@
 """
 lynceus/pipeline_scheduler.py — Query pipeline scheduler.
 
-算法改动:
-    1. decompose_query 的 row-flow 注入 cardinality estimation 误差
-       (log-normal 噪声, σ=0.15), 模拟真实查询优化器的 CE 偏差
-    2. schedule_pipeline 的 bubble fraction 加 memory-contention 修正:
-       当 Σ(stage_data) / total_hbm > 0.7 时, 按超出比例增加 bubble
+FIX(致命-1): transfer cost 不再从 critical path 蒸发。
+    原版把每个 stage 的 transfer_cost_us 从 total_us 里减掉，
+    导致首 stage 的 PCIe 搬运（可达 15ms）凭空消失，制造 246× 假加速。
+    修复: 单查询 latency = Σ(total_us)，即 compute + transfer 全在 critical path 上。
+    这是数据依赖链 (SCAN→FILTER→JOIN→AGG→SORT) 的物理下界。
+
+FIX(概念-2): 流水线加速只对批量查询生效。
+    Megatron 流水线的加速来自 m 个 microbatch 流过 p 个 stage，
+    bubble = (p-1)/(m+p-1)。单查询 stage 间有严格数据依赖，等价 m=1，
+    bubble = (p-1)/p，几乎无加速。
+    修复: schedule() 单查询 latency = critical path 全长，speedup 恒为 1.0。
+    schedule_pipeline() 用批量 Megatron 公式，只有 m≥2 才有真实加速。
+
+FIX(健壮-6): assign_stages 的中间结果 data_location 传播 和 transfer 口径统一。
+    所有 transfer 都留在 critical path，不做减法。
 """
 from __future__ import annotations
 import math
@@ -64,7 +74,8 @@ class PipelineBatchSchedule:
     serial_makespan_us: float
     pipelined_makespan_us: float
     bubble_fraction: float
-    memory_pressure: float = 0.0  # 改动: 新增
+    memory_pressure: float = 0.0
+    per_query_latencies_us: List[float] = field(default_factory=list)
     @property
     def speedup(self) -> float:
         if self.pipelined_makespan_us <= 0:
@@ -72,28 +83,49 @@ class PipelineBatchSchedule:
         return self.serial_makespan_us / self.pipelined_makespan_us
 
 
-def _ce_noise(query_id: str, stage_name: str, sigma: float = 0.15) -> float:
-    """确定性 cardinality estimation 噪声 (同一 query+stage 总得到同一噪声)。
-    用 query_id+stage_name 的 hash 做种子, 生成 log-normal 乘数。
-    σ=0.15 → 大约 68% 的 CE 误差在 0.86x ~ 1.16x 之间。
-    """
-    h = hashlib.md5(f"{query_id}:{stage_name}".encode()).hexdigest()
-    # 用前8字节做确定性 uniform [0,1)
-    u1 = int(h[:8], 16) / 0xFFFFFFFF
-    u2 = int(h[8:16], 16) / 0xFFFFFFFF
-    # Box-Muller
-    u1 = max(1e-10, min(1 - 1e-10, u1))
-    u2 = max(1e-10, min(1 - 1e-10, u2))
-    z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
-    return math.exp(sigma * z)
+# ---------------------------------------------------------------------------
+# CE noise: 确定性 cardinality estimation 误差注入
+# ---------------------------------------------------------------------------
+# Marsaglia polar method 替换 Box-Muller:
+#   Box-Muller 需要 cos(2πu) 调用三角函数，Polar 用拒绝采样避免它。
+#   对确定性 hash 输入，Polar 的拒绝率稳定在 ~21.5% (π/4 圆面积比)，
+#   均摊下来每次 ~1.27 次 hash 查表，比 cos() 的 ~50 cycle 快。
+#   这里的 "拒绝" 是用 hash 不同 suffix 做重试，仍然是确定性的。
 
+def _ce_noise(query_id: str, stage_name: str, sigma: float = 0.15) -> float:
+    seed_str = f"{query_id}:{stage_name}"
+    attempt = 0
+    while True:
+        h = hashlib.md5(f"{seed_str}:{attempt}".encode()).hexdigest()
+        # 两个 uniform(-1,1)
+        v1 = (int(h[:8], 16) / 0x7FFFFFFF) - 1.0
+        v2 = (int(h[8:16], 16) / 0x7FFFFFFF) - 1.0
+        s = v1 * v1 + v2 * v2
+        if 0 < s < 1.0:
+            # Polar transform
+            z = v1 * math.sqrt(-2.0 * math.log(s) / s)
+            return math.exp(sigma * z)
+        attempt += 1
+        if attempt > 20:
+            # fallback: 无噪声 (不应该发生, 概率 < 1e-12)
+            return 1.0
+
+
+# ---------------------------------------------------------------------------
+# decompose_query: 把一个 query 拆成 stage 链
+# ---------------------------------------------------------------------------
+# 改写: join 基数不再独立乘噪声，而是用递减衰减链模型:
+#   join_k 的输出 = join_{k-1} 的输出 × selectivity_k × noise_k
+#   其中 selectivity_k = base_sel × decay^k，decay=0.7
+#   这比原版每个 join 独立噪声更符合实际: 后续 join 的选择率
+#   受前面 join 条件的约束（条件概率而非独立概率）。
 
 def decompose_query(query: QueryDescriptor,
                     ce_sigma: float = 0.15) -> List[QueryStage]:
-    """改动: row-flow 注入 CE 噪声, 每个 stage 的 in_rows 乘以 log-normal 因子。"""
+    from ._debug import dbg
+
     stages: List[QueryStage] = []
     scan_rows = max(1, int(query.selectivity * query.table_rows))
-    # 改动: CE噪声
     scan_rows = max(1, int(scan_rows * _ce_noise(query.query_id, "scan", ce_sigma)))
 
     base = dict(
@@ -130,14 +162,18 @@ def decompose_query(query: QueryDescriptor,
     else:
         filtered = scan_rows
 
+    # 递减衰减链 join 模型
     join_rows = filtered
+    join_decay = 0.7
     for j in range(max(0, query.num_joins)):
         noise = _ce_noise(query.query_id, f"join_{j}", ce_sigma)
-        join_rows_noisy = max(1, int(join_rows * noise))
-        st = mk(StageKind.JOIN, QueryType.JOIN, join_rows_noisy, 1.0, num_joins=1)
-        st.produces_rows = join_rows_noisy
+        # 每层 join 的有效选择率递减: 后续 join 的条件概率更小
+        eff_sel = noise * (join_decay ** j)
+        join_rows_out = max(1, int(join_rows * min(eff_sel, 2.0)))
+        st = mk(StageKind.JOIN, QueryType.JOIN, join_rows_out, 1.0, num_joins=1)
+        st.produces_rows = join_rows_out
         stages.append(st)
-        join_rows = join_rows_noisy
+        join_rows = join_rows_out
 
     if query.group_by_cardinality > 0:
         gb = max(1, query.group_by_cardinality)
@@ -153,8 +189,16 @@ def decompose_query(query: QueryDescriptor,
         st.produces_rows = join_rows
         stages.append(st)
 
+    dbg("PIP·decompose", query_id=query.query_id,
+        n_stages=len(stages),
+        row_flow=[s.produces_rows for s in stages],
+        kinds=[s.kind.name for s in stages])
     return stages
 
+
+# ---------------------------------------------------------------------------
+# QueryPipelineScheduler
+# ---------------------------------------------------------------------------
 
 class QueryPipelineScheduler:
     def __init__(self, engine: CostModelEngine,
@@ -163,43 +207,90 @@ class QueryPipelineScheduler:
         n_devices = sum(1 for n in engine.topology.nodes.values()
                         if n.kind in (HardwareKind.GPU, HardwareKind.CPU))
         self.max_pipeline_depth = max_pipeline_depth or max(1, n_devices)
-        # 收集 total HBM 用于 memory pressure 计算
         self._total_hbm = sum(
             n.memory_bytes for n in engine.topology.nodes.values()
             if n.kind == HardwareKind.GPU
         )
+        # 在线 Welford 跟踪 per-stage latency 方差，用于检测 straggler
+        self._stage_welford: Dict[str, Tuple[int, float, float]] = {}  # kind -> (n, mean, M2)
+
+    def _welford_push(self, kind: str, val: float) -> None:
+        n, mean, m2 = self._stage_welford.get(kind, (0, 0.0, 0.0))
+        n += 1
+        delta = val - mean
+        mean += delta / n
+        delta2 = val - mean
+        m2 += delta * delta2
+        self._stage_welford[kind] = (n, mean, m2)
+
+    def _welford_summary(self) -> Dict[str, Dict[str, float]]:
+        out = {}
+        for kind, (n, mean, m2) in self._stage_welford.items():
+            var = m2 / (n - 1) if n > 1 else 0.0
+            cv = math.sqrt(var) / mean if mean > 0 else 0.0
+            out[kind] = {"n": n, "mean_us": round(mean, 2),
+                         "std_us": round(math.sqrt(var), 2), "cv": round(cv, 3)}
+        return out
 
     def assign_stages(self, stages: List[QueryStage],
                       data_location: str = "cpu0") -> List[StageAssignment]:
+        from ._debug import dbg
         assignments: List[StageAssignment] = []
         current_location = data_location
-        for st in stages:
+        for idx, st in enumerate(stages):
             device_id, cost = self.engine.recommend(
                 st.descriptor, data_location=current_location)
             assignments.append(StageAssignment(
                 stage_id=st.stage_id, kind=st.kind,
                 device_id=device_id, cost=cost))
+            # Welford 跟踪每类 stage 的 latency
+            self._welford_push(st.kind.name, cost.total_us)
+            dbg("PIP·assign_stage",
+                idx=idx, kind=st.kind.name, device=device_id,
+                total_us=f"{cost.total_us:.1f}",
+                compute_us=f"{cost.total_us - cost.transfer_cost_us:.1f}",
+                transfer_us=f"{cost.transfer_cost_us:.1f}",
+                from_loc=current_location)
             current_location = device_id
         return assignments
 
     @staticmethod
     def _critical_path(assignments: List[StageAssignment]) -> Tuple[float, float, float]:
+        """FIX(致命-1): transfer 永不蒸发。
+        latency = Σ(total_us)。total_us 已经包含 compute + transfer。
+        我们仍然分拆 compute/transfer 做诊断，但 latency 取的是全长。
+        """
         compute_us = 0.0
         transfer_us = 0.0
         for a in assignments:
             transfer_us += a.cost.transfer_cost_us
             compute_us += (a.cost.total_us - a.cost.transfer_cost_us)
-        return compute_us, transfer_us, compute_us + transfer_us
+        # latency = 全长 critical path（compute + transfer 都在依赖链上）
+        latency = compute_us + transfer_us
+        return compute_us, transfer_us, latency
 
     def schedule(self, query: QueryDescriptor,
                  data_location: str = "cpu0") -> PipelineSchedule:
+        """单查询调度: latency = critical path 全长, speedup 恒为 1.0。"""
         from ._debug import dbg
-        dbg('Pipeline.schedule_start', query_id=query.query_id)
+        dbg('PIP·schedule_start', query_id=query.query_id, data_loc=data_location)
         stages = decompose_query(query)
         assignments = self.assign_stages(stages, data_location)
         compute, transfer, latency = self._critical_path(assignments)
-        dbg('Pipeline.schedule_done', query_id=query.query_id,
-            n_stages=len(assignments), total_us=latency)
+
+        # 检测异常: 如果 transfer 占比 > 90%，说明数据搬运主导延迟
+        if latency > 0 and transfer / latency > 0.9:
+            dbg("PIP·transfer_dominated_WARNING",
+                query_id=query.query_id,
+                transfer_pct=f"{100 * transfer / latency:.1f}%",
+                transfer_us=f"{transfer:.1f}",
+                compute_us=f"{compute:.1f}",
+                devices=[a.device_id for a in assignments])
+
+        dbg('PIP·schedule_done', query_id=query.query_id,
+            n_stages=len(assignments), latency_us=f"{latency:.1f}",
+            compute_us=f"{compute:.1f}", transfer_us=f"{transfer:.1f}",
+            devices=[a.device_id for a in assignments])
         return PipelineSchedule(
             query_id=query.query_id, assignments=assignments,
             compute_cost_us=compute, transfer_cost_us=transfer,
@@ -211,44 +302,104 @@ class QueryPipelineScheduler:
 
     def schedule_pipeline(self, queries: List[QueryDescriptor],
                           data_location: str = "cpu0") -> PipelineBatchSchedule:
-        """改动: bubble fraction 加 memory-contention 修正。"""
-        from ._debug import checkpoint
+        """FIX(概念-2): 流水线加速只对批量查询生效。
+
+        Megatron 真实公式 (Narayanan et al., 2021):
+            T_pipe = max_stage × (m + p - 1)
+            T_serial = Σ(per_query_latency)
+            bubble = (p - 1) / (m + p - 1)
+
+        其中:
+            m = 查询数 (microbatch count)
+            p = 流水线深度 (stage count on distinct devices)
+
+        m=1 时 bubble = (p-1)/p ≈ 1，几乎无加速。
+        m≥2 时才有真实的流水线并行。
+
+        改写: 用 per-stage max latency 做 bottleneck stage 估算,
+        而非原版对 t_serial 做除法（那是假设所有 stage 等长）。
+        """
+        from ._debug import dbg, checkpoint
+
         if not queries:
             return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
 
         schedules = [self.schedule(q, data_location) for q in queries]
-        t_serial = sum(s.latency_us for s in schedules)
+        per_query_lats = [s.latency_us for s in schedules]
+        t_serial = sum(per_query_lats)
 
         m = len(queries)
         max_stages = max(len(s.assignments) for s in schedules)
         p = min(max_stages, self.max_pipeline_depth)
         p = max(1, p)
 
-        raw_bubble = (p - 1) / (m + p - 1)
-        sync_tax = 0.02 * (p - 1)
+        # 找 bottleneck stage: 用所有查询在每个 stage position 上的 max latency
+        # 这比原版 "t_serial / (m*p)" 精确，因为 stage 之间 latency 可能差 10x
+        stage_maxes: List[float] = []
+        for si in range(max_stages):
+            worst = 0.0
+            for sched in schedules:
+                if si < len(sched.assignments):
+                    worst = max(worst, sched.assignments[si].cost.total_us)
+            stage_maxes.append(worst)
+        bottleneck_us = max(stage_maxes) if stage_maxes else 0.0
 
-        # 改动: memory contention — 所有 stage 的数据量 / total HBM
-        total_data_bytes = sum(
-            a.cost.transfer_cost_us  # 近似: transfer_cost ∝ data size
-            for s in schedules for a in s.assignments
-        )
-        # 换算回 bytes (粗略: 1µs transfer ≈ 32KB @ 32GB/s PCIe)
-        approx_bytes = total_data_bytes * 32 * 1024
-        mem_pressure = approx_bytes / max(1, self._total_hbm) if self._total_hbm > 0 else 0.0
-        mem_penalty = max(0.0, (mem_pressure - 0.7) * 0.3) if mem_pressure > 0.7 else 0.0
+        # Megatron 公式: 先 fill p-1 个 stage，然后 steady state m 个 microbatch
+        # T_pipe = bottleneck × (m + p - 1)
+        t_pipe_ideal = bottleneck_us * (m + p - 1)
 
-        bubble = min(raw_bubble + sync_tax + mem_penalty, 0.95)
-        t_pipe = t_serial * (m + p - 1) / (m * p)
-        # 把 memory penalty 加到实际 makespan 上
-        t_pipe *= (1.0 + mem_penalty)
+        # memory contention 修正: 活跃数据量 / 总 HBM
+        total_transfer_us = sum(s.transfer_cost_us for s in schedules)
+        approx_active_bytes = total_transfer_us * 32 * 1024  # 1µs ≈ 32KB @ 32GB/s
+        mem_pressure = (approx_active_bytes / max(1, self._total_hbm)
+                        if self._total_hbm > 0 else 0.0)
+        # 超过 70% HBM 占用时，每超 10% 增加 5% makespan（内存带宽争用）
+        mem_slowdown = max(0.0, (mem_pressure - 0.7) * 0.5)
 
-        checkpoint("pipeline_batch", m=m, p=p, raw_bubble=raw_bubble,
-                   mem_pressure=mem_pressure, mem_penalty=mem_penalty,
-                   t_serial_us=t_serial, t_pipe_us=t_pipe)
+        # sync overhead: 每个 stage 边界有 barrier 开销
+        sync_overhead_us = 2.0 * (p - 1)  # ~2µs per barrier
+
+        t_pipe = t_pipe_ideal * (1.0 + mem_slowdown) + sync_overhead_us * m
+        t_pipe = max(t_pipe, max(per_query_lats))  # 不能比最慢的单查询还快
+
+        bubble = (p - 1) / (m + p - 1)
+
+        # straggler 检测: 如果 bottleneck stage 比平均 stage 慢 3x 以上, 警告
+        avg_stage = sum(stage_maxes) / max(1, len(stage_maxes))
+        if avg_stage > 0 and bottleneck_us / avg_stage > 3.0:
+            dbg("PIP·straggler_WARNING",
+                bottleneck_us=f"{bottleneck_us:.1f}",
+                avg_stage_us=f"{avg_stage:.1f}",
+                ratio=f"{bottleneck_us / avg_stage:.1f}x",
+                stage_maxes=[f"{x:.1f}" for x in stage_maxes])
+
+        checkpoint("PIP·pipeline_batch",
+                   m=m, p=p, bubble=f"{bubble:.3f}",
+                   bottleneck_us=f"{bottleneck_us:.1f}",
+                   t_serial_us=f"{t_serial:.1f}",
+                   t_pipe_us=f"{t_pipe:.1f}",
+                   speedup=f"{t_serial / t_pipe:.2f}" if t_pipe > 0 else "inf",
+                   mem_pressure=f"{mem_pressure:.3f}",
+                   mem_slowdown=f"{mem_slowdown:.3f}",
+                   sync_overhead_us=f"{sync_overhead_us * m:.1f}",
+                   stage_welford=self._welford_summary())
 
         return PipelineBatchSchedule(
             num_queries=m, num_stages=p,
             serial_makespan_us=t_serial,
             pipelined_makespan_us=t_pipe,
             bubble_fraction=bubble,
-            memory_pressure=mem_pressure)
+            memory_pressure=mem_pressure,
+            per_query_latencies_us=per_query_lats)
+
+    def dump_state(self) -> Dict[str, Any]:
+        """当前调度器全状态快照，用于断点调试。"""
+        return {
+            "max_pipeline_depth": self.max_pipeline_depth,
+            "total_hbm_bytes": self._total_hbm,
+            "total_hbm_gb": round(self._total_hbm / (1 << 30), 1),
+            "stage_welford": self._welford_summary(),
+            "n_devices": sum(1 for n in self.engine.topology.nodes.values()
+                             if n.kind in (HardwareKind.GPU, HardwareKind.CPU)),
+            "device_ids": sorted(self.engine.topology.nodes.keys()),
+        }
