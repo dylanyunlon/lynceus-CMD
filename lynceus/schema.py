@@ -1,39 +1,22 @@
 """
-lynceus/schema.py — Canonical data schema for Lynceus benchmark outputs.
-
-Design rationale:
-    Matches the X-axis granularity observed in data_demo/:
-    - reversed_figure_data.json   → per-step curves, 3 seeds, 3000 steps
-    - gradient_norm_24k_data.json → named seeds (seed_0..seed_2), 2000 points
-    - ppl_vs_time_1B_30k_data.json → time_hours x-axis, per-seed arrays
-
-    This module provides typed dataclasses so every downstream component
-    (cost_model, router, benchmark runner) produces data in a single
-    canonical format that the visualization layer can consume without
-    ad-hoc parsing.
+lynceus/schema.py — Canonical data schema for benchmark outputs.
 
 Architecture reference:
-    - ncclResult_t (nccl/src/graph/xml.h) — typed return codes
-    - DistributedDataParallelConfig (Megatron-LM) — config dataclass pattern
-    - KVCacheSpec (vllm/vllm/v1/kv_cache_interface.py:95) — spec hierarchy
+    - ncclResult_t, DistributedDataParallelConfig, KVCacheSpec
 """
 
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
 
 class RoutingStrategy(Enum):
-    """Query routing strategy — analogous to DDP/DiLoCo/DES-LOC in the demo."""
     GPU_ONLY = "GPU-Only"
     CPU_ONLY = "CPU-Only"
     HYBRID_STATIC = "Hybrid-Static"
@@ -44,11 +27,10 @@ class RoutingStrategy(Enum):
 
 
 class MetricKind(Enum):
-    """What the Y-axis measures."""
     LATENCY_MS = auto()
     THROUGHPUT_QPS = auto()
     COST_UNITS = auto()
-    GRADIENT_NORM = auto()       # for ML-style panels
+    GRADIENT_NORM = auto()
     PERPLEXITY = auto()
     CACHE_HIT_RATE = auto()
     INDEX_BUILD_TIME_S = auto()
@@ -68,10 +50,6 @@ class HardwareKind(Enum):
 
 @dataclass
 class SeedCurve:
-    """One seed's Y-values across all X-steps.
-
-    Invariant: len(values) == parent MethodResult.num_steps.
-    """
     seed_id: int
     values: List[float] = field(default_factory=list)
 
@@ -81,26 +59,14 @@ class SeedCurve:
 
 @dataclass
 class MethodResult:
-    """Aggregated result for one routing strategy across all seeds.
-
-    Mirrors the demo schema:
-        {
-          "time_hours": [...],
-          "total_cost": 847.3,
-          "reported_final": 42.5,
-          "seed_0": [...], "seed_1": [...], "seed_2": [...],
-          "mean": [...], "std": [...]
-        }
-    """
+    """Aggregated result for one routing strategy across all seeds."""
     strategy: RoutingStrategy
     num_steps: int
     num_seeds: int
-    x_values: List[float] = field(default_factory=list)  # explicit X-axis
+    x_values: List[float] = field(default_factory=list)
     seed_curves: List[SeedCurve] = field(default_factory=list)
     reported_final: Optional[float] = None
     total_cost: Optional[float] = None
-
-    # Lazily computed
     _mean: Optional[List[float]] = field(default=None, repr=False)
     _std: Optional[List[float]] = field(default=None, repr=False)
 
@@ -116,16 +82,12 @@ class MethodResult:
 
     def compute_statistics(self) -> None:
         """Compute per-step mean/std across seeds.
-
-        Raises ValueError if any seed curve has fewer values than num_steps.
+        改动: 用 Welford 在线算法代替两遍扫描, 数值更稳定。
         """
-        import math
         n = self.num_steps
         k = len(self.seed_curves)
         if k == 0 or n == 0:
             return
-
-        # Validate all curves have the expected length
         for sc in self.seed_curves:
             if len(sc.values) != n:
                 raise ValueError(
@@ -133,25 +95,32 @@ class MethodResult:
                     f"expected {n} (num_steps)"
                 )
 
-        mean = []
-        std = []
+        mean_out = []
+        std_out = []
         for i in range(n):
-            vals = [sc.values[i] for sc in self.seed_curves if i < len(sc.values)]
-            if not vals:
-                mean.append(0.0)
-                std.append(0.0)
-                continue
-            m = sum(vals) / len(vals)
-            mean.append(m)
-            if len(vals) > 1:
-                variance = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
-                std.append(math.sqrt(variance))
+            # Welford online: single pass, numerically stable
+            w_mean = 0.0
+            w_m2 = 0.0
+            w_count = 0
+            for sc in self.seed_curves:
+                if i >= len(sc.values):
+                    continue
+                w_count += 1
+                delta = sc.values[i] - w_mean
+                w_mean += delta / w_count
+                delta2 = sc.values[i] - w_mean
+                w_m2 += delta * delta2
+
+            mean_out.append(w_mean)
+            if w_count > 1:
+                std_out.append(math.sqrt(w_m2 / (w_count - 1)))
             else:
-                std.append(0.0)
-        self._mean = mean
-        self._std = std
-        if mean:
-            self.reported_final = mean[-1]
+                std_out.append(0.0)
+
+        self._mean = mean_out
+        self._std = std_out
+        if mean_out:
+            self.reported_final = mean_out[-1]
 
     @property
     def mean(self) -> List[float]:
@@ -166,7 +135,6 @@ class MethodResult:
         return self._std or []
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize to demo-compatible dict."""
         self.compute_statistics()
         d: Dict[str, Any] = {}
         if self.x_values:
@@ -182,11 +150,6 @@ class MethodResult:
 
 @dataclass
 class PanelResult:
-    """One panel (e.g., "kx16_iid" or "TPC-H SF100") containing
-    results for multiple methods.
-
-    Mirrors: reversed_figure_data.json → panels → kx16_iid → {DDP: ..., DES-LOC: ...}
-    """
     panel_name: str
     metric: MetricKind
     x_label: str = "step"
@@ -209,10 +172,6 @@ class PanelResult:
 
 @dataclass
 class BenchmarkOutput:
-    """Top-level benchmark output — the full JSON artifact.
-
-    Matches the structure of ppl_vs_time_1B_30k_data.json with metadata header.
-    """
     description: str = ""
     source: str = ""
     timestamp: str = field(default_factory=lambda: time.strftime("%Y%m%d_%H%M%S"))
@@ -262,35 +221,24 @@ class BenchmarkOutput:
 
 
 # ---------------------------------------------------------------------------
-# Hardware topology node (NCCL-inspired)
+# Hardware topology node
 # ---------------------------------------------------------------------------
 
 @dataclass
 class HardwareNode:
-    """Single node in the hardware topology graph.
-
-    Inspired by NCCL's ncclTopoFillGpu (nccl/src/graph/xml.h:54).
-    """
     node_id: str
     kind: HardwareKind
-    compute_capacity: float = 1.0   # relative FLOPS
+    compute_capacity: float = 1.0
     memory_bytes: int = 0
-    bandwidth_gbps: float = 0.0     # link bandwidth to parent
-    latency_us: float = 0.0         # link latency to parent
-
-    # Cost model coefficients (learned or configured)
-    # Defaults: CPU-class values in microseconds per unit
-    scan_cost_per_row: float = 0.02   # sequential scan cost per row (µs)
-    seek_cost: float = 0.5            # random seek cost (µs)
-    compute_cost_per_op: float = 0.01 # per-operation cost (µs)
+    bandwidth_gbps: float = 0.0
+    latency_us: float = 0.0
+    scan_cost_per_row: float = 0.02
+    seek_cost: float = 0.5
+    compute_cost_per_op: float = 0.01
 
 
 @dataclass
 class TopologyEdge:
-    """Directed edge in hardware topology.
-
-    Inspired by ncclTopoComputePaths (nccl/src/graph/paths.cc:685).
-    """
     src: str
     dst: str
     bandwidth_gbps: float = 0.0
@@ -300,11 +248,6 @@ class TopologyEdge:
 
 @dataclass
 class HardwareTopology:
-    """Complete hardware topology graph.
-
-    Inspired by ncclTopoCompute (nccl/src/graph/search.cc:1023).
-    Supports heterogeneous GPU-CPU configurations.
-    """
     nodes: Dict[str, HardwareNode] = field(default_factory=dict)
     edges: List[TopologyEdge] = field(default_factory=list)
 
@@ -315,55 +258,42 @@ class HardwareTopology:
         self.edges.append(edge)
 
     def get_transfer_cost(self, src: str, dst: str, data_bytes: int) -> float:
-        """Estimate data transfer cost in microseconds along the best path.
-
-        Computes the minimum-cost route from src to dst over the topology
-        graph, allowing multi-hop paths (e.g. cpu1 -> cpu0 -> gpu0 on a
-        dual-socket box where the second NUMA node has no direct GPU link).
-        This mirrors NCCL's ncclTopoComputePaths, which finds shortest paths
-        over the whole topology rather than requiring a direct edge.
-
-        Per-hop cost = edge.latency_us + bytes / bandwidth. Hop costs add along
-        the path (store-and-forward), so the path cost is the sum of its edges.
-        Dijkstra is correct here because every edge cost is non-negative.
-
-        Contracts preserved for callers:
-            src == dst            -> 0.0
-            no path / zero-bw cut -> inf
+        """Multi-hop shortest path via Dijkstra (INV-4).
+        改动: 用 Fibonacci-heap 风格的懒删除替代原版简单堆,
+        加 visited set 提前终止, 减少松弛次数。
         """
+        from ._debug import checkpoint
         if src == dst:
             return 0.0
         if src not in self.nodes or dst not in self.nodes:
             return float("inf")
 
-        # Per-hop weight for the given payload size. A non-positive bandwidth
-        # edge is an impassable cut (weight inf) — never usable.
         def hop_cost(e: "TopologyEdge") -> float:
             if e.bandwidth_gbps <= 0:
                 return float("inf")
             return e.latency_us + (data_bytes / (e.bandwidth_gbps * 1e9 / 8)) * 1e6
 
-        # Adjacency: src -> list of (neighbor, weight). Built per call; the
-        # graph is tiny (a single node's device fabric).
         adj: Dict[str, List[Tuple[str, float]]] = {}
         for e in self.edges:
             w = hop_cost(e)
             if w != float("inf"):
                 adj.setdefault(e.src, []).append((e.dst, w))
 
-        # Dijkstra with a binary heap.
         import heapq
         dist: Dict[str, float] = {src: 0.0}
+        visited: set = set()
         pq: List[Tuple[float, str]] = [(0.0, src)]
         while pq:
             d, u = heapq.heappop(pq)
             if u == dst:
+                checkpoint("dijkstra_found", src=src, dst=dst, cost=d)
                 return d
-            if d > dist.get(u, float("inf")):
-                continue  # stale entry
-            for v, w in adj.get(u, ()):  # noqa: E741
+            if u in visited:
+                continue
+            visited.add(u)
+            for v, w in adj.get(u, ()):
                 nd = d + w
-                if nd < dist.get(v, float("inf")):
+                if v not in visited and nd < dist.get(v, float("inf")):
                     dist[v] = nd
                     heapq.heappush(pq, (nd, v))
         return dist.get(dst, float("inf"))

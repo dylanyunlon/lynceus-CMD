@@ -1,51 +1,17 @@
 """
 lynceus/data_writer.py — Benchmark data output writer.
 
-Architecture references (ported/adapted from):
-  - PAR2QO parse.py (par2qo/code/parse.py:1-101)
-    → split_string(), parse_string() — recursive string splitting/parsing
-    → gen_join_hints(), gen_scan_hints(), gen_final_hint() — structured
-      hint generation from parsed query plans
-    → join_type / hint_type_dict mapping tables
-  - PAR2QO postgres.py (par2qo/code/postgres.py:1-178)
-    → get_real_latency() — benchmark execution with median-of-N timing
-    → get_plan_cost_simple() — cost extraction from EXPLAIN JSON
-    → get_plan_cost() — full cost extraction with cardinality injection
-    → get_all_plan_cost() — batch cost collection across plan candidates
-    → DropBufferCache() — cache clearing between benchmark runs
-  - PAR2QO utility.py (par2qo/code/utility.py:1-497)
-    → clean() — JSON file sanitisation (strip noise lines, normalise format)
-    → get_cost_list() — parse cost/latency from benchmark output JSON
-    → cal_rel_error() — relative error between predicted and observed
-    → evenly_sample_card() — generate evenly spaced sample points
-  - PAR2QO diagram.py (par2qo/code/diagram.py:1-565)
-    → saveModeltoCache() / loadModelFromCache — JSON model serialisation
-    → initLogFile() — structured logging to per-experiment log paths
-
-Modifications from upstream references (~20% original):
-  - Removed: psycopg2 database connections, PostgreSQL EXPLAIN parsing
-  - Removed: pg_hint_plan integration, ml_cardest injection
-  - Removed: numpy/matplotlib/tqdm dependencies
-  - Added:   Lynceus cost-model benchmark data formatting
-  - Added:   Multi-format output (JSON, CSV, structured log)
-  - Added:   Experiment metadata tracking (hardware config, routing decisions)
-  - Added:   Comprehensive debug dump at each write stage
-  - Changed: SQL query hints → cost model configuration records
-  - Changed: plan cost extraction → cost model prediction vs observed logging
-
-Design:
-  The data writer serialises benchmark results from cost model evaluation:
-  predicted vs actual execution costs, routing decisions (GPU vs CPU),
-  hardware utilisation, and calibration quality metrics. This is the
-  output side of the benchmark pipeline (benchmark.py collects;
-  data_writer.py exports for analysis).
+算法改动:
+    1. cal_rel_error → symmetric MAPE + log_ratio 双返回
+    2. measure_with_median → IQR outlier rejection
+    3. write_json → p50/p90/p99 latency percentile
+    4. clean_benchmark_data → regex pattern matching
 """
-
 from __future__ import annotations
-
 import math
 import time
 import json
+import re
 import logging
 import os
 from dataclasses import dataclass, field
@@ -54,28 +20,9 @@ from enum import Enum, auto
 
 logger = logging.getLogger(__name__)
 
-
-# ─── String Parsing Utilities ────────────────────────────────────────────────
-# Directly adapted from par2qo parse.py split_string / parse_string (lines 1-12).
-# In PAR2QO these recursively split SQL hint strings by delimiters;
-# here we use them for structured benchmark output formatting.
+# ─── String Parsing (from par2qo parse.py) ──────────────────────────────────
 
 def split_string(s: str, delimiter: str) -> List[str]:
-    """Split string and interleave delimiter tokens.
-
-    Ported from par2qo/code/parse.py:split_string (line 1).
-
-    Original:
-        tmp = tmp.split(d)
-        tmp_list = []
-        for k in range(len(tmp)):
-            tmp_list.append(tmp[k])
-            if k < len(tmp) - 1:
-                tmp_list.append(d)
-        return tmp_list
-
-    Used for tokenising structured benchmark output.
-    """
     parts = s.split(delimiter)
     result: List[str] = []
     for k in range(len(parts)):
@@ -84,22 +31,7 @@ def split_string(s: str, delimiter: str) -> List[str]:
             result.append(delimiter)
     return result
 
-
 def parse_string(tokens: List[str], delimiter: str) -> List[str]:
-    """Apply split_string recursively to a token list.
-
-    Ported from par2qo/code/parse.py:parse_string (line 10).
-
-    Original:
-        final_list = []
-        for i in range(len(new_list)):
-            if d in new_list[i]:
-                tmp_list = split_string(new_list[i], d)
-                final_list += tmp_list
-            else:
-                final_list.append(new_list[i])
-        return final_list
-    """
     result: List[str] = []
     for token in tokens:
         if delimiter in token:
@@ -108,132 +40,103 @@ def parse_string(tokens: List[str], delimiter: str) -> List[str]:
             result.append(token)
     return result
 
-
-# ─── Hint/Record Type Mapping ────────────────────────────────────────────────
-# Adapted from par2qo parse.py join_type/hint_type_dict (lines 14-18).
-# In PAR2QO these mapped SQL join types to pg_hint_plan names;
-# here we map cost model record types to output format keys.
+# ─── Record Type Mapping ────────────────────────────────────────────────────
 
 record_type_names = ['seq_scan', 'index_scan', 'hash_probe', 'hash_build',
                      'transfer', 'pipeline', 'allreduce']
 record_format_dict = {
-    'seq_scan':     'SequentialScan',
-    'index_scan':   'IndexScan',
-    'hash_probe':   'HashProbe',
-    'hash_build':   'HashBuild',
-    'transfer':     'DataTransfer',
-    'pipeline':     'PipelineStage',
-    'allreduce':    'AllReduceSync',
+    'seq_scan': 'SequentialScan', 'index_scan': 'IndexScan',
+    'hash_probe': 'HashProbe', 'hash_build': 'HashBuild',
+    'transfer': 'DataTransfer', 'pipeline': 'PipelineStage',
+    'allreduce': 'AllReduceSync',
 }
 
-
 # ─── Data Sanitisation ──────────────────────────────────────────────────────
-# Adapted from par2qo utility.py clean() (line 69-87).
-# Original cleaned EXPLAIN JSON output by stripping noise lines;
-# we clean benchmark data output for consistent formatting.
+
+# 改动: 编译 regex 模式做噪声匹配 (原版只用关键字字符串 in)
+_NOISE_PATTERNS = [
+    re.compile(r'^\s*DEBUG\b', re.IGNORECASE),
+    re.compile(r'^\s*WARNING\b', re.IGNORECASE),
+    re.compile(r'^[=\-]{4,}'),           # 分隔线
+    re.compile(r'^\s*INTERNAL\b'),
+    re.compile(r'^\s*#.*$'),             # 注释行
+    re.compile(r'^\s*//.*$'),            # C-style注释
+    re.compile(r'^\[.*\]\s*$'),          # bare bracket lines like "[end]"
+]
 
 def clean_benchmark_data(raw_lines: List[str],
-                         del_keys: Optional[List[str]] = None) -> List[str]:
-    """Clean benchmark output lines by removing noise.
+                         del_keys: Optional[List[str]] = None,
+                         extra_patterns: Optional[List[re.Pattern]] = None
+                         ) -> List[str]:
+    """改动: 用预编译 regex 做噪声过滤, 比原版逐字符串 in 检查更精确。
 
-    Ported from par2qo/code/utility.py:clean (line 69).
-
-    Original:
-        del_line_key = ['QUERY PLAN', 'row)', '----']
-        for i in del_line_key:
-            if i in line: need_to_del = 1
-        if need_to_del == 0:
-            line = line.replace('+', '')
-            line = line.strip() + '\\n'
-            new_f.write(line)
-
-    Lynceus: applied to benchmark output instead of EXPLAIN output.
+    原版: for key in del_keys: if key in line → delete
+    问题: "WARNING" 会误删包含 "WARNING" 子串的合法数据行
+    新版: 用 ^\\s*WARNING\\b anchor 匹配行首, 不误伤内容
     """
-    if del_keys is None:
-        del_keys = ['DEBUG', 'WARNING', '====', '----', 'INTERNAL']
+    patterns = list(_NOISE_PATTERNS)
+    if extra_patterns:
+        patterns.extend(extra_patterns)
+    if del_keys:
+        for key in del_keys:
+            patterns.append(re.compile(re.escape(key)))
 
     cleaned = []
     for line in raw_lines:
-        should_delete = False
-        for key in del_keys:
-            if key in line:
-                should_delete = True
-                break
+        should_delete = any(p.search(line) for p in patterns)
         if not should_delete:
             line = line.replace('+', '').strip()
             if line:
                 cleaned.append(line)
     return cleaned
 
-
 # ─── Cost List Extraction ────────────────────────────────────────────────────
-# Adapted from par2qo utility.py get_cost_list() (line 90-115).
-# Original parsed EXPLAIN JSON for 'Total Cost' and 'Actual Total Time';
-# we parse Lynceus benchmark JSON for predicted vs observed costs.
 
 def get_cost_list_from_json(json_str: str,
                             debug_print: bool = True) -> Tuple[List[float], List[float]]:
-    """Extract predicted and actual cost lists from benchmark JSON.
-
-    Ported from par2qo/code/utility.py:get_cost_list (line 90).
-
-    Original:
-        if "Total Cost" in line:
-            cost = line.split(':')[1].split(',')[0]
-            est_cost_list.append(float(cost))
-        if "Actual Total Time" in line:
-            cost = line.split(':')[1].split(',')[0]
-            actual_cost_list.append(float(cost))
-
-    Lynceus: extracts predicted_cost and actual_cost from JSON records.
-    """
     predicted = []
     actual = []
-
     try:
         records = json.loads(json_str)
         if not isinstance(records, list):
             records = [records]
-
         for rec in records:
             if 'predicted_cost' in rec:
                 predicted.append(float(rec['predicted_cost']))
             if 'actual_cost' in rec:
                 actual.append(float(rec['actual_cost']))
-
     except json.JSONDecodeError as e:
         if debug_print:
             print(f"  [data_writer] WARNING: JSON parse error: {e}")
-
     if debug_print:
         print(f"  [data_writer] Extracted {len(predicted)} predicted, "
               f"{len(actual)} actual costs")
-
     return predicted, actual
 
-
-# ─── Relative Error Computation ──────────────────────────────────────────────
-# Directly from par2qo utility.py cal_rel_error (line 260-267).
+# ─── Relative Error ──────────────────────────────────────────────────────────
 
 def cal_rel_error(true_val: float, est_val: float) -> float:
-    """Log-ratio relative error.
+    """改动: 返回 symmetric MAPE 代替非对称 log-ratio。
 
-    Ported from par2qo/code/utility.py:cal_rel_error (line 260).
-
-    Original:
-        if true > est:
-            error = math.log(true / est)
-        else:
-            error = - math.log(est / true)
-
-    Lynceus: added zero/NaN guards (INV-5).
+    原版: if true > est: log(true/est) else: -log(est/true)
+    问题: 非对称, 且 true=0 或 est=0 时未定义
+    新版: sMAPE = 2*|true-est| / (|true|+|est|+eps)
+    范围 [0, 2], 对称, 0处有 epsilon 保护
     """
+    eps = 1e-9
+    if math.isnan(true_val) or math.isnan(est_val):
+        return 0.0
+    numerator = 2.0 * abs(true_val - est_val)
+    denominator = abs(true_val) + abs(est_val) + eps
+    return numerator / denominator
+
+
+def cal_log_ratio(true_val: float, est_val: float) -> float:
+    """保留原版 log-ratio 做辅助指标, 有符号。"""
     if true_val <= 0 or est_val <= 0:
         if true_val <= 0 and est_val <= 0:
             return 0.0
         return float('inf') if true_val <= 0 else float('-inf')
-    if math.isnan(true_val) or math.isnan(est_val):
-        return 0.0
     if true_val > est_val:
         return math.log(true_val / est_val)
     else:
@@ -243,118 +146,88 @@ def cal_rel_error(true_val: float, est_val: float) -> float:
 # ─── Output Format Types ────────────────────────────────────────────────────
 
 class OutputFormat(Enum):
-    """Output format for benchmark data."""
     JSON = auto()
     CSV = auto()
-    LOG = auto()           # structured log (like par2qo logging output)
+    LOG = auto()
 
 
 # ─── Benchmark Record ───────────────────────────────────────────────────────
-# Adapted from par2qo diagram.py's per-query output_result records
-# and postgres.py's get_real_latency return structure.
 
 @dataclass
 class BenchmarkRecord:
-    """One benchmark measurement — analogous to one row in par2qo's
-    output_result list: [sql_id, para_sql, plan_list[robust_plan_id]].
-
-    Extended with Lynceus-specific fields for cost model evaluation.
-    """
     record_id: int
-    operation: str                    # from record_type_names
-    # Cost model evaluation
-    predicted_cost_us: float = 0.0    # cost model prediction
-    actual_cost_us: float = 0.0       # observed execution time
-    routing_decision: str = "CPU"     # CPU or GPU
-    # Hardware context
+    operation: str
+    predicted_cost_us: float = 0.0
+    actual_cost_us: float = 0.0
+    routing_decision: str = "CPU"
     device: str = ""
     n_rows: int = 0
     data_bytes: int = 0
-    # Calibration quality
     rel_error: float = 0.0
-    # Metadata
+    log_ratio: float = 0.0         # 改动: 保留 log_ratio
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        """Compute derived fields."""
         if self.actual_cost_us > 0 and self.predicted_cost_us > 0:
             self.rel_error = cal_rel_error(self.actual_cost_us, self.predicted_cost_us)
+            self.log_ratio = cal_log_ratio(self.actual_cost_us, self.predicted_cost_us)
 
     def dump_debug(self, prefix: str = "") -> str:
         lines = [
-            f"{prefix}╔══ BenchmarkRecord #{self.record_id} ═════════════════",
-            f"{prefix}║ operation    = {self.operation} ({record_format_dict.get(self.operation, '?')})",
-            f"{prefix}║ predicted    = {self.predicted_cost_us:,.1f}µs",
-            f"{prefix}║ actual       = {self.actual_cost_us:,.1f}µs",
-            f"{prefix}║ rel_error    = {self.rel_error:.4f}",
-            f"{prefix}║ routing      = {self.routing_decision}",
-            f"{prefix}║ device       = {self.device}",
-            f"{prefix}║ n_rows       = {self.n_rows:,}",
-            f"{prefix}║ data_bytes   = {self.data_bytes:,}",
-            f"{prefix}║ timestamp    = {self.timestamp:.3f}",
-            f"{prefix}║ metadata     = {self.metadata}",
-            f"{prefix}╚══════════════════════════════════════════════════",
+            f"{prefix}╔══ Record #{self.record_id} ═══════",
+            f"{prefix}║ op={self.operation} pred={self.predicted_cost_us:.1f}µs "
+            f"act={self.actual_cost_us:.1f}µs",
+            f"{prefix}║ sMAPE={self.rel_error:.4f} log_ratio={self.log_ratio:.4f} "
+            f"→ {self.routing_decision}",
+            f"{prefix}╚═══════════════════════",
         ]
         return "\n".join(lines)
 
 
 # ─── Experiment Metadata ─────────────────────────────────────────────────────
-# Adapted from par2qo diagram.py __init__ metadata:
-#   db_name, workload_name, query_id, template_id, N, b, tolerance
 
 @dataclass
 class ExperimentMeta:
-    """Experiment-level metadata — mirrors par2qo Diagram.__init__ params."""
     experiment_id: str = "exp_001"
-    workload_name: str = "default"    # par2qo: workload_name
-    template_id: int = 0             # par2qo: template_id
-    n_samples: int = 100             # par2qo: N
-    tolerance: float = 0.2           # par2qo: tolerance
-    blend_factor: float = 0.5        # par2qo: b
-    # Lynceus-specific
+    workload_name: str = "default"
+    template_id: int = 0
+    n_samples: int = 100
+    tolerance: float = 0.2
+    blend_factor: float = 0.5
     gpu_arch: str = "A100"
     n_workers: int = 1
     sharding_strategy: str = "FULL_SHARD"
     cost_model_version: str = "v1.0"
-
     def dump_debug(self, prefix: str = "") -> str:
-        lines = [
-            f"{prefix}╔══ ExperimentMeta ═══════════════════════════════",
-            f"{prefix}║ experiment_id  = {self.experiment_id}",
-            f"{prefix}║ workload       = {self.workload_name}",
-            f"{prefix}║ template_id    = {self.template_id}",
-            f"{prefix}║ n_samples      = {self.n_samples}",
-            f"{prefix}║ tolerance      = {self.tolerance}",
-            f"{prefix}║ blend_factor   = {self.blend_factor}",
-            f"{prefix}║ gpu_arch       = {self.gpu_arch}",
-            f"{prefix}║ n_workers      = {self.n_workers}",
-            f"{prefix}║ sharding       = {self.sharding_strategy}",
-            f"{prefix}║ cm_version     = {self.cost_model_version}",
-            f"{prefix}╚═══════════════════════════════════════════════════",
-        ]
-        return "\n".join(lines)
+        return (f"{prefix}Experiment({self.experiment_id}): "
+                f"{self.workload_name} N={self.n_samples} "
+                f"tol={self.tolerance} arch={self.gpu_arch}")
 
 
-# ─── Timing Utility ──────────────────────────────────────────────────────────
-# Adapted from par2qo postgres.py get_real_latency (lines 10-72):
-# Original ran N trials, collected latencies, returned median.
-# We provide a timing wrapper that does the same for cost model evaluation.
+# ─── Timing with IQR Outlier Rejection ───────────────────────────────────────
+
+def _percentile(sorted_vals: List[float], p: float) -> float:
+    """无 numpy 的 percentile: 线性插值。"""
+    if not sorted_vals:
+        return 0.0
+    n = len(sorted_vals)
+    k = (n - 1) * p
+    f = math.floor(k)
+    c = min(f + 1, n - 1)
+    if f == c:
+        return sorted_vals[int(f)]
+    return sorted_vals[int(f)] * (c - k) + sorted_vals[int(c)] * (k - f)
+
 
 def measure_with_median(func, *args, times: int = 5,
                         debug_print: bool = True, **kwargs) -> float:
-    """Run a function N times and return median latency.
+    """改动: IQR outlier rejection 后取中位数。
 
-    Adapted from par2qo/code/postgres.py:get_real_latency (line 10).
-
-    Original:
-        for i in range(times):
-            cursor_.execute(to_execute_)
-            cur_latency = query_plan[0][0][0]['Plan']['Actual Total Time']
-            latency_list.append(cur_latency)
-        return np.median(np.array(latency_list))
-
-    Lynceus: generalised to any callable, no numpy.
+    原版: sort → 取 middle 元素
+    新版: 先算 Q1/Q3/IQR, 过滤掉 > Q3+1.5*IQR 或 < Q1-1.5*IQR 的试验,
+    再对剩余值取中位数。
+    效果: OS 调度/GC 抖动产生的极端值不影响结果。
     """
     latencies = []
     for trial in range(times):
@@ -362,74 +235,56 @@ def measure_with_median(func, *args, times: int = 5,
         func(*args, **kwargs)
         elapsed_us = (time.time() - start) * 1e6
         latencies.append(elapsed_us)
-
         if debug_print and trial == 0:
             print(f"  [data_writer] Trial 0: {elapsed_us:.1f}µs")
 
-    # Median without numpy: sort and pick middle
     latencies.sort()
     n = len(latencies)
-    if n % 2 == 1:
-        median = latencies[n // 2]
+
+    if n >= 5:
+        # IQR outlier rejection
+        q1 = _percentile(latencies, 0.25)
+        q3 = _percentile(latencies, 0.75)
+        iqr = q3 - q1
+        lo = q1 - 1.5 * iqr
+        hi = q3 + 1.5 * iqr
+        filtered = [v for v in latencies if lo <= v <= hi]
+        if not filtered:
+            filtered = latencies  # 不能全删
     else:
-        median = (latencies[n // 2 - 1] + latencies[n // 2]) / 2
+        filtered = latencies
+
+    filtered.sort()
+    m = len(filtered)
+    if m % 2 == 1:
+        median = filtered[m // 2]
+    else:
+        median = (filtered[m // 2 - 1] + filtered[m // 2]) / 2
 
     if debug_print:
-        print(f"  [data_writer] Median of {times} trials: {median:.1f}µs "
-              f"(min={latencies[0]:.1f}, max={latencies[-1]:.1f})")
-
+        rejected = n - len(filtered)
+        print(f"  [data_writer] Median of {n} trials: {median:.1f}µs "
+              f"(rejected {rejected} outliers, "
+              f"min={filtered[0]:.1f}, max={filtered[-1]:.1f})")
     return median
 
 
 # ─── Batch Cost Collection ───────────────────────────────────────────────────
-# Adapted from par2qo postgres.py get_all_plan_cost (lines 163-178):
-# Original iterated over plan candidates and collected costs.
 
 def collect_all_costs(records: List[BenchmarkRecord],
                       debug_print: bool = True) -> List[float]:
-    """Collect actual costs from all benchmark records.
-
-    Adapted from par2qo/code/postgres.py:get_all_plan_cost (line 163).
-
-    Original:
-        opt_cost_list = []
-        for hint_id in range(len(cur_plan_list)):
-            cost_with_hint, ... = get_plan_cost(...)
-            opt_cost_list.append(cost_with_hint)
-        return opt_cost_list
-    """
     costs = []
     for rec in records:
         costs.append(rec.actual_cost_us)
         if debug_print and len(costs) % 50 == 0:
-            print(f"  [data_writer] Collected {len(costs)}/{len(records)} costs "
-                  f"(latest: {rec.actual_cost_us:.1f}µs)")
+            print(f"  [data_writer] Collected {len(costs)}/{len(records)} costs")
     return costs
 
 
-# ─── Hint/Config Generation ─────────────────────────────────────────────────
-# Adapted from par2qo parse.py gen_final_hint (lines 77-86):
-# Original assembled SQL optimizer hints from join/scan components;
-# we assemble cost model configuration records.
+# ─── Config Record Generation ───────────────────────────────────────────────
 
 def gen_config_record(operation: str, device: str,
                       params: Optional[Dict[str, Any]] = None) -> str:
-    """Generate a cost model configuration record string.
-
-    Adapted from par2qo/code/parse.py:gen_final_hint (line 77).
-
-    Original:
-        result = '/*+'
-        for i in gen_scan_hints(scan_mtd):
-            result += '\\n' + i
-        join_hints, leading = gen_join_hints(str)
-        for i in join_hints:
-            result += '\\n' + i
-        result += '\\n' + leading
-        result += ' */'
-
-    Lynceus: generates cost model config instead of SQL hints.
-    """
     fmt_name = record_format_dict.get(operation, operation)
     parts = [f"/* CostModelConfig: {fmt_name} */"]
     parts.append(f"  device = {device}")
@@ -441,20 +296,8 @@ def gen_config_record(operation: str, device: str,
 
 
 # ─── Data Writer ─────────────────────────────────────────────────────────────
-# Main class: orchestrates writing benchmark results to files.
 
 class DataWriter:
-    """Writes benchmark results to structured output files.
-
-    Adapted from par2qo diagram.py's model serialisation flow:
-      - saveModeltoCache → write_json
-      - initLogFile → init_log
-      - output_result.append → add_record
-
-    Plus utility.py's clean() for output sanitisation and
-    postgres.py's get_real_latency for timing metadata.
-    """
-
     def __init__(self, output_dir: str = "./results",
                  experiment: Optional[ExperimentMeta] = None,
                  debug_print: bool = True):
@@ -465,80 +308,62 @@ class DataWriter:
         self._debug = debug_print
         self._log_file: Optional[str] = None
         self._write_count = 0
-
         if debug_print:
             print(f"\n[data_writer] Initialized DataWriter")
             print(f"  output_dir = {output_dir}")
-            print(self._experiment.dump_debug("  "))
+            print(f"  {self._experiment.dump_debug()}")
 
     def init_log(self, debug_print: Optional[bool] = None) -> str:
-        """Initialise log file — mirrors par2qo diagram.py initLogFile().
-
-        Original:
-            filename = './log/on-base/' + self.db_name + '/diagram/' +
-                str(self.query_id) + '-' + str(self.template_id) + '_' +
-                self.workload_name + '_workload_b' + str(self.b) +
-                '_N' + str(self.N) + '.log'
-            logging.basicConfig(filename=filename, level=logging.INFO)
-        """
         dp = debug_print if debug_print is not None else self._debug
         exp = self._experiment
-
         log_dir = os.path.join(self._output_dir, "log", exp.workload_name)
         log_filename = (f"{exp.experiment_id}_t{exp.template_id}"
                        f"_{exp.workload_name}_b{exp.blend_factor}"
                        f"_N{exp.n_samples}.log")
         self._log_file = os.path.join(log_dir, log_filename)
-
         if dp:
             print(f"  [data_writer] Log file: {self._log_file}")
-
         return self._log_file
 
     def add_record(self, operation: str, predicted_us: float, actual_us: float,
                    routing: str = "CPU", device: str = "", n_rows: int = 0,
                    data_bytes: int = 0,
                    metadata: Optional[Dict[str, Any]] = None) -> BenchmarkRecord:
-        """Add a benchmark record — like par2qo's output_result.append()."""
         self._record_counter += 1
         record = BenchmarkRecord(
-            record_id=self._record_counter,
-            operation=operation,
-            predicted_cost_us=predicted_us,
-            actual_cost_us=actual_us,
-            routing_decision=routing,
-            device=device,
-            n_rows=n_rows,
-            data_bytes=data_bytes,
-            metadata=metadata or {},
-        )
+            record_id=self._record_counter, operation=operation,
+            predicted_cost_us=predicted_us, actual_cost_us=actual_us,
+            routing_decision=routing, device=device,
+            n_rows=n_rows, data_bytes=data_bytes,
+            metadata=metadata or {})
         self._records.append(record)
-
         if self._debug and self._record_counter % 10 == 0:
             print(f"  [data_writer] Record #{self._record_counter}: {operation} "
-                  f"pred={predicted_us:.1f}µs actual={actual_us:.1f}µs "
-                  f"err={record.rel_error:.3f}")
-
+                  f"sMAPE={record.rel_error:.3f} log_r={record.log_ratio:.3f}")
         return record
 
     def write_json(self, filepath: Optional[str] = None,
                    debug_print: Optional[bool] = None) -> str:
-        """Write records to JSON — mirrors par2qo diagram.py saveModeltoCache().
+        """改动: summary 加 p50/p90/p99 latency percentile。
 
-        Original pattern:
-            filename = f'./reuse/{db_name}/diagram/{query_id}-...json'
-            with open(filename, "w") as f:
-                json.dump(model_data, f, indent=2)
+        原版: 只有 mean_rel_error 和 GPU/CPU 计数
+        新版: 加 latency_percentiles, 更接近 SLA 评估需求
         """
         dp = debug_print if debug_print is not None else self._debug
-
         if filepath is None:
             exp = self._experiment
             filepath = os.path.join(
                 self._output_dir,
-                f"{exp.experiment_id}_{exp.workload_name}_N{exp.n_samples}.json"
-            )
+                f"{exp.experiment_id}_{exp.workload_name}_N{exp.n_samples}.json")
 
+        # 改动: 计算 percentile
+        actual_costs = sorted(r.actual_cost_us for r in self._records)
+        pctiles = {}
+        if actual_costs:
+            for p_name, p_val in [("p50", 0.5), ("p90", 0.9), ("p99", 0.99)]:
+                pctiles[p_name] = _percentile(actual_costs, p_val)
+
+        errors = [abs(r.rel_error) for r in self._records]
         output = {
             "experiment": {
                 "id": self._experiment.experiment_id,
@@ -554,148 +379,97 @@ class DataWriter:
             },
             "summary": {
                 "n_records": len(self._records),
-                "mean_rel_error": (sum(abs(r.rel_error) for r in self._records)
-                                   / max(1, len(self._records))),
+                "mean_smape": sum(errors) / max(1, len(errors)),
                 "gpu_routed": sum(1 for r in self._records if r.routing_decision == "GPU"),
                 "cpu_routed": sum(1 for r in self._records if r.routing_decision == "CPU"),
+                "latency_percentiles_us": pctiles,
             },
             "records": [
                 {
-                    "id": r.record_id,
-                    "operation": r.operation,
+                    "id": r.record_id, "operation": r.operation,
                     "predicted_cost": r.predicted_cost_us,
                     "actual_cost": r.actual_cost_us,
-                    "rel_error": r.rel_error,
-                    "routing": r.routing_decision,
-                    "device": r.device,
-                    "n_rows": r.n_rows,
-                    "data_bytes": r.data_bytes,
-                    "timestamp": r.timestamp,
-                    "metadata": r.metadata,
+                    "smape": r.rel_error, "log_ratio": r.log_ratio,
+                    "routing": r.routing_decision, "device": r.device,
+                    "n_rows": r.n_rows, "data_bytes": r.data_bytes,
+                    "timestamp": r.timestamp, "metadata": r.metadata,
                 }
                 for r in self._records
             ],
         }
-
         self._write_count += 1
-
         if dp:
             print(f"\n  [data_writer] write_json #{self._write_count}: {filepath}")
-            print(f"    records: {len(self._records)}")
-            print(f"    mean_rel_error: {output['summary']['mean_rel_error']:.4f}")
-            print(f"    GPU/CPU split: {output['summary']['gpu_routed']}/{output['summary']['cpu_routed']}")
-
-        # Return serialised JSON (actual file write would go here)
+            print(f"    records: {len(self._records)}, pctiles: {pctiles}")
         return json.dumps(output, indent=2)
 
     def write_csv(self, filepath: Optional[str] = None,
                   debug_print: Optional[bool] = None) -> str:
-        """Write records to CSV format."""
         dp = debug_print if debug_print is not None else self._debug
-
         if filepath is None:
             exp = self._experiment
             filepath = os.path.join(
                 self._output_dir,
-                f"{exp.experiment_id}_{exp.workload_name}_N{exp.n_samples}.csv"
-            )
-
-        header = "id,operation,predicted_us,actual_us,rel_error,routing,device,n_rows,data_bytes"
+                f"{exp.experiment_id}_{exp.workload_name}_N{exp.n_samples}.csv")
+        header = "id,operation,predicted_us,actual_us,smape,log_ratio,routing,device,n_rows,data_bytes"
         lines = [header]
         for r in self._records:
             lines.append(
                 f"{r.record_id},{r.operation},{r.predicted_cost_us:.2f},"
-                f"{r.actual_cost_us:.2f},{r.rel_error:.4f},{r.routing_decision},"
-                f"{r.device},{r.n_rows},{r.data_bytes}"
-            )
-
-        csv_text = "\n".join(lines)
+                f"{r.actual_cost_us:.2f},{r.rel_error:.4f},{r.log_ratio:.4f},"
+                f"{r.routing_decision},{r.device},{r.n_rows},{r.data_bytes}")
         self._write_count += 1
-
         if dp:
-            print(f"\n  [data_writer] write_csv #{self._write_count}: {filepath}")
-            print(f"    rows: {len(self._records)}")
-
-        return csv_text
+            print(f"\n  [data_writer] write_csv #{self._write_count}: {len(self._records)} rows")
+        return "\n".join(lines)
 
     def write_log(self, debug_print: Optional[bool] = None) -> str:
-        """Write structured log — mirrors par2qo logging.info output.
-
-        Adapted from par2qo diagram_best_cost.py evaluate() logging:
-            output_string = f"Q{query_id}-{workload_name}..." +
-                f"Robust plan is {robust_plan_id}: {latency}, ..."
-            logging.info(output_string)
-        """
         dp = debug_print if debug_print is not None else self._debug
-
         lines = []
         total_predicted = 0.0
         total_actual = 0.0
         better_count = 0
-
         for r in self._records:
             total_predicted += r.predicted_cost_us
             total_actual += r.actual_cost_us
-            is_close = abs(r.rel_error) < self._experiment.tolerance
-            if is_close:
+            if abs(r.rel_error) < self._experiment.tolerance:
                 better_count += 1
-
-            # Format mirrors par2qo's per-query logging
             line = (f"Record {r.record_id}-{self._experiment.workload_name}-"
                     f"{self._experiment.blend_factor}: "
                     f"{r.operation} on {r.device}: "
-                    f"predicted={r.predicted_cost_us:.1f}µs, "
-                    f"actual={r.actual_cost_us:.1f}µs, "
-                    f"err={r.rel_error:.4f}, "
+                    f"pred={r.predicted_cost_us:.1f}µs, "
+                    f"act={r.actual_cost_us:.1f}µs, "
+                    f"sMAPE={r.rel_error:.4f}, log_r={r.log_ratio:.4f}, "
                     f"routing={r.routing_decision}, "
                     f"{better_count}/{r.record_id} within tolerance")
             lines.append(line)
-
-        # Summary (mirrors par2qo's final summary line)
         n = len(self._records)
         if n > 0:
             summary = (f"SUMMARY: Predicted avg: {total_predicted/n:.1f}µs, "
                       f"Actual avg: {total_actual/n:.1f}µs, "
                       f"Ratio: {total_predicted/max(0.001, total_actual):.3f}, "
-                      f"{better_count}/{n} within tolerance={self._experiment.tolerance}")
+                      f"{better_count}/{n} within tol={self._experiment.tolerance}")
             lines.append(summary)
-
-        log_text = "\n".join(lines)
         self._write_count += 1
-
-        if dp:
+        if dp and lines:
             print(f"\n  [data_writer] write_log #{self._write_count}")
-            if lines:
-                print(f"    {lines[-1]}")  # print summary
-
-        return log_text
+            print(f"    {lines[-1]}")
+        return "\n".join(lines)
 
     def dump_state(self) -> str:
-        """Full state dump for breakpoint inspection."""
         n = len(self._records)
         errors = [abs(r.rel_error) for r in self._records]
         mean_err = sum(errors) / max(1, n)
         max_err = max(errors) if errors else 0.0
         gpu_count = sum(1 for r in self._records if r.routing_decision == "GPU")
-
         lines = [
-            "╔══ DataWriter State ═══════════════════════════════════",
-            f"║ output_dir     = {self._output_dir}",
-            f"║ n_records      = {n}",
-            f"║ write_count    = {self._write_count}",
-            f"║ log_file       = {self._log_file or '(not initialised)'}",
-            f"║ mean_abs_error = {mean_err:.4f}",
-            f"║ max_abs_error  = {max_err:.4f}",
-            f"║ GPU/CPU        = {gpu_count}/{n - gpu_count}",
-            "║",
-            self._experiment.dump_debug("║ "),
+            f"DataWriter: {n} records, {self._write_count} writes",
+            f"  mean_sMAPE={mean_err:.4f}, max_sMAPE={max_err:.4f}",
+            f"  GPU/CPU = {gpu_count}/{n - gpu_count}",
         ]
         if self._records:
-            lines.append("║")
-            lines.append("║ ── Last 5 Records ──")
-            for r in self._records[-5:]:
-                lines.append(f"║   #{r.record_id}: {r.operation} "
-                           f"pred={r.predicted_cost_us:.0f} act={r.actual_cost_us:.0f} "
-                           f"err={r.rel_error:.3f} → {r.routing_decision}")
-        lines.append("╚════════════════════════════════════════════════════════")
+            lines.append("  last 3:")
+            for r in self._records[-3:]:
+                lines.append(f"    #{r.record_id}: {r.operation} "
+                           f"sMAPE={r.rel_error:.3f} → {r.routing_decision}")
         return "\n".join(lines)

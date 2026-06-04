@@ -1,119 +1,62 @@
-"""
-lynceus/strategies/static.py — Static (non-adaptive) routing strategies.
-
-These are the baseline strategies that don't learn from past queries:
-    - GPUOnlyStrategy: all queries to gpu0
-    - CPUOnlyStrategy: all queries to cpu0
-    - HybridStaticStrategy: threshold-based GPU/CPU split
-
-Architecture references:
-    - NCCL NCCL_ALGO_RING (nccl_tuner.h:29) — a fixed algorithm choice
-    - Megatron get_tensor_model_parallel_group (parallel_state.py:1449)
-      → static group assignment, no runtime adaptation
-"""
-
+"""lynceus/strategies/static.py — Static routing strategies."""
 from __future__ import annotations
-
+import math
 from typing import Optional
-
 from ..cost_model import CostModelEngine, QueryDescriptor
 from ..schema import HardwareKind
 from .base import RoutingDecision, RoutingStrategyBase
 
-
 class GPUOnlyStrategy(RoutingStrategyBase):
-    """Route every query to gpu0, regardless of cost.
-
-    Baseline for measuring GPU overhead on small queries.
-    """
-
-    def __init__(self, engine: CostModelEngine, *,
-                 gpu_id: str = "gpu0", **kwargs):
+    def __init__(self, engine: CostModelEngine, *, gpu_id: str = "gpu0", **kwargs):
         super().__init__(engine, **kwargs)
         self._gpu_id = gpu_id
-
     @property
     def name(self) -> str:
         return "GPU-Only"
-
-    def route_one(self, query: QueryDescriptor,
-                  data_location: Optional[str] = None) -> RoutingDecision:
+    def route_one(self, query: QueryDescriptor, data_location: Optional[str] = None) -> RoutingDecision:
         cb = self._engine.estimate_on_device(query, self._gpu_id, data_location)
-        return RoutingDecision(
-            query_id=query.query_id,
-            device_id=self._gpu_id,
-            cost=cb,
-            confidence=1.0,
-            metadata={"reason": "fixed_gpu"},
-        )
-
+        return RoutingDecision(query_id=query.query_id, device_id=self._gpu_id,
+            cost=cb, confidence=1.0, metadata={"reason": "fixed_gpu"})
 
 class CPUOnlyStrategy(RoutingStrategyBase):
-    """Route every query to cpu0.
-
-    Baseline for measuring CPU performance without GPU acceleration.
-    """
-
-    def __init__(self, engine: CostModelEngine, *,
-                 cpu_id: str = "cpu0", **kwargs):
+    def __init__(self, engine: CostModelEngine, *, cpu_id: str = "cpu0", **kwargs):
         super().__init__(engine, **kwargs)
         self._cpu_id = cpu_id
-
     @property
     def name(self) -> str:
         return "CPU-Only"
-
-    def route_one(self, query: QueryDescriptor,
-                  data_location: Optional[str] = None) -> RoutingDecision:
+    def route_one(self, query: QueryDescriptor, data_location: Optional[str] = None) -> RoutingDecision:
         cb = self._engine.estimate_on_device(query, self._cpu_id, data_location)
-        return RoutingDecision(
-            query_id=query.query_id,
-            device_id=self._cpu_id,
-            cost=cb,
-            confidence=1.0,
-            metadata={"reason": "fixed_cpu"},
-        )
-
+        return RoutingDecision(query_id=query.query_id, device_id=self._cpu_id,
+            cost=cb, confidence=1.0, metadata={"reason": "fixed_cpu"})
 
 class HybridStaticStrategy(RoutingStrategyBase):
-    """Threshold-based routing: large queries → GPU, small → CPU.
-
-    The threshold (estimated_rows > gpu_threshold_rows) is a static
-    configuration parameter, not learned. This models a common production
-    heuristic: "anything touching more than 100K rows goes to the GPU."
-    """
-
-    def __init__(self, engine: CostModelEngine, *,
-                 gpu_threshold_rows: int = 90_000,
-                 gpu_id: str = "gpu0",
-                 cpu_id: str = "cpu0", **kwargs):
+    """改动: sigmoid soft threshold 代替硬阈值, 阈值附近平滑过渡。"""
+    def __init__(self, engine: CostModelEngine, *, gpu_threshold_rows: int = 90_000,
+                 gpu_id: str = "gpu0", cpu_id: str = "cpu0", steepness: float = 2.5, **kwargs):
         super().__init__(engine, **kwargs)
         self._threshold = gpu_threshold_rows
         self._gpu_id = gpu_id
         self._cpu_id = cpu_id
-
+        self._steepness = steepness
+        self._log_threshold = math.log(max(1, gpu_threshold_rows))
     @property
     def name(self) -> str:
         return "Hybrid-Static"
-
-    def route_one(self, query: QueryDescriptor,
-                  data_location: Optional[str] = None) -> RoutingDecision:
-        if query.estimated_rows > self._threshold:
+    def route_one(self, query: QueryDescriptor, data_location: Optional[str] = None) -> RoutingDecision:
+        from .._debug import checkpoint
+        log_rows = math.log(max(1, query.estimated_rows))
+        z = self._steepness * (log_rows - self._log_threshold)
+        gpu_prob = 1.0 / (1.0 + math.exp(-z)) if abs(z) < 20 else (1.0 if z > 0 else 0.0)
+        if gpu_prob > 0.5:
             device = self._gpu_id
-            reason = "rows_above_threshold"
+            reason = "rows_above_soft_threshold"
         else:
             device = self._cpu_id
-            reason = "rows_below_threshold"
-
+            reason = "rows_below_soft_threshold"
         cb = self._engine.estimate_on_device(query, device, data_location)
-        return RoutingDecision(
-            query_id=query.query_id,
-            device_id=device,
-            cost=cb,
-            confidence=1.0,
-            metadata={
-                "reason": reason,
-                "threshold": self._threshold,
-                "estimated_rows": query.estimated_rows,
-            },
-        )
+        checkpoint("hybrid_decision", rows=query.estimated_rows, gpu_prob=gpu_prob, device=device)
+        return RoutingDecision(query_id=query.query_id, device_id=device,
+            cost=cb, confidence=abs(gpu_prob - 0.5) * 2,
+            metadata={"reason": reason, "threshold": self._threshold,
+                      "gpu_probability": gpu_prob, "estimated_rows": query.estimated_rows})

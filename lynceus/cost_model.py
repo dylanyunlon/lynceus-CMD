@@ -1,21 +1,9 @@
 """
 lynceus/cost_model.py — Heterogeneous cost model for query routing.
 
-This is the central decision engine. Given a query descriptor and hardware
-topology, it estimates execution cost on each available device and recommends
-the optimal routing.
-
 Architecture references:
-    - PAR2QO get_plan_cost() (par2qo/code/postgres.py:110)
-      → foundation for plan-level cost estimation
-    - VIDEX VidexModelBase.scan_time() (videx/src/.../videx_strategy.py)
-      → virtual index cost model abstraction
-    - CUTLASS GemmUniversal (cutlass/include/cutlass/gemm/kernel/gemm_universal.h:65)
-      → GPU compute cost modeling (tile-level GEMM throughput)
-    - DeepSeek act_quant_kernel (DeepSeek-V3/inference/kernel.py)
-      → FP8 quantized statistics for compact cost tables
-    - Megatron DistributedOptimizer (Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:102)
-      → distributed parameter update cost model
+    - PAR2QO get_plan_cost(), VIDEX scan_time(), CUTLASS GemmUniversal,
+      DeepSeek act_quant_kernel, Megatron DistributedOptimizer
 """
 
 from __future__ import annotations
@@ -26,17 +14,10 @@ from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
 from .schema import (
-    HardwareNode,
-    HardwareTopology,
-    HardwareKind,
-    RoutingStrategy,
-    TopologyEdge,
+    HardwareNode, HardwareTopology, HardwareKind,
+    RoutingStrategy, TopologyEdge,
 )
 
-
-# ---------------------------------------------------------------------------
-# Query descriptor
-# ---------------------------------------------------------------------------
 
 class QueryType(Enum):
     POINT_LOOKUP = auto()
@@ -50,28 +31,21 @@ class QueryType(Enum):
 
 @dataclass
 class QueryDescriptor:
-    """Describes a single query's characteristics for cost estimation.
-
-    Inspired by PAR2QO's parametric representation of queries where each
-    query is described by its cardinality estimates and plan structure.
-    """
     query_id: str
     query_type: QueryType
     estimated_rows: int = 0
     estimated_width_bytes: int = 100
     num_predicates: int = 1
-    selectivity: float = 1.0         # fraction of table accessed
+    selectivity: float = 1.0
     table_rows: int = 1_000_000
     index_available: bool = False
-    index_depth: int = 3             # B-tree depth
+    index_depth: int = 3
     num_joins: int = 0
     sort_required: bool = False
     group_by_cardinality: int = 0
-    table_name: str = ""             # logical table identity (for cache keying);
-                                     # empty => fall back to query_id stem.
+    table_name: str = ""
 
     def __post_init__(self):
-        """Validate that estimated_rows and other fields are non-negative."""
         if self.estimated_rows < 0:
             raise ValueError(f"estimated_rows must be >= 0, got {self.estimated_rows}")
         if self.table_rows < 0:
@@ -79,7 +53,7 @@ class QueryDescriptor:
         if not (0.0 <= self.selectivity <= 1.0):
             raise ValueError(f"selectivity must be in [0, 1], got {self.selectivity}")
         if self.estimated_width_bytes < 0:
-            raise ValueError(f"estimated_width_bytes must be >= 0, got {self.estimated_width_bytes}")
+            raise ValueError(f"estimated_width_bytes must be >= 0")
 
     @property
     def estimated_data_bytes(self) -> int:
@@ -90,16 +64,9 @@ class QueryDescriptor:
         return self.table_rows * self.estimated_width_bytes
 
 
-# ---------------------------------------------------------------------------
-# Cost breakdown
-# ---------------------------------------------------------------------------
-
 @dataclass
 class CostBreakdown:
-    """Itemized cost estimate for a query on a specific device.
-
-    Units: microseconds (to match NCCL latency_us convention).
-    """
+    """Itemized cost estimate. Units: microseconds."""
     device_id: str
     io_cost_us: float = 0.0
     compute_cost_us: float = 0.0
@@ -118,51 +85,39 @@ class CostBreakdown:
         return self.total_us / 1000.0
 
 
-# ---------------------------------------------------------------------------
-# Device-specific cost models
-# ---------------------------------------------------------------------------
-
 class CPUCostModel:
     """Cost model for CPU-side query execution.
 
-    Inspired by PostgreSQL's cost model (seq_page_cost, random_page_cost,
-    cpu_tuple_cost, cpu_operator_cost) as used in PAR2QO
-    get_plan_cost_simple() (par2qo/code/postgres.py:81).
-
-    IMPORTANT: All costs are in MICROSECONDS for dimensional consistency
-    with GPUCostModel. PostgreSQL uses abstract "cost units"; we convert
-    to µs using empirical measurements from modern server hardware:
-      - DDR5 sequential bandwidth: ~50 GB/s → 8KB page ≈ 0.16 µs
-      - L3 cache random access: ~30-100 ns
-      - DRAM random access (NUMA): ~100-300 ns
-      - NVMe SSD random 4K read: ~10-100 µs
-    We model a warm buffer pool (data in DRAM/L3).
+    改动: IO cost 引入 NUMA-locality 衰减因子,
+    对多谓词评估用 short-circuit 概率递减模型代替线性叠加。
     """
-
-    # Warm-cache microsecond costs per 8KB page
-    SEQ_PAGE_COST: float = 0.024      # sequential page read (prefetched, ~20ns)
-    RANDOM_PAGE_COST: float = 0.58    # random page read (~500ns DRAM access)
-    CPU_TUPLE_COST: float = 0.044     # per-tuple processing (~50ns)
-    CPU_OPERATOR_COST: float = 0.012  # per-predicate evaluation (~10ns)
-    CPU_INDEX_TUPLE_COST: float = 0.018  # per-index-tuple fetch (~20ns)
+    SEQ_PAGE_COST: float = 0.024
+    RANDOM_PAGE_COST: float = 0.58
+    CPU_TUPLE_COST: float = 0.044
+    CPU_OPERATOR_COST: float = 0.012
+    CPU_INDEX_TUPLE_COST: float = 0.018
     PAGE_SIZE: int = 8192
+    # NUMA locality decay: 远端内存访问多 ~40% 延迟
+    NUMA_PENALTY: float = 1.38
 
     def estimate(self, query: QueryDescriptor,
                  node: HardwareNode) -> CostBreakdown:
+        from ._debug import dbg, checkpoint
         cb = CostBreakdown(device_id=node.node_id)
 
         pages = max(1, query.estimated_data_bytes // self.PAGE_SIZE)
         total_pages = max(1, query.full_table_bytes // self.PAGE_SIZE)
 
-        # I/O cost
         if query.query_type == QueryType.FULL_TABLE_SCAN:
-            cb.io_cost_us = total_pages * self.SEQ_PAGE_COST * node.scan_cost_per_row
+            base_io = total_pages * self.SEQ_PAGE_COST
+            # NUMA衰减: 大表扫描可能跨NUMA, 用sqrt衰减模拟部分命中
+            numa_factor = 1.0 + (self.NUMA_PENALTY - 1.0) * min(1.0, total_pages / 50000)
+            cb.io_cost_us = base_io * node.scan_cost_per_row * numa_factor
             if node.scan_cost_per_row == 0:
-                cb.io_cost_us = total_pages * self.SEQ_PAGE_COST
+                cb.io_cost_us = base_io * numa_factor
         elif query.index_available and query.query_type in (
             QueryType.POINT_LOOKUP, QueryType.INDEX_SCAN, QueryType.RANGE_SCAN
         ):
-            # Index scan: random I/O for index traversal + sequential for heap
             index_pages = query.index_depth + max(1, int(
                 pages * query.selectivity
             ))
@@ -170,96 +125,98 @@ class CPUCostModel:
                                 query.estimated_rows * self.CPU_INDEX_TUPLE_COST)
             cb.io_cost_us = pages * query.selectivity * self.SEQ_PAGE_COST
         else:
-            # Range/table scan without index
             cb.io_cost_us = pages * self.SEQ_PAGE_COST
 
-        # CPU compute cost
+        # 多谓词短路概率递减: 每个后续谓词只在前面通过时才评估
+        # 期望评估次数 = rows * (1 + sel + sel^2 + ... + sel^(p-1))
+        # 用几何级数代替原版的 rows * num_predicates 线性叠加
+        p = query.num_predicates
+        sel = query.selectivity
+        if sel < 1.0 and p > 1:
+            geom_sum = (1.0 - sel ** p) / (1.0 - sel)
+        else:
+            geom_sum = float(p)
         cb.compute_cost_us = (
             query.estimated_rows * self.CPU_TUPLE_COST +
-            query.estimated_rows * query.num_predicates * self.CPU_OPERATOR_COST
+            query.estimated_rows * geom_sum * self.CPU_OPERATOR_COST
         )
 
-        # Sort cost (if required)
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
             cb.sort_cost_us = (
                 2.2 * n * math.log2(max(2, n)) * self.CPU_OPERATOR_COST
-                + 0.003 * n  # linear damping for cache thrashing on large sets
+                + 0.003 * n
             )
 
-        # Scale by node's relative capacity (inverse: slower node → higher cost)
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
             scale = 1.0 / node.compute_capacity
             cb.compute_cost_us *= scale
             cb.sort_cost_us *= scale
 
+        checkpoint("cpu_cost_done", query_id=query.query_id,
+                   io=cb.io_cost_us, compute=cb.compute_cost_us,
+                   index=cb.index_cost_us, sort=cb.sort_cost_us,
+                   total_us=cb.total_us)
         return cb
 
 
 class GPUCostModel:
     """Cost model for GPU-accelerated query execution.
 
-    Inspired by:
-    - CUTLASS GemmUniversal tile scheduling: GPU throughput is modeled as
-      number of tiles × cycles_per_tile, where tile dimensions come from
-      the GEMM kernel configuration.
-    - DeepSeek act_quant_kernel: FP8 quantization for statistics storage
-      means we can keep per-column stats in GPU HBM cheaply.
-    - vLLM PagedAttention block management: paged memory for index cache.
-
-    Key insight: GPU excels at bulk-parallel operations (full scans,
-    hash joins, sorts on large datasets) but suffers from kernel launch
-    overhead and PCIe transfer latency for small queries.
+    改动: L2 cache 命中率用 sigmoid 曲线代替线性截断,
+    kernel launch overhead 区分 cold/warm launch。
     """
-
-    KERNEL_LAUNCH_OVERHEAD_US: float = 8.5
-    GPU_TUPLE_COST: float = 0.000085    # ~100x faster than CPU per tuple
+    KERNEL_LAUNCH_COLD_US: float = 12.0   # 首次 launch 或 cache miss
+    KERNEL_LAUNCH_WARM_US: float = 5.5    # 热路径 launch
+    GPU_TUPLE_COST: float = 0.000085
     GPU_OPERATOR_COST: float = 0.000058
-    HBM_BANDWIDTH_GB_S: float = 2150.0  # A100-class HBM bandwidth
-    PCIE_BANDWIDTH_GB_S: float = 31.0    # PCIe Gen4 x16
+    HBM_BANDWIDTH_GB_S: float = 2150.0
+    PCIE_BANDWIDTH_GB_S: float = 31.0
+    _launch_count: int = 0  # 跟踪 warm/cold
 
     def estimate(self, query: QueryDescriptor,
                  node: HardwareNode,
                  data_resident_on_gpu: bool = False) -> CostBreakdown:
+        from ._debug import checkpoint
         cb = CostBreakdown(device_id=node.node_id)
 
-        # PCIe transfer cost (if data not already on GPU)
         if not data_resident_on_gpu:
             transfer_bytes = query.estimated_data_bytes
             transfer_seconds = transfer_bytes / (self.PCIE_BANDWIDTH_GB_S * 1e9)
             cb.transfer_cost_us = transfer_seconds * 1e6
 
-        # Kernel launch overhead (FIXED — not scalable by compute_capacity)
-        kernel_launch_us = self.KERNEL_LAUNCH_OVERHEAD_US
+        # cold/warm kernel launch
+        self._launch_count += 1
+        if self._launch_count <= 3:
+            kernel_launch_us = self.KERNEL_LAUNCH_COLD_US
+        else:
+            kernel_launch_us = self.KERNEL_LAUNCH_WARM_US
 
-        # GPU compute: massively parallel
-        # Model as HBM-bandwidth-bound for scans
         data_bytes = query.estimated_data_bytes
-        l2_hit = max(0.0, 1.0 - data_bytes / (40 * 1024**2))
-        eff_bw = self.HBM_BANDWIDTH_GB_S * (1.0 + 1.5 * l2_hit)
-        hbm_seconds = data_bytes / (eff_bw * 1e9)
-        hbm_us = hbm_seconds * 1e6
+        # L2命中率用 sigmoid: 40MB L2, 中心点=20MB, 陡度k=0.15
+        l2_size = 40 * 1024**2
+        sigmoid_x = (l2_size / 2 - data_bytes) / (l2_size / 6)
+        l2_hit = 1.0 / (1.0 + math.exp(-sigmoid_x)) if abs(sigmoid_x) < 20 else (1.0 if sigmoid_x > 0 else 0.0)
 
-        # Compute-bound component (predicate evaluation etc.)
+        eff_bw = self.HBM_BANDWIDTH_GB_S * (1.0 + 1.8 * l2_hit)
+        hbm_us = (data_bytes / (eff_bw * 1e9)) * 1e6
+
         compute_us = (
             query.estimated_rows * self.GPU_TUPLE_COST +
             query.estimated_rows * query.num_predicates * self.GPU_OPERATOR_COST
         )
 
-        # GPU is either compute-bound or memory-bound
         scalable_compute_us = max(hbm_us, compute_us)
 
-        # GPU sort: bitonic sort or radix sort — O(n log²n) but massively parallel
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
-            # GPU sort: ~n * log²(n) / num_SMs operations
-            num_sms = 108  # A100
+            num_sms = 108
             log_n = math.log2(max(2, n))
-            ops = n * (log_n ** 2) + n * log_n * 0.15  # warp divergence penalty
+            # 改动: 加 warp-divergence 的对数修正项
+            divergence_penalty = 0.15 + 0.03 * math.log2(max(2, log_n))
+            ops = n * (log_n ** 2) + n * log_n * divergence_penalty
             cb.sort_cost_us = ops * self.GPU_OPERATOR_COST / num_sms
 
-        # Scale ONLY the compute-bound portion by node capacity
-        # (kernel launch overhead is fixed regardless of GPU FLOPS)
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
             scale = 1.0 / node.compute_capacity
             scalable_compute_us *= scale
@@ -267,25 +224,14 @@ class GPUCostModel:
 
         cb.compute_cost_us = kernel_launch_us + scalable_compute_us
 
+        checkpoint("gpu_cost_done", query_id=query.query_id,
+                   l2_hit=l2_hit, transfer=cb.transfer_cost_us,
+                   compute=cb.compute_cost_us, sort=cb.sort_cost_us,
+                   kernel_type="warm" if self._launch_count > 3 else "cold")
         return cb
 
 
-# ---------------------------------------------------------------------------
-# Unified cost model
-# ---------------------------------------------------------------------------
-
 class CostModelEngine:
-    """Unified cost model that estimates query cost across all devices
-    in the hardware topology and recommends routing.
-
-    Inspired by:
-    - Megatron's pipeline scheduler choosing forward/backward device placement
-      (forward_backward_pipelining_with_interleaving, schedules.py:896)
-    - NCCL's ncclTopoCompute choosing optimal communication topology
-      (nccl/src/graph/search.cc:1023)
-    - VIDEX's strategy-based cost model selection (VidexStrategy enum)
-    """
-
     def __init__(self, topology: HardwareTopology):
         self.topology = topology
         self.cpu_model = CPUCostModel()
@@ -296,9 +242,9 @@ class CostModelEngine:
                            device_id: str,
                            data_location: Optional[str] = None
                            ) -> CostBreakdown:
-        """Estimate cost of executing query on a specific device."""
         from ._debug import dbg
-        dbg('CostModel.estimate', query_id=query.query_id, device=device_id, qtype=query.query_type.name)
+        dbg('CostModel.estimate', query_id=query.query_id,
+            device=device_id, qtype=query.query_type.name)
         node = self.topology.get_node(device_id)
         if node is None:
             raise ValueError(f"Unknown device: {device_id}")
@@ -306,7 +252,6 @@ class CostModelEngine:
         if node.kind == HardwareKind.GPU:
             data_resident = (data_location == device_id)
             cb = self.gpu_model.estimate(query, node, data_resident)
-            # Add transfer cost from data location
             if data_location and not data_resident:
                 cb.transfer_cost_us = self.topology.get_transfer_cost(
                     data_location, device_id, query.estimated_data_bytes
@@ -325,7 +270,6 @@ class CostModelEngine:
     def estimate_all_devices(self, query: QueryDescriptor,
                              data_location: Optional[str] = None
                              ) -> Dict[str, CostBreakdown]:
-        """Estimate cost on every device in the topology."""
         results = {}
         for node_id, node in self.topology.nodes.items():
             if node.kind in (HardwareKind.GPU, HardwareKind.CPU):
@@ -340,19 +284,12 @@ class CostModelEngine:
     def recommend(self, query: QueryDescriptor,
                   data_location: Optional[str] = None
                   ) -> Tuple[str, CostBreakdown]:
-        """Recommend the optimal device for this query.
-
-        Returns (device_id, cost_breakdown) with the lowest total cost.
-
-        This is the core routing decision — analogous to NCCL's
-        ncclTopoCompute choosing the best algorithm/protocol path.
-        """
         estimates = self.estimate_all_devices(query, data_location)
         if not estimates:
             raise RuntimeError("No devices available for estimation")
-
         from ._debug import dbg
-        dbg('CostModel.recommend_result', query_id=query.query_id, n_candidates=len(estimates),
+        dbg('CostModel.recommend_result', query_id=query.query_id,
+            n_candidates=len(estimates),
             costs={k: v.total_ms for k, v in estimates.items()})
         best_id = min(estimates, key=lambda k: estimates[k].total_us)
         return best_id, estimates[best_id]
@@ -360,58 +297,32 @@ class CostModelEngine:
     def route_batch(self, queries: List[QueryDescriptor],
                     data_location: Optional[str] = None
                     ) -> List[Tuple[str, CostBreakdown]]:
-        """Route a batch of queries. Returns per-query (device_id, cost)."""
         return [self.recommend(q, data_location) for q in queries]
 
 
-# ---------------------------------------------------------------------------
-# Default topology factory
-# ---------------------------------------------------------------------------
-
 def create_default_topology() -> HardwareTopology:
-    """Create a typical single-node heterogeneous topology:
-    2x CPU sockets + 4x GPUs connected via PCIe/NVLink.
-
-    Inspired by NCCL's ncclTopoFillGpu/ncclTopoFillNet pattern.
-    """
     topo = HardwareTopology()
-
-    # CPU nodes
     cpu0 = HardwareNode(
         node_id="cpu0", kind=HardwareKind.CPU,
-        compute_capacity=1.0,
-        memory_bytes=256 * (1 << 30),  # 256 GB
-        scan_cost_per_row=1.0,
-        seek_cost=4.0,
-        compute_cost_per_op=0.01,
+        compute_capacity=1.0, memory_bytes=256 * (1 << 30),
+        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.01,
     )
     cpu1 = HardwareNode(
         node_id="cpu1", kind=HardwareKind.CPU,
-        compute_capacity=1.0,
-        memory_bytes=256 * (1 << 30),
-        scan_cost_per_row=1.0,
-        seek_cost=4.0,
-        compute_cost_per_op=0.01,
+        compute_capacity=1.0, memory_bytes=256 * (1 << 30),
+        scan_cost_per_row=1.0, seek_cost=4.0, compute_cost_per_op=0.01,
     )
-
-    # GPU nodes (A100-class)
     gpus = []
     for i in range(4):
         gpu = HardwareNode(
             node_id=f"gpu{i}", kind=HardwareKind.GPU,
-            compute_capacity=110.0,  # ~100x CPU FLOPS
-            memory_bytes=80 * (1 << 30),  # 80 GB HBM
-            bandwidth_gbps=2000.0,   # HBM bandwidth
-            scan_cost_per_row=0.001,
-            seek_cost=0.01,
-            compute_cost_per_op=0.0001,
+            compute_capacity=110.0, memory_bytes=80 * (1 << 30),
+            bandwidth_gbps=2000.0,
+            scan_cost_per_row=0.001, seek_cost=0.01, compute_cost_per_op=0.0001,
         )
         gpus.append(gpu)
-
     for n in [cpu0, cpu1] + gpus:
         topo.add_node(n)
-
-    # PCIe edges: CPU ↔ GPU
     for gpu in gpus:
         topo.add_edge(TopologyEdge(
             src="cpu0", dst=gpu.node_id,
@@ -423,8 +334,6 @@ def create_default_topology() -> HardwareTopology:
             bandwidth_gbps=32.0, latency_us=1.0,
             link_type=HardwareKind.PCIE,
         ))
-
-    # NVLink edges: GPU ↔ GPU (mesh)
     for i, g1 in enumerate(gpus):
         for j, g2 in enumerate(gpus):
             if i != j:
@@ -433,18 +342,12 @@ def create_default_topology() -> HardwareTopology:
                     bandwidth_gbps=600.0, latency_us=0.5,
                     link_type=HardwareKind.NVLINK,
                 ))
-
-    # CPU ↔ CPU (QPI/UPI)
     topo.add_edge(TopologyEdge(
-        src="cpu0", dst="cpu1",
-        bandwidth_gbps=50.0, latency_us=0.3,
+        src="cpu0", dst="cpu1", bandwidth_gbps=50.0, latency_us=0.3,
         link_type=HardwareKind.NETWORK,
     ))
     topo.add_edge(TopologyEdge(
-        src="cpu1", dst="cpu0",
-        bandwidth_gbps=50.0, latency_us=0.3,
+        src="cpu1", dst="cpu0", bandwidth_gbps=50.0, latency_us=0.3,
         link_type=HardwareKind.NETWORK,
     ))
-
     return topo
-
