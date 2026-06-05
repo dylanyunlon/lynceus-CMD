@@ -646,3 +646,26 @@
 - 3种负载: TPC-H(OLAP) / TPC-DS(混合) / YCSB(OLTP)
 - 6种策略 × 每负载
 - 输出 fig1-fig4 JSON: latency曲线/累积cost/路由分布/缓存命中率
+
+---
+
+## 第五位 Claude 完成记录（M181–M200: 论文表格）
+
+**日期**: 2026-06-05
+**交付**: scripts/generate_paper_tables.py (377行)
+
+- table1: 6策略排名 (mean/std/P95/entropy/cache), LaTeX \textbf 最优高亮
+- table2: 7项消融 (baseline/ablated/Cohen's d/p-value/effect)
+- table3: 3负载×6策略 grand_mean, 每负载内最优高亮
+- ASCII终端预览 + sparkline ▁▂▃▄▅▆▇█
+
+---
+
+## 第六位 Claude 完成记录（M201–M220: 全链路runner）
+
+**日期**: 2026-06-05
+**交付**: scripts/run_full_experiment.py (194行)
+
+- 4阶段顺序执行: strategy → ablation → multi_workload → tables
+- 增量执行(--skip-existing), 超时watchdog, fail-fast退出码
+- 摘要报告: 每阶段耗时/文件大小/成功状态
