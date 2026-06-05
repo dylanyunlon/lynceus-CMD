@@ -616,3 +616,33 @@
   "smape_matrix": { "GPU-Only vs CPU-Only": 0.0957, ... }
 }
 ```
+
+---
+
+## 第三位 Claude 完成记录（M141–M160: 消融实验）
+
+**日期**: 2026-06-05
+**交付**: scripts/ablation_study.py (569行)
+**方法**: 子模型(opus 4.6)生成骨架 → 监督Claude修复API兼容性
+
+| 消融项 | baseline | ablated | Cohen's d |
+|--------|----------|---------|-----------|
+| phase_shift_vs_fixed_zipf | phase-shift | 固定均匀 | +0.18 (negligible) |
+| numa_local_vs_cross | cpu0 | cpu1(跨NUMA) | 0.00 |
+| welford_vs_naive_variance | Welford | two-pass | Δ=1e-12 精度 |
+| kahan_vs_naive_sum | Kahan | naive += | Δ=5e-10 精度 |
+| sigmoid_vs_hard_threshold | sigmoid(2.5) | step(100) | 0.00 |
+| softmax_anneal_vs_greedy | 退火(50→2) | greedy(0.01) | 0.00 |
+| adaptive_vs_fixed_margin | 自适应 | 固定 | 0.00 |
+
+---
+
+## 第四位 Claude 完成记录（M161–M180: 多负载论文数据）
+
+**日期**: 2026-06-05
+**交付**: scripts/multi_workload_bench.py (452行)
+**方法**: 子模型(opus 4.6)生成 → 监督Claude修复CostBreakdown.total_us
+
+- 3种负载: TPC-H(OLAP) / TPC-DS(混合) / YCSB(OLTP)
+- 6种策略 × 每负载
+- 输出 fig1-fig4 JSON: latency曲线/累积cost/路由分布/缓存命中率
