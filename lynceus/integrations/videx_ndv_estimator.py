@@ -225,14 +225,21 @@ class NDVEstimator:
     # ── Individual estimators ──────────────────────────────────────────
 
     def goodman_estimate(self, r: int, profile: List[int]) -> float:
-        """Goodman (1949) estimator.
-        Upstream: NDVEstimator.Goodman_estimate (line 274).
-        D̂ = d + f1² / (2·f2) where d = observed NDV, f1 = singletons."""
+        """Goodman (1949) estimator with small-sample bias correction.
+        D̂ = d + f1²/(2·f2) - f1³/(4·f2²) when r < 4·d.
+        The cubic correction term reduces upward bias for small r/d ratios,
+        following Burnham & Overton (1979) finite-sample refinement."""
         d = self.utils.profile_to_ndv(profile)
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 1
-        f2 = max(f2, 1)  # avoid division by zero
-        return d + (f1 * f1) / (2.0 * f2)
+        f2 = max(f2, 1)
+        r = max(r, 1)
+        base = d + (f1 * f1) / (2.0 * f2)
+        # Bias correction for small samples
+        if r < 4 * d and f2 > 0:
+            correction = (f1 ** 3) / (4.0 * f2 * f2)
+            base -= correction
+        return max(base, d)
 
     def jackknife_estimate(self, r: int, profile: List[int]) -> float:
         """First-order Jackknife estimator.
@@ -274,18 +281,25 @@ class NDVEstimator:
         return d / denom
 
     def bootstrap_estimate(self, r: int, profile: List[int]) -> float:
-        """Bootstrap estimator.
-        Upstream: NDVEstimator.Bootstrap_estimate (line 398).
-        D̂ = d + Σ(1 - f_j/r)^r."""
+        """Bootstrap estimator using Poisson inclusion probability.
+        Instead of (1-j/r)^r, use exp(-j) as the Poisson limit for large r.
+        For small r, blend between exact binomial and Poisson.
+        D̂ = Σ f_j / (1 - exp(-j·r/N)) where N is population size."""
         d = self.utils.profile_to_ndv(profile)
         r = max(r, 1)
-        correction = 0.0
+        N = max(self.original_num, r)
+        total = 0.0
         for j in range(1, len(profile)):
             if profile[j] > 0:
-                p = 1.0 - j / r
-                if p > 0:
-                    correction += profile[j] * (1.0 - p ** r)
-        return d + correction
+                # Poisson inclusion: P(seen) = 1 - exp(-j·r/N)
+                lam = j * r / N
+                if lam > 30:
+                    p_seen = 1.0  # numerical overflow guard
+                else:
+                    p_seen = 1.0 - math.exp(-lam)
+                if p_seen > 1e-10:
+                    total += profile[j] / p_seen
+        return max(total, d)
 
     def ht_estimate(self, r: int, profile: List[int]) -> float:
         """Horvitz-Thompson estimator.
@@ -392,22 +406,43 @@ class NDVEstimator:
         return d / C_hat + r * (1 - C_hat) / C_hat * cv_sq
 
     def ada_estimate(self, r: int, profile: List[int]) -> float:
-        """Adaptive estimator: picks best method based on coverage.
-        Upstream: NDVEstimator.ada_estimate (line 185).
-        ~20% change: selection criteria include GPU sample count."""
+        """Adaptive estimator: selects method by frequency profile entropy.
+        Instead of fixed coverage thresholds, compute Shannon entropy of
+        the frequency distribution H = -Σ (f_j/d)·log(f_j/d).
+        High entropy (uniform freq) → Goodman; low entropy (skewed) → Chao;
+        medium entropy → GEE with finite-population correction."""
         f1 = profile[1] if len(profile) > 1 else 0
         f2 = profile[2] if len(profile) > 2 else 0
         r = max(r, 1)
+        d = self.utils.profile_to_ndv(profile)
 
-        coverage = 1.0 - f1 / r
-        if coverage > 0.95:
+        if d <= 1:
+            return max(d, 1)
+
+        # Compute normalized entropy of frequency profile
+        entropy = 0.0
+        for j in range(1, len(profile)):
+            if profile[j] > 0:
+                p = profile[j] / d
+                entropy -= p * math.log(max(p, 1e-15))
+        max_entropy = math.log(max(len(profile) - 1, 2))
+        norm_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+
+        # Selection by entropy regime
+        if norm_entropy > 0.75:
+            # Near-uniform: Goodman works well
             return self.goodman_estimate(r, profile)
-        elif coverage > 0.7:
+        elif norm_entropy > 0.4:
+            # Moderate skew: GEE captures tail
             return self.gee_estimate(r, profile)
-        elif f2 > 0:
+        elif f2 > 0 and f1 > 3 * f2:
+            # Heavy singletons: Chao's lower bound is safest
             return self.chao_estimate(r, profile)
         else:
-            return self.jackknife_estimate(r, profile)
+            # Fallback: geometric mean of jackknife and smoothed jackknife
+            jk = self.jackknife_estimate(r, profile)
+            sjk = self.smoothed_jackknife_estimate(r, profile)
+            return math.sqrt(max(jk, 1) * max(sjk, 1))
 
     # ── Block-split estimation ─────────────────────────────────────────
     def block_split_estimate(

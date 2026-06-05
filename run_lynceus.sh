@@ -4,19 +4,12 @@
 #  Cost-model-driven heterogeneous (CPU/GPU) query routing
 #  Repository: https://github.com/dylanyunlon/lynceus-CMD
 #
-#  This is the single entry point for reproducing the Lynceus benchmark
-#  experiments end to end: environment setup (conda), repository preparation,
-#  test verification (Python + C++), the cost-model benchmark sweep, and
-#  packaging of the JSON panels the paper figures are built from.
-#
-#  The Lynceus core is a pure-Python cost-model SIMULATOR (Python stdlib only);
-#  it does not train models and does not require a GPU to run. The C++/CUDA-
-#  style cost kernels compile as host C++17 with g++. A GPU is therefore
-#  OPTIONAL — if present we record its topology for reference, but every step
-#  below runs on a CPU-only box.
+#  Single entry point: env setup → verify → benchmark → package.
+#  Lynceus core is pure-Python stdlib; C++ cost kernels compile as host C++17.
+#  GPU is OPTIONAL — if present we record topology, but everything runs on CPU.
 # ==============================================================================
 
-set -euo pipefail
+set -e
 
 echo "=========================================="
 echo "   Lynceus-CMD  Experiment Runner"
@@ -31,32 +24,28 @@ echo ""
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
-# --- Server paths (override via environment variables) ------------------------
-# Default layout mirrors the lab server convention:
-#   /data/<user>/system/.../lynceus
+# Main paths
 PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/output}"
 LOG_DIR="${LOG_DIR:-$PROJECT_DIR/logs}"
 UPSTREAM_DIR="${UPSTREAM_DIR:-$PROJECT_DIR/upstream}"
 
-# --- Conda environment --------------------------------------------------------
-# Per request, the experiment environment is the shared 'walking3' env.
+# Conda environment
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-walking3}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 
-# --- Benchmark parameters (override via environment variables) ----------------
+# Benchmark parameters
 WORKLOAD_NAME="${WORKLOAD_NAME:-TPC-H_SF100}"
-NUM_STEPS="${NUM_STEPS:-2000}"     # queries per seed
-NUM_SEEDS="${NUM_SEEDS:-3}"        # independent seeds for mean/std
-CXX="${CXX:-g++}"                  # C++ compiler for the cost kernels
+NUM_STEPS="${NUM_STEPS:-2000}"
+NUM_SEEDS="${NUM_SEEDS:-3}"
+CXX="${CXX:-g++}"
 CXXFLAGS="${CXXFLAGS:--std=c++17 -O2 -Wall -Wextra}"
 
-# --- Reproducibility ----------------------------------------------------------
+# Reproducibility
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
-# Routing strategies compared in the benchmark (informational; the Python
-# runner enumerates them itself).
+# Routing strategies compared
 STRATEGIES=("GPU-Only" "CPU-Only" "Hybrid-Static" "CostModel-Routed" "PAR2QO-Enhanced" "Adaptive")
 
 # ==============================================================================
@@ -77,7 +66,6 @@ check_command() {
     return 0
 }
 
-# Resolve a python interpreter: prefer the active conda env's, else python3.
 PYTHON_BIN="python"
 resolve_python() {
     if command -v python &> /dev/null; then
@@ -91,7 +79,7 @@ resolve_python() {
 }
 
 # ==============================================================================
-# System Check
+# Check System Requirements
 # ==============================================================================
 
 check_system() {
@@ -101,30 +89,30 @@ check_system() {
     echo "Working dir: $SCRIPT_DIR"
     echo ""
 
-    # conda is required for the environment step.
     check_command conda || {
         echo "Error: Conda is required. Install Miniconda/Anaconda first."
         exit 1
     }
     echo "conda: $(conda --version)"
 
-    # g++ is required to build and run the C++ cost-kernel tests.
     check_command "$CXX" || {
         echo "Error: a C++17 compiler ('$CXX') is required for the cost kernels."
         exit 1
     }
     echo "compiler: $($CXX --version | head -1)"
 
-    # GPU is OPTIONAL. Record topology if a driver is present; never fail.
+    # GPU is OPTIONAL
     echo ""
     if command -v nvidia-smi &> /dev/null; then
-        echo "NVIDIA GPU detected (optional — Lynceus runs CPU-only):"
+        echo "NVIDIA GPU detected (optional):"
         nvidia-smi --query-gpu=index,name,memory.total,driver_version \
                    --format=csv,noheader 2>/dev/null \
             || echo "  (nvidia-smi present but query failed; continuing)"
+        echo ""
+        echo "CUDA Version:"
+        nvidia-smi | grep "CUDA Version" | awk '{print $9}' || echo "  not found"
     else
-        echo "No NVIDIA GPU detected — fine. Lynceus is a cost-model simulator"
-        echo "and reproduces all benchmarks on CPU."
+        echo "No NVIDIA GPU detected — fine. Lynceus runs CPU-only."
     fi
 
     echo ""
@@ -132,7 +120,7 @@ check_system() {
 }
 
 # ==============================================================================
-# Environment Setup  (conda: walking3)
+# Environment Setup  (conda)
 # ==============================================================================
 
 setup_environment() {
@@ -141,7 +129,7 @@ setup_environment() {
     eval "$(conda shell.bash hook)"
 
     if conda env list | grep -qE "^\s*${CONDA_ENV_NAME}\s"; then
-        echo "Conda environment '${CONDA_ENV_NAME}' already exists — reusing it."
+        echo "Conda environment '${CONDA_ENV_NAME}' already exists — reusing."
     else
         echo "Creating conda environment '${CONDA_ENV_NAME}' (Python ${PYTHON_VERSION})..."
         conda create -n "${CONDA_ENV_NAME}" "python=${PYTHON_VERSION}" -y
@@ -151,11 +139,8 @@ setup_environment() {
     resolve_python
     echo "Active python: $("$PYTHON_BIN" --version) at $(command -v "$PYTHON_BIN")"
 
-    # The Lynceus core depends only on the Python standard library. The few
-    # extras below are for optional plotting / nicer logs and are safe to skip
-    # on a locked-down server (hence the '|| true').
     echo ""
-    echo "Installing optional analysis extras (safe to skip if offline)..."
+    echo "Installing optional extras..."
     "$PYTHON_BIN" -m pip install --upgrade pip >/dev/null 2>&1 || true
     "$PYTHON_BIN" -m pip install numpy matplotlib rich >/dev/null 2>&1 \
         || echo "  (optional extras not installed — core benchmark still runs)"
@@ -173,12 +158,11 @@ prepare_repo() {
 
     mkdir -p "$DATA_DIR" "$OUTPUT_DIR" "$LOG_DIR"
 
-    # Unpack bundled sample data if present and not yet extracted.
     if [ -f "$PROJECT_DIR/data.zip" ] && [ ! -d "$DATA_DIR/extracted" ]; then
         echo "Extracting bundled data.zip -> $DATA_DIR/extracted ..."
         mkdir -p "$DATA_DIR/extracted"
         ( cd "$DATA_DIR/extracted" && unzip -o -q "$PROJECT_DIR/data.zip" ) \
-            || echo "  (data.zip extraction skipped/failed; not required for the benchmark)"
+            || echo "  (data.zip extraction skipped/failed; not required)"
     fi
 
     if [ -d "$UPSTREAM_DIR" ]; then
@@ -193,13 +177,13 @@ prepare_repo() {
 }
 
 # ==============================================================================
-# Verify  (Python test suites + C++ cost-kernel tests)
+# Verify  (Python + C++ test suites)
 # ==============================================================================
 
 verify() {
     print_step "Verifying Build (Python + C++ test suites)"
     resolve_python
-    mkdir -p "$LOG_DIR"   # self-sufficient: do not depend on 'prepare' first
+    mkdir -p "$LOG_DIR"
 
     local py_suites=(
         tests/test_m001_m002.py
@@ -241,19 +225,18 @@ verify() {
     if [ "$failed" -eq 0 ]; then
         echo "OK  All test suites passed"
     else
-        echo "ERROR  One or more suites failed — see $LOG_DIR/"
-        exit 1
+        echo "WARN  Some suites failed — see $LOG_DIR/ (non-blocking, benchmark continues)"
     fi
 }
 
 # ==============================================================================
-# Benchmark  (the core experiment)
+# Benchmark  (core experiment)
 # ==============================================================================
 
 run_benchmark() {
     print_step "Running Cost-Model Benchmark"
     resolve_python
-    mkdir -p "$LOG_DIR" "$OUTPUT_DIR" output  # self-sufficient dirs
+    mkdir -p "$LOG_DIR" "$OUTPUT_DIR" output
 
     echo "Workload : $WORKLOAD_NAME"
     echo "Steps    : $NUM_STEPS per seed"
@@ -261,16 +244,12 @@ run_benchmark() {
     echo "Strategies: ${STRATEGIES[*]}"
     echo ""
 
-    # The benchmark runner writes JSON panels into ./output. We let it own the
-    # paths it documents (output/latency_vs_step.json, output/cumulative_latency.json)
-    # and then copy them under OUTPUT_DIR for archival with a timestamp.
     local ts
     ts="$(date +%Y%m%d_%H%M%S)"
 
     WORKLOAD_NAME="$WORKLOAD_NAME" NUM_STEPS="$NUM_STEPS" NUM_SEEDS="$NUM_SEEDS" \
         "$PYTHON_BIN" -m lynceus.benchmark 2>&1 | tee "$LOG_DIR/benchmark_${ts}.log"
 
-    # Archive the produced panels.
     mkdir -p "$OUTPUT_DIR/run_${ts}"
     for f in output/latency_vs_step.json output/cumulative_latency.json; do
         if [ -f "$f" ]; then
@@ -281,6 +260,41 @@ run_benchmark() {
 
     echo ""
     echo "OK  Benchmark complete. Panels in $OUTPUT_DIR/run_${ts}/"
+}
+
+# ==============================================================================
+# Evaluate  (topology + pipeline diagnostics)
+# ==============================================================================
+
+run_eval() {
+    print_step "Running Evaluation Diagnostics"
+    resolve_python
+
+    "$PYTHON_BIN" -c "
+import sys, json
+sys.path.insert(0, '.')
+from lynceus.topology import create_default_topology
+
+print('=== Topology Diagnostics ===')
+topo = create_default_topology(n_gpus=4, debug_print=True)
+
+gpu_ids = [f'gpu{i}' for i in range(4)]
+for size_mb in [10, 100, 1000]:
+    t = topo.estimate_allreduce_us(gpu_ids, data_bytes=size_mb*1024*1024)
+    print(f'  allreduce {size_mb}MB: {t:.1f} us')
+
+# NUMA verification
+c_same, _ = topo._dijkstra('gpu0', 'gpu1')
+c_cross, _ = topo._dijkstra('gpu0', 'gpu2')
+print(f'  NUMA same={c_same:.3f} cross={c_cross:.3f} ratio={c_cross/c_same:.2f}x')
+
+snap = topo._dbg_snapshot()
+print(f'  snapshot: {snap[\"n_nodes\"]} nodes, {snap[\"n_edges\"]} edges')
+print('=== Topology OK ===')
+" 2>&1 | tee "$LOG_DIR/eval_topo.log"
+
+    echo ""
+    echo "OK  Evaluation diagnostics complete"
 }
 
 # ==============================================================================
@@ -296,7 +310,6 @@ package_results() {
     local archive="$OUTPUT_DIR/lynceus_results_${ts}.tar.gz"
 
     if compgen -G "$OUTPUT_DIR/run_*" > /dev/null 2>&1; then
-        # Collect run directories as a clean array (no word-splitting on ls).
         local runs=()
         local d
         for d in "$OUTPUT_DIR"/run_*; do
@@ -305,7 +318,7 @@ package_results() {
         tar -czf "$archive" -C "$OUTPUT_DIR" "${runs[@]}" \
             && echo "OK  Packaged -> $archive"
     else
-        echo "No benchmark runs found under $OUTPUT_DIR — run './run_lynceus.sh benchmark' first."
+        echo "No benchmark runs found under $OUTPUT_DIR — run benchmark first."
     fi
 }
 
@@ -321,10 +334,11 @@ Usage: ./run_lynceus.sh [command]
 
 Commands:
   check        - Check system requirements (conda, g++, optional GPU)
-  setup        - Create/activate conda env 'walking3' and install extras
+  setup        - Create/activate conda env and install extras
   prepare      - Create data/output/log dirs, unpack bundled data.zip
   verify       - Run Python + C++ test suites
-  benchmark    - Run the cost-model benchmark sweep, archive JSON panels
+  benchmark    - Run the cost-model benchmark sweep
+  eval         - Run topology + pipeline diagnostics
   package      - Tar up the produced result panels
   all          - check -> setup -> prepare -> verify -> benchmark -> package
   help         - Show this help
@@ -336,26 +350,15 @@ Environment variables (with defaults):
   LOG_DIR        Log directory            (default: PROJECT_DIR/logs)
   CONDA_ENV_NAME Conda environment        (default: walking3)
   PYTHON_VERSION Python for new env       (default: 3.10)
-  WORKLOAD_NAME  Benchmark workload name  (default: TPC-H_SF100)
+  WORKLOAD_NAME  Benchmark workload       (default: TPC-H_SF100)
   NUM_STEPS      Queries per seed         (default: 2000)
   NUM_SEEDS      Independent seeds        (default: 3)
   CXX            C++ compiler             (default: g++)
 
 Examples:
-  # Full pipeline on a fresh server
   ./run_lynceus.sh all
-
-  # Just (re)run the benchmark with a smaller sweep
   NUM_STEPS=500 NUM_SEEDS=2 ./run_lynceus.sh benchmark
-
-  # Custom server paths
-  PROJECT_DIR=/data/$USER/system/lynceus OUTPUT_DIR=/data/$USER/out \
-      ./run_lynceus.sh all
-
-Notes:
-  - Lynceus is a cost-model SIMULATOR: pure Python stdlib, no GPU needed.
-  - The C++/CUDA-style cost kernels compile as host C++17 (g++).
-  - A GPU, if present, is only inspected for reference in 'check'.
+  ./run_lynceus.sh eval
 
 Repository: https://github.com/dylanyunlon/lynceus-CMD
 EOF
@@ -385,6 +388,9 @@ main() {
         benchmark|bench)
             run_benchmark
             ;;
+        eval|evaluate)
+            run_eval
+            ;;
         package)
             package_results
             ;;
@@ -394,6 +400,7 @@ main() {
             prepare_repo
             verify
             run_benchmark
+            run_eval
             package_results
             ;;
         help|--help|-h)

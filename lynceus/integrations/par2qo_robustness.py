@@ -163,54 +163,81 @@ def simulate_plan_cost(
     gpu_speedup_factor: float = 3.5,
     transfer_us_per_mb: float = 12.0,
 ) -> CostEstimate:
-    """Simulate query cost for a plan under given selectivities.
+    """Simulate query cost under given selectivities.
 
-    PAR2QO: get_plan_cost(cursor, sql, hint, explain) → calls PostgreSQL.
-    Lynceus: analytical cost model with GPU/CPU split.
-
-    The cost model computes:
-      cpu_cost = Σ(rows_scanned × scan_weight + rows_joined × join_weight)
-      gpu_cost = cpu_cost / gpu_speedup_factor
-      transfer = data_size_mb × transfer_us_per_mb
+    Lynceus cost model — analytical GPU/CPU split.
     """
     cpu_cost = 0.0
     total_rows_scanned = 0
+    total_output_rows = 0
 
-    # Scan cost: PAR2QO uses PostgreSQL's cost; we simulate
+    # ── Scan cost: Mackert-Lohman nonlinear I/O ──
+    # effective_page_cost = seq_cost * sqrt(sel) + rand_cost * (1 - sqrt(sel))
+    # This models the transition from sequential to random I/O as selectivity drops
+    seq_page_cost = 1.0
+    rand_page_cost = 4.0
     for i, (tbl, method) in enumerate(plan.scan_methods.items()):
         rows = table_rows.get(tbl, 100000)
         sel = base_selectivities[i] if i < len(base_selectivities) else 0.01
+        sel = max(1e-8, min(1.0, sel))
         scanned = rows * sel
         total_rows_scanned += scanned
 
+        sqrt_sel = math.sqrt(sel)
         if method == ScanMethod.SEQ:
-            cpu_cost += scanned * 1.0  # seq_page_cost analog
+            # Mackert-Lohman: mixed I/O model
+            eff_page_cost = seq_page_cost * sqrt_sel + rand_page_cost * (1.0 - sqrt_sel)
+            cpu_cost += scanned * eff_page_cost
         elif method == ScanMethod.INDEX:
-            cpu_cost += scanned * 1.5 + math.log2(max(rows, 1)) * 4.0
+            # B-tree traversal: log2(N) * 4 + leaf scan * (1 + random_io_penalty)
+            tree_depth = math.log2(max(rows, 2))
+            leaf_scan = scanned * (1.0 + rand_page_cost * (1.0 - sqrt_sel))
+            cpu_cost += tree_depth * 4.0 + leaf_scan
         else:  # BITMAP
-            cpu_cost += scanned * 0.8 + math.sqrt(max(rows, 1)) * 2.0
+            # bitmap: heap scan amortizes random I/O via bitmap merge
+            # cost = sqrt(pages) * 2 + rows * 0.5 (heap recheck)
+            pages = max(1, rows // 80)  # ~80 rows per 8KB page
+            cpu_cost += math.sqrt(pages) * 2.0 + scanned * 0.5
 
-    # Join cost: PAR2QO uses PostgreSQL's join cost estimation
+    # ── Join cost: build/probe asymmetry + output materialization ──
     for j, ((left, right), method) in enumerate(
         zip(plan.join_order, plan.join_methods)
     ):
         sel = join_selectivities[j] if j < len(join_selectivities) else 0.001
         left_rows = table_rows.get(left, 10000)
         right_rows = table_rows.get(right, 10000)
-        output_rows = left_rows * right_rows * sel
+        output_rows = max(1, left_rows * right_rows * sel)
+        total_output_rows += output_rows
 
         if method == JoinMethod.HASH:
-            cpu_cost += left_rows + right_rows * 2.0 + output_rows
+            # Build phase: scan + insert hash table (2.3× for hash collision overhead)
+            build = left_rows * 2.3
+            # Probe phase: scan right + probe (1.1× for successful + miss probes)
+            probe = right_rows * 1.1
+            # Output materialization
+            cpu_cost += build + probe + output_rows * 0.4
         elif method == JoinMethod.NESTED_LOOP:
-            cpu_cost += left_rows * right_rows * sel * 0.5
+            # NL with index on inner: outer × (index_lookup + match_fetch)
+            index_cost = math.log2(max(right_rows, 2)) * 3.0
+            cpu_cost += left_rows * (index_cost + sel * right_rows * 0.3)
         else:  # MERGE
-            cpu_cost += (left_rows + right_rows) * math.log2(
-                max(left_rows + right_rows, 1)
-            )
+            # Sort-merge: sort both sides + linear merge
+            sort_left = left_rows * math.log2(max(left_rows, 2)) * 1.39  # 3-way mergesort
+            sort_right = right_rows * math.log2(max(right_rows, 2)) * 1.39
+            merge = left_rows + right_rows  # linear scan
+            cpu_cost += sort_left + sort_right + merge + output_rows * 0.2
 
-    # GPU cost: divide by speedup, add transfer
-    data_mb = total_rows_scanned * 0.0001  # ~100 bytes per row
-    gpu_cost = cpu_cost / gpu_speedup_factor
+    # ── GPU cost: roofline model instead of flat divisor ──
+    # GPU excels at high-parallelism (many rows) but has launch overhead
+    # roofline: max(compute_bound, memory_bound)
+    data_mb = total_rows_scanned * 0.0001
+    launch_overhead = 15.0  # kernel launch ~15µs
+    # memory-bound: HBM bandwidth 2TB/s → data_mb * 1000 / 2000 µs
+    mem_bound_us = (data_mb * 1000.0) / 2000.0
+    # compute-bound: cpu_cost / speedup (parallelism gain)
+    compute_bound_us = cpu_cost / gpu_speedup_factor
+    gpu_cost = max(mem_bound_us, compute_bound_us) + launch_overhead
+
     transfer = data_mb * transfer_us_per_mb
 
     return CostEstimate(cpu_cost=cpu_cost, gpu_cost=gpu_cost, transfer_cost=transfer)
@@ -262,29 +289,41 @@ def cal_penalty_at_sample(
         plan, perturbed_base, perturbed_join, table_rows, gpu_speedup
     )
 
-    # Cost of the "optimal" plan (heuristic: use best device for each stage)
-    # PAR2QO: calls get_plan_cost(cursor, sql, explain) with no hint → optimizer picks
-    # Lynceus: we approximate by taking the best cost across devices
-    cost_opt_value = cost_hint.best * 0.85  # optimizer advantage factor
+    # Optimal cost: oracle that picks the best device for each operation
+    # Regret = cost(plan) - cost(oracle). The oracle sees perturbed selectivities
+    # and picks min(cpu, gpu+transfer) per stage.
+    # This is a proper regret metric, not a flat multiplier.
+    cost_cpu_only = cost_hint.cpu_cost
+    cost_gpu_with_transfer = cost_hint.gpu_cost + cost_hint.transfer_cost
+    cost_oracle = min(cost_cpu_only, cost_gpu_with_transfer)
 
-    penalty = max(cost_hint.best - cost_opt_value, 0.0)
+    # The plan's actual cost depends on its forced device assignment
+    cost_plan = cost_hint.best  # best across devices for this plan structure
+
+    # Transfer variance jitter: real transfers have ±15% variance from
+    # PCIe contention, NUMA effects, etc. Add this as penalty risk.
+    transfer_jitter = cost_hint.transfer_cost * 0.15
+
+    # Regret = plan cost - oracle cost + transfer risk
+    penalty = max(cost_plan - cost_oracle + transfer_jitter, 0.0)
 
     if debug:
         logger.info(
             f"[DEBUG penalty] plan={plan.plan_id} "
             f"cost_hint_cpu={cost_hint.cpu_cost:.1f} "
             f"cost_hint_gpu={cost_hint.total_gpu:.1f} "
-            f"cost_opt={cost_opt_value:.1f} "
+            f"cost_oracle={cost_oracle:.1f} "
             f"penalty={penalty:.1f} "
+            f"transfer_jitter={transfer_jitter:.1f} "
             f"best_device={cost_hint.best_device}"
         )
         print(
             f"  ├─ penalty@sample: plan#{plan.plan_id} "
             f"cpu={cost_hint.cpu_cost:.1f} gpu={cost_hint.total_gpu:.1f} "
-            f"opt={cost_opt_value:.1f} Δ={penalty:.1f} [{cost_hint.best_device}]"
+            f"oracle={cost_oracle:.1f} Δ={penalty:.1f} [{cost_hint.best_device}]"
         )
 
-    return penalty, cost_hint.best, cost_opt_value
+    return penalty, cost_hint.best, cost_oracle
 
 
 # ── Joint error sampling (from PAR2QO robustness.py:358) ────────────
@@ -377,7 +416,8 @@ def exp_penalty_by_samples(
 
     for hint_id, plan in enumerate(plan_list):
         t0 = time.time()
-        total_penalty = 0.0
+        total_weighted_penalty = 0.0
+        total_weight = 0.0
         penalties = []
         incur_count = 0
         worst_penalty = 0.0
@@ -393,7 +433,7 @@ def exp_penalty_by_samples(
                 table_rows=table_rows,
                 error_dists=error_dists,
                 gpu_speedup=gpu_speedup,
-                debug=(debug and s_idx < 3),  # debug first 3 samples only
+                debug=(debug and s_idx < 3),
             )
 
             cost_ratio = (cost_hint / cost_opt) if cost_opt > 0 else float("inf")
@@ -405,7 +445,14 @@ def exp_penalty_by_samples(
                 else:
                     incur_count += 1
 
-            total_penalty += penalty
+            # Importance sampling weight: larger errors are rarer but riskier,
+            # weight by L2 norm of error vector to emphasize tail risk.
+            # w(e) = 1 + ||e||_2 (ensures uniform weight=1 when error=0)
+            err_norm = math.sqrt(sum(e * e for e in error)) if error else 0.0
+            weight = 1.0 + err_norm
+
+            total_weighted_penalty += penalty * weight
+            total_weight += weight
             penalties.append(penalty)
 
             if penalty > worst_penalty:
@@ -414,7 +461,8 @@ def exp_penalty_by_samples(
 
         elapsed = time.time() - t0
         n = len(joint_error_samples)
-        avg = total_penalty / n if n > 0 else 0.0
+        # Weighted average (importance sampling estimator)
+        avg = total_weighted_penalty / total_weight if total_weight > 0 else 0.0
         std = _std(penalties)
         incur_frac = incur_count / n if n > 0 else 0.0
 

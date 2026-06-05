@@ -403,3 +403,123 @@ class QueryPipelineScheduler:
                              if n.kind in (HardwareKind.GPU, HardwareKind.CPU)),
             "device_ids": sorted(self.engine.topology.nodes.keys()),
         }
+
+    # ===================================================================
+    # M015 新增: 1F1B Interleaved Virtual Pipeline Schedule
+    # ===================================================================
+    # Megatron-LM 的 1F1B 调度 (Narayanan et al. 2021):
+    #   - Warmup phase: 前 p-1 个 microbatch 只做 forward
+    #   - Steady state: 每做一个 forward 就紧跟一个 backward
+    #   - Cooldown phase: 最后 p-1 个 microbatch 只做 backward
+    #
+    # Interleaved (virtual pipeline):
+    #   - 每个设备持有 v 个 virtual chunks (v=num_model_chunks)
+    #   - 有效 pipeline 深度 = p×v
+    #   - bubble 从 (p-1)/(m+p-1) 降到 (p-1)/(m×v+p-1)
+    #   - 代价: 更多通信次数 (每个 chunk 边界要交换 activation)
+
+    def schedule_1f1b(self, queries: List[QueryDescriptor],
+                      data_location: str = "cpu0",
+                      virtual_chunks: int = 1) -> PipelineBatchSchedule:
+        """1F1B interleaved pipeline scheduling.
+
+        Args:
+            queries: microbatch 列表
+            data_location: 数据起始位置
+            virtual_chunks: 虚拟流水线分块数 (v≥1, v>1 为 interleaved)
+        """
+        from ._debug import dbg, checkpoint
+
+        if not queries:
+            return PipelineBatchSchedule(0, 0, 0.0, 0.0, 0.0)
+
+        v = max(1, virtual_chunks)
+        m = len(queries)
+        schedules = [self.schedule(q, data_location) for q in queries]
+        per_query_lats = [s.latency_us for s in schedules]
+        t_serial = sum(per_query_lats)
+
+        max_stages = max(len(s.assignments) for s in schedules)
+        p = min(max_stages, self.max_pipeline_depth)
+        p = max(1, p)
+
+        # Virtual pipeline: 有效深度 p_eff = p * v
+        # 每个 stage 的 latency 被分成 v 个 chunk, 每个 chunk 更短
+        stage_maxes: List[float] = []
+        for si in range(max_stages):
+            worst = 0.0
+            for sched in schedules:
+                if si < len(sched.assignments):
+                    worst = max(worst, sched.assignments[si].cost.total_us)
+            stage_maxes.append(worst)
+        bottleneck_us = max(stage_maxes) if stage_maxes else 0.0
+
+        # Virtual pipeline 拆分: 每个 chunk 的 bottleneck ≈ bottleneck / v
+        chunk_bottleneck = bottleneck_us / v
+
+        # 1F1B bubble 公式 (interleaved):
+        #   bubble = (p - 1) / (m × v + p - 1)
+        # 标准1F1B (v=1): bubble = (p-1)/(m+p-1)
+        eff_m = m * v
+        bubble = (p - 1) / (eff_m + p - 1)
+
+        # 1F1B 三阶段 makespan:
+        #   warmup:  (p-1) × chunk_bottleneck  (只 forward, 填满 pipeline)
+        #   steady:  m × chunk_bottleneck      (1F1B steady state)
+        #   cooldown: (p-1) × chunk_bottleneck  (只 backward, 排空 pipeline)
+        # 但 steady state 的 forward+backward 是重叠的, 所以:
+        #   T = chunk_bottleneck × (m × v + p - 1)
+        t_1f1b = chunk_bottleneck * (eff_m + p - 1)
+
+        # Virtual pipeline 的额外通信: 每个 chunk 边界要交换 activation
+        # 每次交换 ≈ 5µs (PCIe P2P) 或 1µs (NVLink)
+        extra_comm_per_chunk = 3.0  # µs, 保守估计
+        n_chunk_boundaries = (v - 1) * m  # 每个 microbatch 经过 v-1 个 chunk 边界
+        extra_comm_us = extra_comm_per_chunk * n_chunk_boundaries
+
+        t_pipe = t_1f1b + extra_comm_us
+        t_pipe = max(t_pipe, max(per_query_lats))  # 下界
+
+        # Memory pressure: 1F1B 的优势是只需保存 p-1 个 microbatch 的 activation
+        # (而非 m 个), 大幅降低 memory 需求
+        peak_activations = p - 1  # 1F1B 的 activation 峰值
+        est_activation_bytes = bottleneck_us * 32 * 1024  # 粗估
+        mem_pressure = (peak_activations * est_activation_bytes
+                        / max(1, self._total_hbm))
+
+        checkpoint("PIP·1f1b_schedule",
+                   m=m, p=p, v=v, eff_m=eff_m,
+                   bubble=f"{bubble:.4f}",
+                   bottleneck_us=f"{bottleneck_us:.1f}",
+                   chunk_bottleneck_us=f"{chunk_bottleneck:.1f}",
+                   t_serial_us=f"{t_serial:.1f}",
+                   t_1f1b_us=f"{t_1f1b:.1f}",
+                   extra_comm_us=f"{extra_comm_us:.1f}",
+                   t_pipe_us=f"{t_pipe:.1f}",
+                   speedup=f"{t_serial / t_pipe:.2f}" if t_pipe > 0 else "inf",
+                   mem_pressure=f"{mem_pressure:.4f}",
+                   peak_activations=peak_activations,
+                   stage_welford=self._welford_summary())
+
+        return PipelineBatchSchedule(
+            num_queries=m, num_stages=p,
+            serial_makespan_us=t_serial,
+            pipelined_makespan_us=t_pipe,
+            bubble_fraction=bubble,
+            memory_pressure=mem_pressure,
+            per_query_latencies_us=per_query_lats)
+
+    def _dbg_pipeline_gantt(self, schedules: List[PipelineSchedule]) -> str:
+        """调试用: 生成 ASCII Gantt 图 展示 pipeline 时间线."""
+        if not schedules:
+            return "(empty)"
+        lines = ["== Pipeline Gantt Chart =="]
+        max_lat = max(s.latency_us for s in schedules)
+        width = 60  # ASCII chart width
+        for i, s in enumerate(schedules):
+            bar_len = int(s.latency_us / max_lat * width) if max_lat > 0 else 0
+            devices = ",".join(s.devices_used)
+            bar = "█" * bar_len + "░" * (width - bar_len)
+            lines.append(f"  Q{i:03d} [{bar}] {s.latency_us:8.1f}µs  {devices}")
+        lines.append(f"  Scale: |{'─'*width}| = {max_lat:.1f}µs")
+        return "\n".join(lines)

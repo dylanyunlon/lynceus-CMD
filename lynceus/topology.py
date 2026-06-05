@@ -38,16 +38,33 @@ class TopoEdge:
     _hop_cost: float = field(init=False)
 
     def __post_init__(self):
-        # 改动: 拥塞修正用饱和对数, 高带宽链路拥塞概率更低
+        # 改写(M013): NCCL alpha-beta transport model替代饱和对数
+        # NCCL ncclTopoCompute uses alpha(latency) + n/beta(bandwidth) per hop;
+        # 我们用 1MB 参考包大小, 带宽利用率 eta 按链路类型分级:
+        #   NVLink eta=0.92, PCIe eta=0.78, QPI eta=0.65, NET eta=0.55
+        _eta_table = {
+            LinkType.NVLINK:  0.92,
+            LinkType.PCIE:    0.78,
+            LinkType.PCIE_P2P: 0.82,
+            LinkType.QPI_UPI: 0.65,
+            LinkType.SHM:     0.88,
+            LinkType.NETWORK: 0.55,
+        }
+        eta = _eta_table.get(self.link_type, 0.70)
         ref_mb = 1.0
-        transfer_us = (ref_mb * 1000) / max(0.001, self.bandwidth_gbps)
-        # 饱和对数拥塞: 低带宽链路惩罚更重
-        cong = 1.0 + 0.12 / (1.0 + math.exp(self.bandwidth_gbps / 200.0 - 2.0))
-        self._hop_cost = (self.latency_us + transfer_us) * cong
+        effective_bw = max(0.001, self.bandwidth_gbps * eta)
+        transfer_us = (ref_mb * 1000.0) / effective_bw
+        # alpha-beta: hop_cost = alpha + n/beta, 这里alpha=latency, n/beta=transfer
+        self._hop_cost = self.latency_us + transfer_us
+        self._effective_bw = effective_bw  # 保存供调试输出
 
     @property
     def hop_cost(self) -> float:
         return self._hop_cost
+
+    def effective_bandwidth(self) -> float:
+        """调试用: 返回考虑利用率后的有效带宽 (GB/s)."""
+        return self._effective_bw
 
 
 @dataclass
@@ -160,6 +177,11 @@ class HardwareTopologyGraph:
         visited: Set[str] = set()
         heap = [(0.0, src)]
 
+        # M013改写: NUMA亲和性折扣——同NUMA域内转移代价×0.70
+        # 参考NCCL ncclTopoGetIntraNode对同socket通信的优先路径选择
+        src_numa = self._nodes[src].numa_node if src in self._nodes else -1
+        dst_numa = self._nodes[dst].numa_node if dst in self._nodes else -1
+
         while heap:
             d, u = heapq.heappop(heap)
             if u in visited:
@@ -167,11 +189,17 @@ class HardwareTopologyGraph:
             visited.add(u)
             if u == dst:
                 break
+            u_numa = self._nodes[u].numa_node if u in self._nodes else -1
             for edge in self._adj.get(u, []):
                 v = edge.dst
                 if v in visited:
                     continue
-                new_dist = d + edge.hop_cost
+                v_numa = self._nodes[v].numa_node if v in self._nodes else -1
+                cost = edge.hop_cost
+                # NUMA亲和折扣: 两端在同一NUMA域且非默认(-1)
+                if u_numa >= 0 and u_numa == v_numa:
+                    cost *= 0.70
+                new_dist = d + cost
                 if new_dist < dist.get(v, float('inf')):
                     dist[v] = new_dist
                     prev[v] = u
@@ -188,8 +216,13 @@ class HardwareTopologyGraph:
             node = prev.get(node)
         path.reverse()
 
-        self._path_cache[cache_key] = (dist[dst], path)
-        return dist[dst], path
+        result = (dist[dst], path)
+        self._path_cache[cache_key] = result
+        if self._debug and len(path) > 2:
+            logger.debug(f"[topo:dijkstra] {src}->{dst}: cost={dist[dst]:.2f}, "
+                        f"hops={len(path)-1}, numa_affinity="
+                        f"{'yes' if src_numa==dst_numa and src_numa>=0 else 'no'}")
+        return result
 
     def _find_edge(self, src: str, dst: str) -> Optional[TopoEdge]:
         best = None
@@ -276,6 +309,135 @@ class HardwareTopologyGraph:
                 cost_str = f"{cost:.2f}" if cost < float('inf') else "inf"
                 print(f"  {src}->{dst}: cost={cost_str}, path=[{path_str}]")
 
+    # =======================================================================
+    # M013 新增: NCCL Ring Allreduce 拓扑推导
+    # =======================================================================
+
+    def build_ring_topology(self, gpu_ids: List[str]) -> List[Tuple[str, str]]:
+        """构造最优ring顺序, 参考NCCL ncclTopoCompute ring search.
+
+        贪心策略: 从任意GPU出发, 每次选hop_cost最小的未访问邻居,
+        类似TSP最近邻启发(NCCL用的也是贪心+局部搜索).
+        返回 [(gpu0,gpu1), (gpu1,gpu2), ..., (gpuN-1,gpu0)] 的环.
+        """
+        if len(gpu_ids) <= 1:
+            return []
+
+        # 贪心构造: 从第一个GPU出发, 始终选最近的
+        ring_order: List[str] = [gpu_ids[0]]
+        remaining = set(gpu_ids[1:])
+        while remaining:
+            cur = ring_order[-1]
+            best_next, best_cost = None, float('inf')
+            for cand in remaining:
+                c, _ = self._dijkstra(cur, cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_next = cand
+            if best_next is None:
+                break
+            ring_order.append(best_next)
+            remaining.discard(best_next)
+
+        # 闭合环
+        ring_edges = []
+        for i in range(len(ring_order)):
+            s = ring_order[i]
+            d = ring_order[(i + 1) % len(ring_order)]
+            ring_edges.append((s, d))
+
+        if self._debug:
+            ring_str = "->".join(ring_order + [ring_order[0]])
+            total_ring_cost = sum(
+                self._dijkstra(s, d)[0] for s, d in ring_edges
+            )
+            print(f"  [TOPO:ring] Ring order: {ring_str}")
+            print(f"  [TOPO:ring] Total ring cost: {total_ring_cost:.2f}")
+
+        return ring_edges
+
+    def estimate_allreduce_us(self, gpu_ids: List[str],
+                               data_bytes: int) -> float:
+        """Ring allreduce 时间估计: 2·(n-1)/n · size/bw.
+
+        NCCL ring allreduce的理论下界: 对n个GPU, 数据量S, 环上最小带宽bw:
+          T = 2·(n-1)/n · S/bw
+        2倍因为 reduce-scatter + allgather 各一趟.
+        """
+        n = len(gpu_ids)
+        if n <= 1:
+            return 0.0
+
+        ring_edges = self.build_ring_topology(gpu_ids)
+        if not ring_edges:
+            return float('inf')
+
+        # 找环上的瓶颈带宽 (最慢的那条边)
+        min_bw_gbps = float('inf')
+        total_latency_us = 0.0
+        for s, d in ring_edges:
+            edge = self._find_edge(s, d)
+            if edge:
+                min_bw_gbps = min(min_bw_gbps, edge.effective_bandwidth())
+                total_latency_us += edge.latency_us
+            else:
+                # fallback: 用dijkstra路径的transfer
+                _, path = self._dijkstra(s, d)
+                for i in range(len(path) - 1):
+                    e2 = self._find_edge(path[i], path[i + 1])
+                    if e2:
+                        min_bw_gbps = min(min_bw_gbps, e2.effective_bandwidth())
+                        total_latency_us += e2.latency_us
+
+        if min_bw_gbps <= 0 or min_bw_gbps == float('inf'):
+            return float('inf')
+
+        data_mb = data_bytes / (1024 * 1024)
+        # ring allreduce公式: 2·(n-1)/n · data / bw + latency
+        coeff = 2.0 * (n - 1) / n
+        transfer_us = coeff * (data_mb * 1000.0) / min_bw_gbps
+        # latency: 每个step需要2(n-1)次hop
+        ring_latency_us = total_latency_us * 2.0 * (n - 1) / n
+
+        result = transfer_us + ring_latency_us
+
+        if self._debug:
+            print(f"  [TOPO:allreduce] n={n}, data={data_mb:.2f}MB, "
+                  f"bottleneck_bw={min_bw_gbps:.1f}GB/s, "
+                  f"transfer={transfer_us:.1f}us, lat={ring_latency_us:.1f}us, "
+                  f"total={result:.1f}us")
+        return result
+
+    def _dbg_snapshot(self) -> Dict[str, Any]:
+        """调试快照: 返回完整拓扑状态字典, 用于断点检查."""
+        return {
+            'n_nodes': len(self._nodes),
+            'n_edges': sum(len(v) for v in self._adj.values()),
+            'cached_paths': len(self._path_cache),
+            'reachability_computed': self._reachable is not None,
+            'nodes': {
+                nid: {
+                    'kind': n.kind,
+                    'mem_gb': n.memory_gb,
+                    'compute_tflops': n.compute_tflops,
+                    'numa': n.numa_node,
+                }
+                for nid, n in self._nodes.items()
+            },
+            'edges': [
+                {
+                    'src': e.src, 'dst': e.dst,
+                    'bw': e.bandwidth_gbps,
+                    'lat': e.latency_us,
+                    'link': e.link_type.name,
+                    'hop_cost': round(e.hop_cost, 3),
+                    'eff_bw': round(e.effective_bandwidth(), 3),
+                }
+                for edges in self._adj.values()
+                for e in edges
+            ],
+        }
+
 
 def create_default_topology(
     n_gpus: int = 4,
@@ -302,12 +464,23 @@ def create_default_topology(
     for i in range(n_gpus):
         for j in range(n_gpus):
             if i != j:
+                # M013改写: 同NUMA内NVLink带宽更高 (全速600GB/s vs 跨域540GB/s)
+                # 参考DGX A100/H100真实拓扑: 同socket GPU对走直连NVLink,
+                # 跨socket GPU对经NVSwitch中转, 有效带宽略低
+                same_numa = (i < n_gpus // 2) == (j < n_gpus // 2)
+                bw = 600.0 if same_numa else 540.0
+                lat = 0.4 if same_numa else 0.7
                 topo.add_edge(TopoEdge(
                     f"gpu{i}", f"gpu{j}",
-                    bandwidth_gbps=580.0, latency_us=0.5,
+                    bandwidth_gbps=bw, latency_us=lat,
                     link_type=LinkType.NVLINK,
                 ))
     if debug_print:
         print(f"\n[topology] Created default topology: {n_gpus} GPUs, dual-socket")
         print(topo.dump_state())
+        # 自动构造并打印ring拓扑
+        gpu_ids = [f"gpu{i}" for i in range(n_gpus)]
+        topo.build_ring_topology(gpu_ids)
+        # 估算1GB allreduce时间
+        topo.estimate_allreduce_us(gpu_ids, data_bytes=1024*1024*1024)
     return topo

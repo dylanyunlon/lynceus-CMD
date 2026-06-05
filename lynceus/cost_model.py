@@ -143,9 +143,17 @@ class CPUCostModel:
 
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
+            # Knuth TAOCP Vol.3: optimal 3-way mergesort = 1.39·n·ln(n) comparisons
+            # Plus cache-miss penalty: when data > L3 (30MB), each merge pass
+            # touches O(n) pages, incurring ~0.1µs TLB miss per 4KB page
+            ln_n = math.log(max(2, n))
+            comparisons = 1.39 * n * ln_n
+            data_bytes = n * max(query.estimated_width_bytes, 8)
+            l3_bytes = 30 * 1024 * 1024  # 30MB L3
+            cache_miss_factor = 1.0 + 0.25 * max(0, data_bytes - l3_bytes) / l3_bytes
             cb.sort_cost_us = (
-                2.2 * n * math.log2(max(2, n)) * self.CPU_OPERATOR_COST
-                + 0.003 * n
+                comparisons * self.CPU_OPERATOR_COST * cache_miss_factor
+                + 0.002 * n  # memory write-back
             )
 
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
@@ -211,11 +219,16 @@ class GPUCostModel:
         if query.sort_required and query.estimated_rows > 1:
             n = query.estimated_rows
             num_sms = 108
-            log_n = math.log2(max(2, n))
-            # 改动: 加 warp-divergence 的对数修正项
-            divergence_penalty = 0.15 + 0.03 * math.log2(max(2, log_n))
-            ops = n * (log_n ** 2) + n * log_n * divergence_penalty
-            cb.sort_cost_us = ops * self.GPU_OPERATOR_COST / num_sms
+            # CUB DeviceRadixSort: O(n · passes / P) where passes = key_bits / radix_bits
+            # Typical: 32-bit keys, radix=8 → 4 passes; 64-bit → 8 passes
+            key_bits = 64  # assume 64-bit sort keys
+            radix_bits = 8  # CUB uses 8-bit radix
+            passes = key_bits // radix_bits
+            # Each pass: scatter n elements across 2^radix_bits bins
+            scatter_cost = n * passes * self.GPU_OPERATOR_COST / num_sms
+            # Histogram phase: each pass builds 256-bin histogram per SM tile
+            hist_cost = passes * num_sms * 256 * self.GPU_OPERATOR_COST
+            cb.sort_cost_us = scatter_cost + hist_cost
 
         if node.compute_capacity > 0 and node.compute_capacity != 1.0:
             scale = 1.0 / node.compute_capacity
