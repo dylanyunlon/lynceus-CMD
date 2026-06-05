@@ -1,0 +1,831 @@
+{
+  "metadata": {
+    "panel": "Scalability Benchmark \u2014 CostModel-Routed",
+    "strategy": "CostModel-Routed",
+    "table_sizes": [
+      100000,
+      1000000,
+      10000000,
+      50000000,
+      100000000
+    ],
+    "batch_sizes": [
+      10,
+      50,
+      100,
+      500,
+      1000
+    ],
+    "n_combos": 25,
+    "total_queries_executed": 8300,
+    "elapsed_seconds": 71.48,
+    "seed": 42,
+    "algorithms": {
+      "cumulative": "Kahan compensated summation",
+      "variance": "Welford single-pass online",
+      "workload": "TPC-H 4-table mixed (SCAN/JOIN/INDEX/AGG)"
+    }
+  },
+  "matrix": [
+    {
+      "table_rows": 100000,
+      "batch_size": 10,
+      "total_latency_us": 1150.26,
+      "mean_latency_us": 115.03,
+      "std_latency_us": 97.86,
+      "throughput_qps": 166.37,
+      "simulated_throughput_qps": 8693.68,
+      "wall_clock_sec": 0.0601,
+      "route_distribution": {
+        "gpu3": 1,
+        "gpu0": 9
+      },
+      "cache_hit_rate": 0.7
+    },
+    {
+      "table_rows": 100000,
+      "batch_size": 50,
+      "total_latency_us": 4969.48,
+      "mean_latency_us": 99.39,
+      "std_latency_us": 79.39,
+      "throughput_qps": 171.78,
+      "simulated_throughput_qps": 10061.42,
+      "wall_clock_sec": 0.2911,
+      "route_distribution": {
+        "gpu0": 48,
+        "cpu0": 2
+      },
+      "cache_hit_rate": 0.9477
+    },
+    {
+      "table_rows": 100000,
+      "batch_size": 100,
+      "total_latency_us": 8579.16,
+      "mean_latency_us": 85.79,
+      "std_latency_us": 72.49,
+      "throughput_qps": 172.03,
+      "simulated_throughput_qps": 11656.15,
+      "wall_clock_sec": 0.5813,
+      "route_distribution": {
+        "gpu0": 94,
+        "cpu0": 6
+      },
+      "cache_hit_rate": 0.9698
+    },
+    {
+      "table_rows": 100000,
+      "batch_size": 500,
+      "total_latency_us": 45678.28,
+      "mean_latency_us": 91.36,
+      "std_latency_us": 82.97,
+      "throughput_qps": 184.84,
+      "simulated_throughput_qps": 10946.12,
+      "wall_clock_sec": 2.7051,
+      "route_distribution": {
+        "gpu0": 464,
+        "cpu0": 36
+      },
+      "cache_hit_rate": 0.994
+    },
+    {
+      "table_rows": 100000,
+      "batch_size": 1000,
+      "total_latency_us": 92776.41,
+      "mean_latency_us": 92.78,
+      "std_latency_us": 84.8,
+      "throughput_qps": 185.66,
+      "simulated_throughput_qps": 10778.6,
+      "wall_clock_sec": 5.3861,
+      "route_distribution": {
+        "gpu0": 914,
+        "cpu0": 86
+      },
+      "cache_hit_rate": 0.997
+    },
+    {
+      "table_rows": 1000000,
+      "batch_size": 10,
+      "total_latency_us": 9825.5,
+      "mean_latency_us": 982.55,
+      "std_latency_us": 1031.99,
+      "throughput_qps": 172.05,
+      "simulated_throughput_qps": 1017.76,
+      "wall_clock_sec": 0.0581,
+      "route_distribution": {
+        "gpu0": 10
+      },
+      "cache_hit_rate": 0.7632
+    },
+    {
+      "table_rows": 1000000,
+      "batch_size": 50,
+      "total_latency_us": 41374.08,
+      "mean_latency_us": 827.48,
+      "std_latency_us": 801.29,
+      "throughput_qps": 177.15,
+      "simulated_throughput_qps": 1208.49,
+      "wall_clock_sec": 0.2822,
+      "route_distribution": {
+        "gpu0": 49,
+        "cpu0": 1
+      },
+      "cache_hit_rate": 0.9584
+    },
+    {
+      "table_rows": 1000000,
+      "batch_size": 100,
+      "total_latency_us": 69268.32,
+      "mean_latency_us": 692.68,
+      "std_latency_us": 727.66,
+      "throughput_qps": 175.8,
+      "simulated_throughput_qps": 1443.66,
+      "wall_clock_sec": 0.5688,
+      "route_distribution": {
+        "gpu0": 98,
+        "cpu0": 2
+      },
+      "cache_hit_rate": 0.9756
+    },
+    {
+      "table_rows": 1000000,
+      "batch_size": 500,
+      "total_latency_us": 379815.72,
+      "mean_latency_us": 759.63,
+      "std_latency_us": 840.65,
+      "throughput_qps": 186.0,
+      "simulated_throughput_qps": 1316.43,
+      "wall_clock_sec": 2.6882,
+      "route_distribution": {
+        "gpu0": 493,
+        "cpu0": 7
+      },
+      "cache_hit_rate": 0.9951
+    },
+    {
+      "table_rows": 1000000,
+      "batch_size": 1000,
+      "total_latency_us": 774110.02,
+      "mean_latency_us": 774.11,
+      "std_latency_us": 858.25,
+      "throughput_qps": 186.48,
+      "simulated_throughput_qps": 1291.81,
+      "wall_clock_sec": 5.3625,
+      "route_distribution": {
+        "gpu0": 984,
+        "cpu0": 16
+      },
+      "cache_hit_rate": 0.9976
+    },
+    {
+      "table_rows": 10000000,
+      "batch_size": 10,
+      "total_latency_us": 96577.83,
+      "mean_latency_us": 9657.78,
+      "std_latency_us": 10379.65,
+      "throughput_qps": 159.01,
+      "simulated_throughput_qps": 103.54,
+      "wall_clock_sec": 0.0629,
+      "route_distribution": {
+        "gpu0": 10
+      },
+      "cache_hit_rate": 0.7659
+    },
+    {
+      "table_rows": 10000000,
+      "batch_size": 50,
+      "total_latency_us": 405323.33,
+      "mean_latency_us": 8106.47,
+      "std_latency_us": 8028.63,
+      "throughput_qps": 155.89,
+      "simulated_throughput_qps": 123.36,
+      "wall_clock_sec": 0.3207,
+      "route_distribution": {
+        "gpu0": 50
+      },
+      "cache_hit_rate": 0.9598
+    },
+    {
+      "table_rows": 10000000,
+      "batch_size": 100,
+      "total_latency_us": 675832.51,
+      "mean_latency_us": 6758.33,
+      "std_latency_us": 7288.82,
+      "throughput_qps": 156.59,
+      "simulated_throughput_qps": 147.97,
+      "wall_clock_sec": 0.6386,
+      "route_distribution": {
+        "gpu0": 100
+      },
+      "cache_hit_rate": 0.9767
+    },
+    {
+      "table_rows": 10000000,
+      "batch_size": 500,
+      "total_latency_us": 3719442.33,
+      "mean_latency_us": 7438.88,
+      "std_latency_us": 8425.61,
+      "throughput_qps": 163.18,
+      "simulated_throughput_qps": 134.43,
+      "wall_clock_sec": 3.0642,
+      "route_distribution": {
+        "gpu0": 500
+      },
+      "cache_hit_rate": 0.9953
+    },
+    {
+      "table_rows": 10000000,
+      "batch_size": 1000,
+      "total_latency_us": 7583201.36,
+      "mean_latency_us": 7583.2,
+      "std_latency_us": 8601.5,
+      "throughput_qps": 155.77,
+      "simulated_throughput_qps": 131.87,
+      "wall_clock_sec": 6.4197,
+      "route_distribution": {
+        "gpu0": 1000
+      },
+      "cache_hit_rate": 0.9977
+    },
+    {
+      "table_rows": 50000000,
+      "batch_size": 10,
+      "total_latency_us": 482143.91,
+      "mean_latency_us": 48214.39,
+      "std_latency_us": 51925.06,
+      "throughput_qps": 105.45,
+      "simulated_throughput_qps": 20.74,
+      "wall_clock_sec": 0.0948,
+      "route_distribution": {
+        "gpu0": 10
+      },
+      "cache_hit_rate": 0.7662
+    },
+    {
+      "table_rows": 50000000,
+      "batch_size": 50,
+      "total_latency_us": 2022868.75,
+      "mean_latency_us": 40457.37,
+      "std_latency_us": 40150.52,
+      "throughput_qps": 92.62,
+      "simulated_throughput_qps": 24.72,
+      "wall_clock_sec": 0.5399,
+      "route_distribution": {
+        "gpu0": 50
+      },
+      "cache_hit_rate": 0.96
+    },
+    {
+      "table_rows": 50000000,
+      "batch_size": 100,
+      "total_latency_us": 3371666.89,
+      "mean_latency_us": 33716.67,
+      "std_latency_us": 36449.87,
+      "throughput_qps": 98.38,
+      "simulated_throughput_qps": 29.66,
+      "wall_clock_sec": 1.0165,
+      "route_distribution": {
+        "gpu0": 100
+      },
+      "cache_hit_rate": 0.9768
+    },
+    {
+      "table_rows": 50000000,
+      "batch_size": 500,
+      "total_latency_us": 18562228.54,
+      "mean_latency_us": 37124.46,
+      "std_latency_us": 42136.76,
+      "throughput_qps": 104.44,
+      "simulated_throughput_qps": 26.94,
+      "wall_clock_sec": 4.7873,
+      "route_distribution": {
+        "gpu0": 500
+      },
+      "cache_hit_rate": 0.9954
+    },
+    {
+      "table_rows": 50000000,
+      "batch_size": 1000,
+      "total_latency_us": 37845816.62,
+      "mean_latency_us": 37845.82,
+      "std_latency_us": 43016.17,
+      "throughput_qps": 106.29,
+      "simulated_throughput_qps": 26.42,
+      "wall_clock_sec": 9.4086,
+      "route_distribution": {
+        "gpu0": 1000
+      },
+      "cache_hit_rate": 0.9977
+    },
+    {
+      "table_rows": 100000000,
+      "batch_size": 10,
+      "total_latency_us": 964101.48,
+      "mean_latency_us": 96410.15,
+      "std_latency_us": 103856.82,
+      "throughput_qps": 66.98,
+      "simulated_throughput_qps": 10.37,
+      "wall_clock_sec": 0.1493,
+      "route_distribution": {
+        "gpu0": 10
+      },
+      "cache_hit_rate": 0.7662
+    },
+    {
+      "table_rows": 100000000,
+      "batch_size": 50,
+      "total_latency_us": 4044800.53,
+      "mean_latency_us": 80896.01,
+      "std_latency_us": 80302.89,
+      "throughput_qps": 65.69,
+      "simulated_throughput_qps": 12.36,
+      "wall_clock_sec": 0.7612,
+      "route_distribution": {
+        "gpu0": 50
+      },
+      "cache_hit_rate": 0.96
+    },
+    {
+      "table_rows": 100000000,
+      "batch_size": 100,
+      "total_latency_us": 6741459.86,
+      "mean_latency_us": 67414.6,
+      "std_latency_us": 72901.18,
+      "throughput_qps": 74.09,
+      "simulated_throughput_qps": 14.83,
+      "wall_clock_sec": 1.3498,
+      "route_distribution": {
+        "gpu0": 100
+      },
+      "cache_hit_rate": 0.9768
+    },
+    {
+      "table_rows": 100000000,
+      "batch_size": 500,
+      "total_latency_us": 37115710.97,
+      "mean_latency_us": 74231.42,
+      "std_latency_us": 84275.69,
+      "throughput_qps": 74.12,
+      "simulated_throughput_qps": 13.47,
+      "wall_clock_sec": 6.7457,
+      "route_distribution": {
+        "gpu0": 500
+      },
+      "cache_hit_rate": 0.9954
+    },
+    {
+      "table_rows": 100000000,
+      "batch_size": 1000,
+      "total_latency_us": 75674085.42,
+      "mean_latency_us": 75674.09,
+      "std_latency_us": 86034.51,
+      "throughput_qps": 72.93,
+      "simulated_throughput_qps": 13.21,
+      "wall_clock_sec": 13.7124,
+      "route_distribution": {
+        "gpu0": 1000
+      },
+      "cache_hit_rate": 0.9977
+    }
+  ],
+  "by_table_size": {
+    "100000": {
+      "mean_of_means": 96.87,
+      "max_throughput": 11656.15,
+      "batch_results": [
+        {
+          "table_rows": 100000,
+          "batch_size": 10,
+          "total_latency_us": 1150.26,
+          "mean_latency_us": 115.03,
+          "std_latency_us": 97.86,
+          "throughput_qps": 166.37,
+          "simulated_throughput_qps": 8693.68,
+          "wall_clock_sec": 0.0601,
+          "route_distribution": {
+            "gpu3": 1,
+            "gpu0": 9
+          },
+          "cache_hit_rate": 0.7
+        },
+        {
+          "table_rows": 100000,
+          "batch_size": 50,
+          "total_latency_us": 4969.48,
+          "mean_latency_us": 99.39,
+          "std_latency_us": 79.39,
+          "throughput_qps": 171.78,
+          "simulated_throughput_qps": 10061.42,
+          "wall_clock_sec": 0.2911,
+          "route_distribution": {
+            "gpu0": 48,
+            "cpu0": 2
+          },
+          "cache_hit_rate": 0.9477
+        },
+        {
+          "table_rows": 100000,
+          "batch_size": 100,
+          "total_latency_us": 8579.16,
+          "mean_latency_us": 85.79,
+          "std_latency_us": 72.49,
+          "throughput_qps": 172.03,
+          "simulated_throughput_qps": 11656.15,
+          "wall_clock_sec": 0.5813,
+          "route_distribution": {
+            "gpu0": 94,
+            "cpu0": 6
+          },
+          "cache_hit_rate": 0.9698
+        },
+        {
+          "table_rows": 100000,
+          "batch_size": 500,
+          "total_latency_us": 45678.28,
+          "mean_latency_us": 91.36,
+          "std_latency_us": 82.97,
+          "throughput_qps": 184.84,
+          "simulated_throughput_qps": 10946.12,
+          "wall_clock_sec": 2.7051,
+          "route_distribution": {
+            "gpu0": 464,
+            "cpu0": 36
+          },
+          "cache_hit_rate": 0.994
+        },
+        {
+          "table_rows": 100000,
+          "batch_size": 1000,
+          "total_latency_us": 92776.41,
+          "mean_latency_us": 92.78,
+          "std_latency_us": 84.8,
+          "throughput_qps": 185.66,
+          "simulated_throughput_qps": 10778.6,
+          "wall_clock_sec": 5.3861,
+          "route_distribution": {
+            "gpu0": 914,
+            "cpu0": 86
+          },
+          "cache_hit_rate": 0.997
+        }
+      ]
+    },
+    "1000000": {
+      "mean_of_means": 807.29,
+      "max_throughput": 1443.66,
+      "batch_results": [
+        {
+          "table_rows": 1000000,
+          "batch_size": 10,
+          "total_latency_us": 9825.5,
+          "mean_latency_us": 982.55,
+          "std_latency_us": 1031.99,
+          "throughput_qps": 172.05,
+          "simulated_throughput_qps": 1017.76,
+          "wall_clock_sec": 0.0581,
+          "route_distribution": {
+            "gpu0": 10
+          },
+          "cache_hit_rate": 0.7632
+        },
+        {
+          "table_rows": 1000000,
+          "batch_size": 50,
+          "total_latency_us": 41374.08,
+          "mean_latency_us": 827.48,
+          "std_latency_us": 801.29,
+          "throughput_qps": 177.15,
+          "simulated_throughput_qps": 1208.49,
+          "wall_clock_sec": 0.2822,
+          "route_distribution": {
+            "gpu0": 49,
+            "cpu0": 1
+          },
+          "cache_hit_rate": 0.9584
+        },
+        {
+          "table_rows": 1000000,
+          "batch_size": 100,
+          "total_latency_us": 69268.32,
+          "mean_latency_us": 692.68,
+          "std_latency_us": 727.66,
+          "throughput_qps": 175.8,
+          "simulated_throughput_qps": 1443.66,
+          "wall_clock_sec": 0.5688,
+          "route_distribution": {
+            "gpu0": 98,
+            "cpu0": 2
+          },
+          "cache_hit_rate": 0.9756
+        },
+        {
+          "table_rows": 1000000,
+          "batch_size": 500,
+          "total_latency_us": 379815.72,
+          "mean_latency_us": 759.63,
+          "std_latency_us": 840.65,
+          "throughput_qps": 186.0,
+          "simulated_throughput_qps": 1316.43,
+          "wall_clock_sec": 2.6882,
+          "route_distribution": {
+            "gpu0": 493,
+            "cpu0": 7
+          },
+          "cache_hit_rate": 0.9951
+        },
+        {
+          "table_rows": 1000000,
+          "batch_size": 1000,
+          "total_latency_us": 774110.02,
+          "mean_latency_us": 774.11,
+          "std_latency_us": 858.25,
+          "throughput_qps": 186.48,
+          "simulated_throughput_qps": 1291.81,
+          "wall_clock_sec": 5.3625,
+          "route_distribution": {
+            "gpu0": 984,
+            "cpu0": 16
+          },
+          "cache_hit_rate": 0.9976
+        }
+      ]
+    },
+    "10000000": {
+      "mean_of_means": 7908.93,
+      "max_throughput": 147.97,
+      "batch_results": [
+        {
+          "table_rows": 10000000,
+          "batch_size": 10,
+          "total_latency_us": 96577.83,
+          "mean_latency_us": 9657.78,
+          "std_latency_us": 10379.65,
+          "throughput_qps": 159.01,
+          "simulated_throughput_qps": 103.54,
+          "wall_clock_sec": 0.0629,
+          "route_distribution": {
+            "gpu0": 10
+          },
+          "cache_hit_rate": 0.7659
+        },
+        {
+          "table_rows": 10000000,
+          "batch_size": 50,
+          "total_latency_us": 405323.33,
+          "mean_latency_us": 8106.47,
+          "std_latency_us": 8028.63,
+          "throughput_qps": 155.89,
+          "simulated_throughput_qps": 123.36,
+          "wall_clock_sec": 0.3207,
+          "route_distribution": {
+            "gpu0": 50
+          },
+          "cache_hit_rate": 0.9598
+        },
+        {
+          "table_rows": 10000000,
+          "batch_size": 100,
+          "total_latency_us": 675832.51,
+          "mean_latency_us": 6758.33,
+          "std_latency_us": 7288.82,
+          "throughput_qps": 156.59,
+          "simulated_throughput_qps": 147.97,
+          "wall_clock_sec": 0.6386,
+          "route_distribution": {
+            "gpu0": 100
+          },
+          "cache_hit_rate": 0.9767
+        },
+        {
+          "table_rows": 10000000,
+          "batch_size": 500,
+          "total_latency_us": 3719442.33,
+          "mean_latency_us": 7438.88,
+          "std_latency_us": 8425.61,
+          "throughput_qps": 163.18,
+          "simulated_throughput_qps": 134.43,
+          "wall_clock_sec": 3.0642,
+          "route_distribution": {
+            "gpu0": 500
+          },
+          "cache_hit_rate": 0.9953
+        },
+        {
+          "table_rows": 10000000,
+          "batch_size": 1000,
+          "total_latency_us": 7583201.36,
+          "mean_latency_us": 7583.2,
+          "std_latency_us": 8601.5,
+          "throughput_qps": 155.77,
+          "simulated_throughput_qps": 131.87,
+          "wall_clock_sec": 6.4197,
+          "route_distribution": {
+            "gpu0": 1000
+          },
+          "cache_hit_rate": 0.9977
+        }
+      ]
+    },
+    "50000000": {
+      "mean_of_means": 39471.74,
+      "max_throughput": 29.66,
+      "batch_results": [
+        {
+          "table_rows": 50000000,
+          "batch_size": 10,
+          "total_latency_us": 482143.91,
+          "mean_latency_us": 48214.39,
+          "std_latency_us": 51925.06,
+          "throughput_qps": 105.45,
+          "simulated_throughput_qps": 20.74,
+          "wall_clock_sec": 0.0948,
+          "route_distribution": {
+            "gpu0": 10
+          },
+          "cache_hit_rate": 0.7662
+        },
+        {
+          "table_rows": 50000000,
+          "batch_size": 50,
+          "total_latency_us": 2022868.75,
+          "mean_latency_us": 40457.37,
+          "std_latency_us": 40150.52,
+          "throughput_qps": 92.62,
+          "simulated_throughput_qps": 24.72,
+          "wall_clock_sec": 0.5399,
+          "route_distribution": {
+            "gpu0": 50
+          },
+          "cache_hit_rate": 0.96
+        },
+        {
+          "table_rows": 50000000,
+          "batch_size": 100,
+          "total_latency_us": 3371666.89,
+          "mean_latency_us": 33716.67,
+          "std_latency_us": 36449.87,
+          "throughput_qps": 98.38,
+          "simulated_throughput_qps": 29.66,
+          "wall_clock_sec": 1.0165,
+          "route_distribution": {
+            "gpu0": 100
+          },
+          "cache_hit_rate": 0.9768
+        },
+        {
+          "table_rows": 50000000,
+          "batch_size": 500,
+          "total_latency_us": 18562228.54,
+          "mean_latency_us": 37124.46,
+          "std_latency_us": 42136.76,
+          "throughput_qps": 104.44,
+          "simulated_throughput_qps": 26.94,
+          "wall_clock_sec": 4.7873,
+          "route_distribution": {
+            "gpu0": 500
+          },
+          "cache_hit_rate": 0.9954
+        },
+        {
+          "table_rows": 50000000,
+          "batch_size": 1000,
+          "total_latency_us": 37845816.62,
+          "mean_latency_us": 37845.82,
+          "std_latency_us": 43016.17,
+          "throughput_qps": 106.29,
+          "simulated_throughput_qps": 26.42,
+          "wall_clock_sec": 9.4086,
+          "route_distribution": {
+            "gpu0": 1000
+          },
+          "cache_hit_rate": 0.9977
+        }
+      ]
+    },
+    "100000000": {
+      "mean_of_means": 78925.25,
+      "max_throughput": 14.83,
+      "batch_results": [
+        {
+          "table_rows": 100000000,
+          "batch_size": 10,
+          "total_latency_us": 964101.48,
+          "mean_latency_us": 96410.15,
+          "std_latency_us": 103856.82,
+          "throughput_qps": 66.98,
+          "simulated_throughput_qps": 10.37,
+          "wall_clock_sec": 0.1493,
+          "route_distribution": {
+            "gpu0": 10
+          },
+          "cache_hit_rate": 0.7662
+        },
+        {
+          "table_rows": 100000000,
+          "batch_size": 50,
+          "total_latency_us": 4044800.53,
+          "mean_latency_us": 80896.01,
+          "std_latency_us": 80302.89,
+          "throughput_qps": 65.69,
+          "simulated_throughput_qps": 12.36,
+          "wall_clock_sec": 0.7612,
+          "route_distribution": {
+            "gpu0": 50
+          },
+          "cache_hit_rate": 0.96
+        },
+        {
+          "table_rows": 100000000,
+          "batch_size": 100,
+          "total_latency_us": 6741459.86,
+          "mean_latency_us": 67414.6,
+          "std_latency_us": 72901.18,
+          "throughput_qps": 74.09,
+          "simulated_throughput_qps": 14.83,
+          "wall_clock_sec": 1.3498,
+          "route_distribution": {
+            "gpu0": 100
+          },
+          "cache_hit_rate": 0.9768
+        },
+        {
+          "table_rows": 100000000,
+          "batch_size": 500,
+          "total_latency_us": 37115710.97,
+          "mean_latency_us": 74231.42,
+          "std_latency_us": 84275.69,
+          "throughput_qps": 74.12,
+          "simulated_throughput_qps": 13.47,
+          "wall_clock_sec": 6.7457,
+          "route_distribution": {
+            "gpu0": 500
+          },
+          "cache_hit_rate": 0.9954
+        },
+        {
+          "table_rows": 100000000,
+          "batch_size": 1000,
+          "total_latency_us": 75674085.42,
+          "mean_latency_us": 75674.09,
+          "std_latency_us": 86034.51,
+          "throughput_qps": 72.93,
+          "simulated_throughput_qps": 13.21,
+          "wall_clock_sec": 13.7124,
+          "route_distribution": {
+            "gpu0": 1000
+          },
+          "cache_hit_rate": 0.9977
+        }
+      ]
+    }
+  },
+  "by_batch_size": {
+    "10": {
+      "mean_of_means": 31075.98,
+      "total_latency_range": [
+        1150.26,
+        964101.48
+      ]
+    },
+    "50": {
+      "mean_of_means": 26077.34,
+      "total_latency_range": [
+        4969.48,
+        4044800.53
+      ]
+    },
+    "100": {
+      "mean_of_means": 21733.61,
+      "total_latency_range": [
+        8579.16,
+        6741459.86
+      ]
+    },
+    "500": {
+      "mean_of_means": 23929.15,
+      "total_latency_range": [
+        45678.28,
+        37115710.97
+      ]
+    },
+    "1000": {
+      "mean_of_means": 24394.0,
+      "total_latency_range": [
+        92776.41,
+        75674085.42
+      ]
+    }
+  },
+  "summary": {
+    "best_combo": {
+      "table_rows": 100000,
+      "batch_size": 100,
+      "mean_latency_us": 85.79
+    },
+    "worst_combo": {
+      "table_rows": 100000000,
+      "batch_size": 10,
+      "mean_latency_us": 96410.15
+    },
+    "scalability_ratio_1000x_rows": 815.63
+  }
+}
