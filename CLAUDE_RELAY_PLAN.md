@@ -559,3 +559,60 @@
 6. **调试输出**: 全部到 stderr，stdout 保持干净
 7. **行数要求**: 改写文件行数 ≥ 原始版
 8. **语法要求**: 40/40 py_compile 通过
+
+---
+
+## 第二位 Claude 完成记录（M121–M140: 6策略×多seed对比实验）
+
+**日期**: 2026-06-05
+**交付**: 1 文件新建, +640 行
+
+### 新增文件
+
+| 文件 | 行数 | 用途 |
+|------|------|------|
+| scripts/strategy_comparison.py | 640 | 6策略×多seed×多步对比实验 |
+
+### 算法改写清单 (7处实质改写)
+
+| # | 原算法 | 新算法 | 文件 |
+|---|--------|--------|------|
+| 1 | 固定Zipf权重选query_type | phase-shift三阶段漂移 (SCAN→JOIN→AGG) | strategy_comparison.py |
+| 2 | two-pass variance | Welford单pass在线方差 | strategy_comparison.py |
+| 3 | naive sum += | Kahan补偿求和 | strategy_comparison.py |
+| 4 | 无路由多样性度量 | Shannon熵 H=-Σp·ln(p) | strategy_comparison.py |
+| 5 | relative_error (除零风险) | SMAPE 2\|a-b\|/(\|a\|+\|b\|) | strategy_comparison.py |
+| 6 | 无百分位报告 | P50/P95/P99精确百分位 (排序选取) | strategy_comparison.py |
+| 7 | 无收敛检测 | 滑窗尾部CV (std/mean < 5%) | strategy_comparison.py |
+
+### 调试探针
+
+| 模块 | 探针数 | 内容 |
+|------|--------|------|
+| strategy_comparison | 12+ | STATE DUMP开始/结束, 每500步快照(mean/P50/P95/cache/entropy/cv), 跨策略SMAPE矩阵, 排名, 收敛检测 |
+
+### 验证结果
+
+| 测试 | 结果 |
+|------|------|
+| py_compile | ✓ |
+| 50步×1seed smoke | 6/6策略通过 ✓ |
+| 500步×2seed medium | 6/6策略通过 ✓ |
+| test_e2e_pipeline.py | 23/23 PASS ✓ |
+| run_benchmark.py (不退步) | ✓ |
+| JSON格式兼容 | ✓ |
+
+### 输出格式
+
+```json
+{
+  "metadata": { "panel": "Strategy Comparison", "algorithms": {...} },
+  "methods": {
+    "GPU-Only": { "step_mean": [...], "grand_mean": 4778.5, "p95": 16690.2, "shannon_entropy": 0.0, ... },
+    "Adaptive": { "step_mean": [...], "grand_mean": 4897.1, "p95": 16691.5, "shannon_entropy": 1.165, ... },
+    ...
+  },
+  "ranking": ["PAR2QO-Enhanced", "Hybrid-Static", ...],
+  "smape_matrix": { "GPU-Only vs CPU-Only": 0.0957, ... }
+}
+```
