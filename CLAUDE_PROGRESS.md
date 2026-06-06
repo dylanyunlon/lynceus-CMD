@@ -180,3 +180,35 @@
    - main 统计输出: 只看 final_mean → IQR (p25/p50/p75) 分位数
 
 ### 调试探针: 38 处 (_dbg/_snapshot/_Timer/dump_state/dump_topology)
+
+---
+
+## Claude #7: 算法深化 — Consistent Hashing / Thompson Sampling / FPL+Hedge
+
+| Milestone | 文件 | 改动 |
+|-----------|------|------|
+| M311 | lynceus/router.py | _HashRing: Karger 1997一致性哈希, 150虚拟节点, MD5+二分查找 |
+| M312 | lynceus/router.py | route_one: strategy推荐 + hash ring负载均衡加权融合 |
+| M313 | lynceus/router.py | route_batch: locality-aware batching, 按table_names分组 |
+| M314 | lynceus/router.py | tournament: 全对决Elo (Bradley-Terry), sigmoid连续得分 |
+| M315 | lynceus/strategies/adaptive.py | Thompson Sampling: Beta(α,β)后验采样选device |
+| M316 | lynceus/strategies/adaptive.py | Gumbel-Max trick: 数值稳定的离散概率采样 |
+| M317 | lynceus/strategies/adaptive.py | Bayesian online update: Welford法维护running mean/var |
+| M318 | lynceus/strategies/cost_driven.py | FPL: Follow the Perturbed Leader, 指数噪声扰动 |
+| M319 | lynceus/strategies/cost_driven.py | Hedge: Multiplicative Weights Update, w*=exp(-η·loss) |
+| M320 | lynceus/strategies/cost_driven.py | _dbg_regret_trace: 累积regret和权重追踪 |
+
+**统计**: +453/-114 lines, 3 files changed
+**算法参考**: Karger 1997 (consistent hashing), Kalai & Vempala 2005 (FPL), Freund & Schapire 1997 (Hedge)
+**验证**: py_compile 40/40, benchmark运行正常 (fpl_decision/thompson_select checkpoints confirmed)
+
+### 开发计划 (6位Claude分工)
+
+| Claude | Milestones | 任务 | 状态 |
+|--------|-----------|------|------|
+| #7 (当前) | M311-M320 | router/strategies算法改写 (Consistent Hashing + Thompson Sampling + FPL/Hedge) | ✅ |
+| #8 (下一位) | M321-M330 | integrations/ 深度移植 (par2qo diagram.py + plan_reduction算法) | 待开始 |
+| #9 | M331-M340 | upstream kepler trainer/evaluation 算法移植 | 待开始 |
+| #10 | M341-M350 | distributed/ 通信算法深化 (BytePS/NCCL模拟) | 待开始 |
+| #11 | M351-M360 | 端到端实验运行 + 论文数据生成 | 待开始 |
+| #12 | M361-M370 | 最终集成测试 + 消融实验 | 待开始 |
