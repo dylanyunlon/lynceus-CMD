@@ -14,6 +14,18 @@ Modifications from upstream diagram.py (~30% algorithm kept, ~70% rewritten):
   - Added:   PlanCostHistogram — per-plan cost distribution (CCCL histogram pattern)
   - Added:   DeviceAwarePenalty — penalty scaled by device transfer variance
 
+M321-M330 Algorithm Changes (Phase 8):
+  [ALG-1] select_robust_plan: simple penalty-weighted argmin → Pareto frontier
+          with non-dominated sorting on (expected_cost, max_penalty), then
+          Chebyshev scalarization to pick final plan from Pareto set.
+  [ALG-2] cal_reweight_probability: simple 1/(1+penalty) normalization →
+          softmax with adaptive temperature + entropy regularization to
+          prevent probability collapse onto a single sample.
+  [ALG-3] collect_plan_cost: added bootstrap confidence interval estimation
+          (B=200 resamples) for each plan's cost distribution across samples.
+  [ALG-4] _dbg_pareto_frontier(): prints Pareto set size, each plan's
+          (cost, robustness) coordinates, and selected plan details.
+
 References:
   PAR2QO diagram.py:46 — pqoByFeatureCollection (N samples, plan collection)
   PAR2QO diagram.py:113 — collectFeatures (selectivity sampling)
@@ -24,9 +36,18 @@ from __future__ import annotations
 
 import math
 import logging
+import random as _random_module
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum, auto
+
+_DBG_ENABLED = False          # flip to True or call _dbg_enable() at runtime
+_log = logging.getLogger(__name__)
+
+
+def _dbg_enable():
+    global _DBG_ENABLED
+    _DBG_ENABLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +167,9 @@ class HeterogeneousPlanDiagram:
         self.gpu_cost_matrix: List[List[float]] = []       # [sample][plan] → gpu_cost
         self.device_decisions: List[List[str]] = []        # [sample][plan] → "cpu"/"gpu"
 
+        # [ALG-3] Bootstrap confidence intervals: plan_idx → (ci_low, ci_high)
+        self.bootstrap_ci: Dict[int, Tuple[float, float]] = {}
+
     # -------------------------------------------------------------------
     # Step 1: collectFeatures (from PAR2QO diagram.py:113)
     # -------------------------------------------------------------------
@@ -185,6 +209,10 @@ class HeterogeneousPlanDiagram:
     #
     # PAR2QO evaluates each plan's cost at each selectivity sample using
     # PostgreSQL's cost model. We evaluate on BOTH CPU and GPU.
+    #
+    # [ALG-3] After cost collection, compute bootstrap confidence intervals
+    # for each plan's cost distribution across the selectivity samples.
+    # B=200 resamples, report 95% CI (2.5th and 97.5th percentiles).
     # -------------------------------------------------------------------
 
     def collect_plan_cost(self, cost_fn=None):
@@ -195,6 +223,9 @@ class HeterogeneousPlanDiagram:
           gpu_cost_matrix[sample][plan] — GPU execution cost
           cost_collection[sample][plan] — min(cpu, gpu)
           device_decisions[sample][plan] — "cpu" or "gpu"
+
+        Then runs bootstrap resampling (B=200) to estimate 95% confidence
+        intervals on the expected cost per plan.
         """
         n_samples = len(self.samples)
         n_plans = len(self.plan_list)
@@ -222,6 +253,41 @@ class HeterogeneousPlanDiagram:
                 self.gpu_cost_matrix[s_idx][p_idx] = gpu
                 self.cost_collection[s_idx][p_idx] = min(cpu, gpu)
                 self.device_decisions[s_idx][p_idx] = "gpu" if gpu < cpu else "cpu"
+
+        # [ALG-3] Bootstrap confidence interval estimation
+        self._compute_bootstrap_ci(n_resamples=200, alpha=0.05)
+
+    def _compute_bootstrap_ci(self, n_resamples: int = 200, alpha: float = 0.05):
+        """Bootstrap resample each plan's cost vector to get CI on expected cost.
+
+        For plan p, the cost vector is [cost_collection[s][p] for s in samples].
+        We draw B bootstrap samples (with replacement), compute the mean of each,
+        and report the alpha/2 and 1-alpha/2 percentiles as CI bounds.
+        """
+        rng = _random_module.Random(123)
+        n_samples = len(self.samples)
+        n_plans = len(self.plan_list)
+        lo_pct = alpha / 2.0
+        hi_pct = 1.0 - alpha / 2.0
+
+        self.bootstrap_ci = {}
+
+        for p_idx in range(n_plans):
+            cost_vec = [self.cost_collection[s][p_idx] for s in range(n_samples)]
+            if not cost_vec:
+                self.bootstrap_ci[p_idx] = (0.0, 0.0)
+                continue
+
+            boot_means = []
+            for _ in range(n_resamples):
+                resample = [cost_vec[rng.randint(0, n_samples - 1)]
+                            for _ in range(n_samples)]
+                boot_means.append(sum(resample) / len(resample))
+
+            boot_means.sort()
+            lo_idx = max(0, int(lo_pct * n_resamples) - 1)
+            hi_idx = min(n_resamples - 1, int(hi_pct * n_resamples))
+            self.bootstrap_ci[p_idx] = (boot_means[lo_idx], boot_means[hi_idx])
 
     # -------------------------------------------------------------------
     # Step 4: collectOptCostAndPenalty (from PAR2QO)
@@ -261,45 +327,94 @@ class HeterogeneousPlanDiagram:
     # -------------------------------------------------------------------
     # Step 5: calReweightProbability (from PAR2QO diagram.py:161)
     #
-    # PAR2QO reweights each sample's probability based on whether the
-    # chosen plan is robust (low penalty) across nearby samples.
+    # [ALG-2] CHANGED: simple 1/(1+max_penalty) normalization →
+    #         softmax with adaptive temperature + entropy regularization.
+    #
+    # Temperature τ = median of max-penalties (adapts to penalty scale).
+    # Entropy regularization adds λ·H(P) to prevent collapse:
+    #   final_prob ∝ softmax(-max_penalty / τ) blended with uniform via λ.
     # -------------------------------------------------------------------
 
     def cal_reweight_probability(self):
         """Compute reweighted probabilities for each sample.
 
-        PAR2QO's Bayesian reweighting (simplified):
-          P(sample) ∝ 1 / (1 + max_penalty_at_sample)
+        [ALG-2] Softmax with adaptive temperature + entropy regularization.
 
-        Samples where all plans are near-optimal get higher weight;
-        samples in "danger zones" (high penalty) get lower weight.
+        1. Compute max_penalty per sample (danger signal).
+        2. Set temperature τ = median(max_penalties) to auto-scale.
+        3. Compute softmax weights: w_s = exp(-max_penalty_s / τ).
+        4. Blend with uniform distribution for entropy regularization:
+             P(s) = (1 - λ) · softmax(s) + λ · (1/N)
+           where λ = 0.1 prevents any sample from getting zero weight.
         """
         n_samples = len(self.samples)
         if n_samples == 0:
             return
 
-        raw_weights = []
-        for s_idx in range(n_samples):
-            max_penalty = max(self.penalty_collection[s_idx]) if self.penalty_collection[s_idx] else 0
-            raw_weights.append(1.0 / (1.0 + max_penalty))
+        entropy_lambda = 0.1  # regularization strength
 
-        total = sum(raw_weights)
-        self.joint_probabilities = [w / total for w in raw_weights] if total > 0 else [1.0 / n_samples] * n_samples
+        # Per-sample max penalty
+        max_penalties = []
+        for s_idx in range(n_samples):
+            mp = max(self.penalty_collection[s_idx]) if self.penalty_collection[s_idx] else 0.0
+            max_penalties.append(mp)
+
+        # Adaptive temperature = median of max-penalties (avoid division by zero)
+        sorted_mp = sorted(max_penalties)
+        median_idx = n_samples // 2
+        temperature = sorted_mp[median_idx] if sorted_mp[median_idx] > 1e-12 else 1.0
+
+        # Softmax: w_s = exp(-max_penalty_s / τ)
+        # For numerical stability, subtract the max exponent
+        logits = [-mp / temperature for mp in max_penalties]
+        max_logit = max(logits)
+        exp_weights = [math.exp(l - max_logit) for l in logits]
+        exp_sum = sum(exp_weights)
+        softmax_probs = [w / exp_sum for w in exp_weights] if exp_sum > 0 else [1.0 / n_samples] * n_samples
+
+        # Entropy regularization: blend with uniform
+        uniform = 1.0 / n_samples
+        self.joint_probabilities = [
+            (1.0 - entropy_lambda) * sp + entropy_lambda * uniform
+            for sp in softmax_probs
+        ]
+
+        # Renormalize (should already sum to 1, but ensure)
+        total = sum(self.joint_probabilities)
+        if total > 0 and abs(total - 1.0) > 1e-12:
+            self.joint_probabilities = [p / total for p in self.joint_probabilities]
+
+        if _DBG_ENABLED:
+            ent = -sum(p * math.log(max(1e-30, p)) for p in self.joint_probabilities)
+            _log.info("[DBG] cal_reweight_probability: τ=%.4f, λ=%.2f, "
+                      "entropy=%.4f, min_prob=%.6f, max_prob=%.6f",
+                      temperature, entropy_lambda, ent,
+                      min(self.joint_probabilities),
+                      max(self.joint_probabilities))
 
     # -------------------------------------------------------------------
-    # select_robust_plan — the final PAR2QO selection algorithm
+    # select_robust_plan — [ALG-1] Pareto frontier + Chebyshev scalarization
     #
-    # Selects the plan that minimizes expected penalty-weighted cost:
-    #   best_plan = argmin_p Σ_s P(s) * (cost[s][p] + b * penalty[s][p])
-    #
-    # Lynceus: returns BOTH the best plan AND the recommended device.
+    # CHANGED from simple penalty-weighted argmin to:
+    #   1. Compute two objectives per plan:
+    #      - obj_cost = Σ_s P(s) * cost[s][p]     (expected cost)
+    #      - obj_penalty = max_s penalty[s][p]     (worst-case robustness)
+    #   2. Non-dominated sorting to find Pareto front on (obj_cost, obj_penalty)
+    #   3. Chebyshev scalarization on the Pareto set:
+    #        score = max( w1·|obj_cost - ideal_cost|/range_cost,
+    #                     w2·|obj_penalty - ideal_penalty|/range_penalty )
+    #      using w1 = 1 - robustness_weight, w2 = robustness_weight.
+    #   4. Return the plan that minimizes the Chebyshev score.
     # -------------------------------------------------------------------
 
     def select_robust_plan(self) -> Tuple[Optional[QueryPlan], str, float]:
         """Select the most robust plan with device recommendation.
 
+        [ALG-1] Pareto frontier on (expected_cost, worst_penalty) with
+        Chebyshev scalarization to pick the final plan.
+
         Returns:
-            (plan, device, expected_cost) — the penalty-aware optimal choice.
+            (plan, device, expected_cost) — the Pareto-optimal choice.
         """
         if not self.plan_list or not self.samples:
             return None, "cpu", 0.0
@@ -310,28 +425,123 @@ class HeterogeneousPlanDiagram:
         if not self.joint_probabilities:
             self.cal_reweight_probability()
 
-        best_plan_idx = 0
-        best_score = float('inf')
-
+        # --- Step 1: compute two objectives per plan ---
+        objectives: List[Tuple[float, float]] = []  # (expected_cost, max_penalty)
         for p_idx in range(n_plans):
-            score = 0.0
+            exp_cost = 0.0
+            worst_penalty = 0.0
             for s_idx in range(n_samples):
                 prob = self.joint_probabilities[s_idx]
                 cost = self.cost_collection[s_idx][p_idx]
                 penalty = self.penalty_collection[s_idx][p_idx]
-                score += prob * (cost + self.robustness_weight * penalty * cost)
-            if score < best_score:
-                best_score = score
+                exp_cost += prob * cost
+                if penalty > worst_penalty:
+                    worst_penalty = penalty
+            objectives.append((exp_cost, worst_penalty))
+
+        # --- Step 2: non-dominated sorting for Pareto front ---
+        # A plan i dominates plan j iff both objectives of i <= j and at
+        # least one is strictly less.
+        pareto_indices: List[int] = []
+        for i in range(n_plans):
+            dominated = False
+            for j in range(n_plans):
+                if i == j:
+                    continue
+                if (objectives[j][0] <= objectives[i][0] and
+                        objectives[j][1] <= objectives[i][1] and
+                        (objectives[j][0] < objectives[i][0] or
+                         objectives[j][1] < objectives[i][1])):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto_indices.append(i)
+
+        # Fallback: if somehow empty (shouldn't happen), use all plans
+        if not pareto_indices:
+            pareto_indices = list(range(n_plans))
+
+        # --- Step 3: Chebyshev scalarization on Pareto set ---
+        # Ideal point: best value of each objective across Pareto set
+        pareto_costs = [objectives[i][0] for i in pareto_indices]
+        pareto_penalties = [objectives[i][1] for i in pareto_indices]
+
+        ideal_cost = min(pareto_costs)
+        ideal_penalty = min(pareto_penalties)
+
+        range_cost = max(pareto_costs) - ideal_cost
+        range_penalty = max(pareto_penalties) - ideal_penalty
+
+        # Weights from robustness_weight parameter
+        w_cost = 1.0 - self.robustness_weight
+        w_penalty = self.robustness_weight
+
+        best_plan_idx = pareto_indices[0]
+        best_cheby = float('inf')
+
+        for p_idx in pareto_indices:
+            c_norm = ((objectives[p_idx][0] - ideal_cost) / range_cost
+                      if range_cost > 1e-15 else 0.0)
+            p_norm = ((objectives[p_idx][1] - ideal_penalty) / range_penalty
+                      if range_penalty > 1e-15 else 0.0)
+            # Chebyshev: minimize the maximum weighted deviation
+            cheby = max(w_cost * c_norm, w_penalty * p_norm)
+            if cheby < best_cheby:
+                best_cheby = cheby
                 best_plan_idx = p_idx
 
-        # Determine device recommendation
+        # --- Step 4: device recommendation via majority vote ---
         gpu_votes = sum(
             1 for s_idx in range(n_samples)
             if self.device_decisions[s_idx][best_plan_idx] == "gpu"
         )
         device = "gpu" if gpu_votes > n_samples / 2 else "cpu"
 
-        return self.plan_list[best_plan_idx], device, best_score
+        expected_cost = objectives[best_plan_idx][0]
+
+        if _DBG_ENABLED:
+            self._dbg_pareto_frontier(objectives, pareto_indices,
+                                      best_plan_idx, best_cheby)
+
+        return self.plan_list[best_plan_idx], device, expected_cost
+
+    # -------------------------------------------------------------------
+    # [ALG-4] Debug: Pareto frontier diagnostics
+    # -------------------------------------------------------------------
+
+    def _dbg_pareto_frontier(self, objectives: List[Tuple[float, float]],
+                             pareto_indices: List[int],
+                             selected_idx: int,
+                             cheby_score: float):
+        """Print Pareto frontier diagnostics.
+
+        Shows: Pareto set size, each plan's (cost, robustness) coordinates,
+        which plan was selected, and its Chebyshev score.
+        """
+        n_plans = len(self.plan_list)
+        print("=" * 60)
+        print(f"[_dbg_pareto_frontier] query={self.query_id}")
+        print(f"  Total plans: {n_plans}")
+        print(f"  Pareto set size: {len(pareto_indices)}")
+        print(f"  Pareto plan indices: {pareto_indices}")
+        print()
+        print("  All plans (cost, worst_penalty):")
+        for i, (c, p) in enumerate(objectives):
+            marker = " *PARETO*" if i in pareto_indices else ""
+            sel = " <== SELECTED" if i == selected_idx else ""
+            ci = self.bootstrap_ci.get(i, (float('nan'), float('nan')))
+            print(f"    plan[{i}] id={self.plan_list[i].plan_id}: "
+                  f"cost={c:.4f}, penalty={p:.4f}, "
+                  f"CI95=[{ci[0]:.4f}, {ci[1]:.4f}]{marker}{sel}")
+        print(f"  Chebyshev score of selected: {cheby_score:.6f}")
+        print("=" * 60)
+
+    @staticmethod
+    def _dbg():
+        """Enable debug output for all HeterogeneousPlanDiagram instances."""
+        _dbg_enable()
+        print("[par2qo_bridge] Debug mode enabled — Pareto frontier, "
+              "softmax reweighting, and bootstrap CI diagnostics will print.")
 
     # -------------------------------------------------------------------
     # Full pipeline (from PAR2QO pqoByFeatureCollection, diagram.py:46)

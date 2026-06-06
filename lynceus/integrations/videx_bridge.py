@@ -13,12 +13,58 @@ Modifications from upstream videx_strategy.py (~20% changed):
   - Modified: VidexStrategy enum — added gpu_accelerated, heterogeneous
   - Kept:    VidexModelBase ABC, cardinality/NDV/records_in_range interface,
              calc_mulcol_ndv_independent utility
+
+M321-M330 Algorithm Changes (Phase 8):
+  [ALG-1] _estimate_selectivity: simple 1/NDV → KDE (Kernel Density Estimation)
+          with Gaussian kernel. When histogram bucket data is available, treat
+          bucket midpoints as data points and use Silverman's rule for bandwidth:
+          h = 0.9 * min(σ, IQR/1.34) * n^(-1/5). Falls back to 1/NDV when no
+          histogram data exists.
+  [ALG-2] _index_benefit: added covering index detection. If the index covers
+          all columns referenced by the query (SELECT + WHERE), the benefit
+          multiplier doubles because heap lookups are avoided entirely.
+  [ALG-3] _dbg_kde_estimate(): prints bandwidth, evaluation points, and
+          density values for each KDE-based selectivity estimate.
 """
 from __future__ import annotations
 import enum, math, logging
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
+
+logger = logging.getLogger("lynceus.videx_bridge")
+
+
+def _dbg_kde_estimate(col: str, bandwidth: float, n_points: int,
+                      query_point: float, density: float, selectivity: float):
+    """打印KDE估计的完整参数"""
+    try:
+        from lynceus._debug import dbg
+        dbg('kde_selectivity',
+            column=col,
+            bandwidth=f"{bandwidth:.6f}",
+            n_data_points=n_points,
+            query_point=f"{query_point:.4f}",
+            density_at_point=f"{density:.8f}",
+            estimated_selectivity=f"{selectivity:.6f}")
+    except ImportError:
+        pass
+
+
+def _dbg_covering_index(index_name: str, index_cols: List[str],
+                        query_cols: List[str], is_covering: bool,
+                        benefit_multiplier: float):
+    """打印covering index检测结果"""
+    try:
+        from lynceus._debug import dbg
+        dbg('covering_index_check',
+            index=index_name,
+            index_columns=index_cols,
+            query_columns=query_cols,
+            is_covering=is_covering,
+            benefit_multiplier=f"{benefit_multiplier:.2f}")
+    except ImportError:
+        pass
 
 
 class VidexStrategy(enum.Enum):
@@ -67,6 +113,10 @@ class TableStats:
     clustered_index_size: int = 0
     innodb_buffer_pool_size: int = 0
     column_ndvs: Dict[str, int] = field(default_factory=dict)
+    # M321: 新增直方图数据用于KDE
+    column_histograms: Dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
+    # M321: 新增index定义用于covering index检测
+    index_definitions: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -82,6 +132,48 @@ class DeviceCostParams:
     hbm_bandwidth_gb_s: float = 2000.0
     pcie_bandwidth_gb_s: float = 32.0
     gpu_num_sms: int = 108
+
+
+# ── KDE 选择性估计 (Silverman's rule bandwidth) ─────────────────────
+def _gaussian_kernel(x: float) -> float:
+    """标准高斯核: K(x) = (1/√2π) * exp(-x²/2)"""
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _kde_estimate(data_points: List[float], query_point: float,
+                  bandwidth: float) -> float:
+    """Kernel Density Estimation with Gaussian kernel.
+    f̂(x) = (1/nh) Σᵢ K((x - xᵢ)/h)
+    """
+    n = len(data_points)
+    if n == 0 or bandwidth <= 0:
+        return 0.0
+    density = 0.0
+    for xi in data_points:
+        u = (query_point - xi) / bandwidth
+        density += _gaussian_kernel(u)
+    return density / (n * bandwidth)
+
+
+def _silverman_bandwidth(data_points: List[float]) -> float:
+    """Silverman's rule of thumb: h = 0.9 * min(σ, IQR/1.34) * n^(-1/5)
+    用于自动选择KDE带宽。"""
+    n = len(data_points)
+    if n < 2:
+        return 1.0
+    mean = sum(data_points) / n
+    var = sum((x - mean) ** 2 for x in data_points) / (n - 1)
+    std = math.sqrt(max(var, 1e-12))
+
+    # IQR估计
+    sorted_pts = sorted(data_points)
+    q1_idx = int(n * 0.25)
+    q3_idx = int(n * 0.75)
+    iqr = sorted_pts[min(q3_idx, n - 1)] - sorted_pts[min(q1_idx, n - 1)]
+    iqr_scaled = iqr / 1.34 if iqr > 0 else std
+
+    spread = min(std, iqr_scaled) if iqr_scaled > 0 else std
+    return 0.9 * spread * (n ** (-0.2))
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +226,7 @@ class HeterogeneousCost:
 
 
 # ---------------------------------------------------------------------------
-# DeviceAwareCostModel — extends VidexModelBase with GPU estimation
+# DeviceAwareCostModel — extends VidexModelBase with GPU estimation + KDE
 # ---------------------------------------------------------------------------
 
 class DeviceAwareCostModel(VidexModelBase):
@@ -144,11 +236,52 @@ class DeviceAwareCostModel(VidexModelBase):
         self.params = params or DeviceCostParams()
         self._ndv_cache: Dict[str, int] = {}
 
+    def _estimate_selectivity(self, rc: RangeCond) -> float:
+        """[ALG-1] KDE选择性估计: 当有直方图数据时用Gaussian KDE,
+        否则回退到经典的 1/NDV 估计。
+
+        直方图桶的中点作为KDE的数据点, bandwidth用Silverman's rule自动选择。
+        对range查询, 在range的中点评估密度, 乘以range宽度得到选择性。
+        对equality查询, 评估单点密度, 除以总密度积分得到选择性。"""
+        col = rc.col
+        ndv = self.table_stats.column_ndvs.get(col, 1)
+        hist = self.table_stats.column_histograms.get(col)
+
+        if hist and len(hist) >= 3:
+            # 用直方图桶中点作为数据点
+            data_points = [(lo + hi) / 2.0 for lo, hi in hist]
+            bw = _silverman_bandwidth(data_points)
+
+            if rc.is_equality and rc.lower is not None:
+                try:
+                    qp = float(rc.lower)
+                except (ValueError, TypeError):
+                    return 1.0 / max(1, ndv)
+                density = _kde_estimate(data_points, qp, bw)
+                # 选择性 = density / 总面积 (近似为1.0)
+                sel = max(1e-6, min(1.0, density * bw))
+                _dbg_kde_estimate(col, bw, len(data_points), qp, density, sel)
+                return sel
+            else:
+                # range查询: 在range中点评估密度
+                lo_val = float(rc.lower) if rc.lower is not None else data_points[0]
+                hi_val = float(rc.upper) if rc.upper is not None else data_points[-1]
+                mid = (lo_val + hi_val) / 2.0
+                width = max(hi_val - lo_val, bw)
+                density = _kde_estimate(data_points, mid, bw)
+                sel = max(1e-6, min(1.0, density * width))
+                _dbg_kde_estimate(col, bw, len(data_points), mid, density, sel)
+                return sel
+        else:
+            # 回退到经典估计
+            return rc.selectivity(self.table_stats.total_rows, ndv)
+
     def cardinality(self, idx_range_cond: IndexRangeCond) -> int:
+        """改用KDE的选择性估计来计算cardinality"""
         rows = self.table_stats.total_rows
         for rc in idx_range_cond.ranges:
-            ndv = self.table_stats.column_ndvs.get(rc.col, 1)
-            rows = max(1, int(rows * rc.selectivity(rows, ndv)))
+            sel = self._estimate_selectivity(rc)
+            rows = max(1, int(rows * sel))
         return rows
 
     def ndv(self, index_name: str, field_list: List[str]) -> int:
@@ -163,6 +296,21 @@ class DeviceAwareCostModel(VidexModelBase):
         p = self.params
         pages = max(1, self.table_stats.total_rows * self.table_stats.avg_row_length // 8192)
         return pages * p.seq_page_cost + self.table_stats.total_rows * p.cpu_tuple_cost
+
+    def _is_covering_index(self, index_name: str,
+                           query_columns: List[str]) -> bool:
+        """[ALG-2] Covering index detection:
+        如果index包含了query所需的所有列, 就是covering index,
+        可以避免heap lookup (回表), 性能翻倍。"""
+        idx_cols = self.table_stats.index_definitions.get(index_name, [])
+        if not idx_cols:
+            return False
+        idx_col_set = set(c.lower() for c in idx_cols)
+        query_col_set = set(c.lower() for c in query_columns)
+        is_covering = query_col_set.issubset(idx_col_set)
+        _dbg_covering_index(index_name, idx_cols, query_columns,
+                           is_covering, 2.0 if is_covering else 1.0)
+        return is_covering
 
     def scan_time_heterogeneous(self, estimated_rows: int = 0,
                                 num_predicates: int = 1,
@@ -187,20 +335,30 @@ class DeviceAwareCostModel(VidexModelBase):
                        "gpu_hbm": hbm, "gpu_compute": gpu_compute, "gpu_sort": gpu_sort})
 
     def index_scan_heterogeneous(self, idx_range_cond: IndexRangeCond,
-                                 depth: int = 3) -> HeterogeneousCost:
+                                 depth: int = 3,
+                                 query_columns: Optional[List[str]] = None) -> HeterogeneousCost:
+        """改动: 加入covering index检测, 如果是covering index则避免回表"""
         card = self.cardinality(idx_range_cond)
         p = self.params
         data_bytes = card * self.table_stats.avg_row_length
         pages = max(1, data_bytes // 8192)
+
+        # [ALG-2] covering index检测
+        covering_mult = 1.0
+        if query_columns:
+            if self._is_covering_index(idx_range_cond.index_name, query_columns):
+                covering_mult = 0.5  # 避免回表, 成本减半
+
         cpu_idx = depth * p.random_page_cost + card * p.cpu_index_tuple_cost
-        cpu_io = pages * p.seq_page_cost
-        cpu_total = cpu_idx + cpu_io + card * p.cpu_tuple_cost
-        transfer = (data_bytes / (p.pcie_bandwidth_gb_s * 1e9)) * 1e6
-        hbm = (data_bytes / (p.hbm_bandwidth_gb_s * 1e9)) * 1e6
-        gpu_total = p.kernel_launch_us + transfer + max(hbm, card * p.gpu_tuple_cost)
+        cpu_io = pages * p.seq_page_cost * covering_mult  # covering时不需要回表读heap
+        cpu_total = cpu_idx + cpu_io + card * p.cpu_tuple_cost * covering_mult
+        transfer = (data_bytes * covering_mult / (p.pcie_bandwidth_gb_s * 1e9)) * 1e6
+        hbm = (data_bytes * covering_mult / (p.hbm_bandwidth_gb_s * 1e9)) * 1e6
+        gpu_total = p.kernel_launch_us + transfer + max(hbm, card * p.gpu_tuple_cost * covering_mult)
         return HeterogeneousCost(cpu_cost_us=cpu_total, gpu_cost_us=gpu_total,
             recommended_device="gpu" if gpu_total < cpu_total else "cpu",
-            breakdown={"cpu_index": cpu_idx, "cardinality": card})
+            breakdown={"cpu_index": cpu_idx, "cardinality": card,
+                       "covering_index": covering_mult < 1.0})
 
 
 class CostHistogram:
