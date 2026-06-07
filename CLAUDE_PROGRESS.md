@@ -60,3 +60,20 @@
 
 ### Total Integration Modules: 31 files (was 25)
 ### Next: Claude #2 (M127-M140) — kepler evaluation + integration tests
+
+## Session #9b — Worker Loop (M127-M134 via 4 Opus 4.6 Workers)
+
+### Status: ✅ COMPLETED
+
+### Dispatch Log:
+| Worker | Conv ID | Time | Files | Lines |
+|--------|---------|------|-------|-------|
+| #3 (M127-M128) | 74fa5def | 逻辑重试 | kepler_evaluation + kepler_e2e_evaluation | 791 |
+| #4 (M129-M130) | 743ce83a | ~120s | par2qo_diagram_cost + par2qo_data_transform | 818 |
+| #5 (M131-M132) | 7ee231c9 | ~100s | kepler_parameter_generator + kepler_query_plan_utils | 718 |
+| #6 (M133-M134) | 67644d4e | ~110s | kepler_active_learning + kepler_model_serving | 736 |
+
+### Key Finding: tools=[] (无repl) 让模型直接输出代码到回复文本中
+
+### Total Integration Modules: 49 files, 21021 lines
+### Commits: 2 (M121-M126 + M127-M134), both pushed to main
