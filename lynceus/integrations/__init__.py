@@ -38,6 +38,13 @@ Ported modules (upstream → lynceus):
     rds_env.py + videx_build_env.py → videx_env_manager.py (LSH fingerprinting, convergence detect)
     meta.py + db_variable.py + common_operation.py → videx_metadata_extended.py (vector clocks)
 
+  PAR2QO (batch 3, Session #8 / M128-M129):
+    diagram_best_cost.py + diagram_nearest.py + dict2json.py → par2qo_plan_selector.py (Thompson, VP-tree)
+    prepend.py + trans_pqo_combination_to_csv.py → par2qo_data_utils.py (HLL sketch, tokenizer)
+
+  Integration Tests (M130):
+    test_integration_pipeline.py — 10 cross-module pipeline tests (all passing)
+
   Tabular:
     hash_table_common.h → tabular_bridge.py      (index build cost)
 """
