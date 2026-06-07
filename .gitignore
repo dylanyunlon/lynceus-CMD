@@ -11,3 +11,9 @@ _fix_port.py
 _port_v3.py
 port_generator.py
 __pycache__/
+-e 
+logs/
+opus_output/
+output/run_*
+*.log
+/tmp/
