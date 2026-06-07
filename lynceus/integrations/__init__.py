@@ -33,14 +33,10 @@ Ported modules (upstream → lynceus):
     analyze_*.py + estimate_stats*.py → videx_stats_analyzer.py (KS test, Theil-Sen)
     plm4ndv_model_infer.py + adandv*.py → videx_model_inference.py (L1 PLM, Good-Turing)
 
-  VIDEX (batch 3, Session #8 / M121-M127):
-    videx_mysql_utils.py + mysql_command.py → videx_mysql_adapter.py (adaptive pool, LFU cache)
-    rds_env.py + videx_build_env.py → videx_env_manager.py (LSH fingerprint, CUSUM convergence)
-    meta.py + db_variable.py + common_operation.py → videx_metadata_extended.py (vector clocks, Bloom)
-    ndv_estimator.py + histogram_utils.py → videx_histogram_engine.py (Ben-Haim streaming, wavelet)
-    sample_info.py + sample_file_info.py + explain_result.py → videx_sample_manager.py (Horvitz-Thompson)
-    videx_logging.py + exceptions.py → videx_logging_telemetry.py (CUSUM anomaly, reservoir log)
-    pydantic_utils.py + sqlbrain_constants.py → videx_pydantic_bridge.py (schema evolution, type registry)
+  VIDEX (batch 3, M121-M123):
+    videx_mysql_utils.py + mysql_command.py → videx_mysql_adapter.py (LFU cache, connection pooling)
+    rds_env.py + videx_build_env.py → videx_env_manager.py (LSH fingerprinting, convergence detect)
+    meta.py + db_variable.py + common_operation.py → videx_metadata_extended.py (vector clocks)
 
   Tabular:
     hash_table_common.h → tabular_bridge.py      (index build cost)
