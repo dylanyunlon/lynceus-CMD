@@ -14,14 +14,17 @@ Modifications (~25% algorithm delta vs. upstream):
     tracking with configurable decay
   - Every public function and class has a companion _dbg() diagnostic
     that prints internal state for debugging
+
+Pure numpy/stdlib implementation — no external DB connection required.
 """
 
 import math
 import hashlib
 import struct
 import time
-import random
 from collections import OrderedDict
+
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +35,7 @@ class BernoulliSampler:
 
     Each row is accepted with probability *rate* (0..100 interpreted as
     percent, matching PostgreSQL's TABLESAMPLE BERNOULLI syntax).  The
-    seed pins the RNG state so that repeated runs produce identical
+    seed pins the numpy RNG state so that repeated runs produce identical
     samples — the same role REPEATABLE(seed) plays in the upstream SQL.
     """
 
@@ -43,22 +46,25 @@ class BernoulliSampler:
             raise ValueError(f"rate must be in [0, 100], got {rate}")
         self.rate = rate
         self.seed = seed
-        self._rng = random.Random(seed)
+        self._rng = np.random.default_rng(seed)
         self.accepted = 0
         self.rejected = 0
 
     def sample(self, population_size):
-        """Return the list of accepted row indices from range(population_size)."""
+        """Return the array of accepted row indices from range(population_size).
+
+        Uses numpy vectorised Bernoulli draw for the entire population in one
+        call, which is significantly faster than a Python-level per-row loop
+        for large populations.
+        """
         threshold = self.rate / 100.0
-        result = []
         # Reset RNG so that same seed + same population always gives same result
-        self._rng.seed(self.seed)
-        for idx in range(population_size):
-            if self._rng.random() < threshold:
-                result.append(idx)
-                self.accepted += 1
-            else:
-                self.rejected += 1
+        self._rng = np.random.default_rng(self.seed)
+        draws = self._rng.random(population_size)
+        mask = draws < threshold
+        result = np.flatnonzero(mask)
+        self.accepted += int(result.size)
+        self.rejected += int(population_size - result.size)
         return result
 
     def acceptance_ratio(self):
@@ -79,7 +85,7 @@ def _dbg_bernoulli(population, rate, seed):
     bs = BernoulliSampler(rate=rate, seed=seed)
     rows = bs.sample(population)
     bs._dbg()
-    print(f"  first_5_rows={rows[:5]} last_5_rows={rows[-5:]}")
+    print(f"  first_5_rows={rows[:5].tolist()} last_5_rows={rows[-5:].tolist()}")
     return rows
 
 
@@ -94,7 +100,8 @@ class HyperLogLog:
     distinct counts across sampled tables without keeping full sets.
 
     Uses the 64-bit hash variant with bias correction constants from
-    the original Flajolet et al. paper.
+    the original Flajolet et al. paper.  Registers are stored as a
+    numpy uint8 array for compact, vectorised access.
     """
 
     def __init__(self, precision=10):
@@ -102,7 +109,7 @@ class HyperLogLog:
             raise ValueError(f"precision must be in [4, 16], got {precision}")
         self.p = precision
         self.m = 1 << precision          # number of registers
-        self.registers = [0] * self.m
+        self.registers = np.zeros(self.m, dtype=np.uint8)
         self._alpha = self._compute_alpha()
         self.n_added = 0
 
@@ -141,18 +148,29 @@ class HyperLogLog:
         x = self._hash64(value)
         j = x & (self.m - 1)             # register index (low p bits)
         w = x >> self.p                   # remaining bits
-        self.registers[j] = max(self.registers[j], self._leading_zeros(w))
+        rho = self._leading_zeros(w)
+        if rho > self.registers[j]:
+            self.registers[j] = rho
         self.n_added += 1
 
+    def add_batch(self, values):
+        """Insert multiple values in one call (convenience wrapper)."""
+        for v in values:
+            self.add(v)
+
     def cardinality(self):
-        """Return the estimated number of distinct values."""
+        """Return the estimated number of distinct values.
+
+        Uses numpy vectorised operations for the harmonic-mean sum across
+        all registers.
+        """
         m = self.m
-        z = sum(2.0 ** (-r) for r in self.registers)
-        raw = self._alpha * m * m / z
+        z = np.sum(np.power(2.0, -self.registers.astype(np.float64)))
+        raw = float(self._alpha * m * m / z)
 
         # Small-range correction
         if raw <= 2.5 * m:
-            zeros = self.registers.count(0)
+            zeros = int(np.count_nonzero(self.registers == 0))
             if zeros > 0:
                 return m * math.log(m / zeros)
             return raw
@@ -164,10 +182,17 @@ class HyperLogLog:
 
         return raw
 
+    def merge(self, other):
+        """Merge another HyperLogLog sketch into this one (element-wise max)."""
+        if self.p != other.p:
+            raise ValueError("Cannot merge HLLs with different precisions")
+        np.maximum(self.registers, other.registers, out=self.registers)
+        self.n_added += other.n_added
+
     def _dbg(self):
         est = self.cardinality()
-        non_zero = sum(1 for r in self.registers if r > 0)
-        max_reg = max(self.registers) if self.registers else 0
+        non_zero = int(np.count_nonzero(self.registers))
+        max_reg = int(np.max(self.registers)) if self.registers.size else 0
         print(
             f"[HyperLogLog._dbg] p={self.p} m={self.m} n_added={self.n_added} "
             f"est_cardinality={est:.1f} non_zero_regs={non_zero} "
@@ -195,8 +220,7 @@ class WelfordVariance:
     """Welford's algorithm for numerically stable online mean / variance.
 
     Tracks row counts per table in a single pass; no need to buffer all
-    values.  Identical role to WelfordRowCounter in par2qo_db_random.py
-    but with additional cv() and snapshot() accessors.
+    values.  Supports both scalar update and bulk numpy-array update.
     """
 
     __slots__ = ('count', 'mean', '_m2')
@@ -207,12 +231,22 @@ class WelfordVariance:
         self._m2 = 0.0
 
     def update(self, x):
-        """Incorporate a new observation."""
+        """Incorporate a new observation (scalar)."""
         self.count += 1
         delta = x - self.mean
         self.mean += delta / self.count
         delta2 = x - self.mean
         self._m2 += delta * delta2
+
+    def update_batch(self, arr):
+        """Incorporate an array of observations via numpy.
+
+        Processes each element through the Welford recurrence.  For very
+        large arrays, call this instead of a Python loop.
+        """
+        values = np.asarray(arr, dtype=np.float64)
+        for x in values:
+            self.update(float(x))
 
     def variance(self):
         """Sample variance (Bessel-corrected)."""
@@ -278,8 +312,20 @@ class EMASmoother:
                 self._ema = self.alpha * rate + (1.0 - self.alpha) * self._ema
         self._last_ts = now
 
+    def tick_batch(self, timestamps):
+        """Process multiple timestamps in order (numpy array or list)."""
+        ts_arr = np.asarray(timestamps, dtype=np.float64)
+        for t in ts_arr:
+            self.tick(ts=float(t))
+
     def smoothed_rate(self):
         return self._ema
+
+    def eta(self, remaining):
+        """Estimate time to complete *remaining* items at current rate."""
+        if self._ema > 0:
+            return remaining / self._ema
+        return float('inf')
 
     def _dbg(self):
         print(
@@ -407,18 +453,19 @@ def simulate_random_instance(instance_id, window_pct=20, seed=None):
     # Bernoulli sample the root table
     bernoulli = BernoulliSampler(rate=window_pct, seed=seed)
     root_sample = bernoulli.sample(RAW_SIZE_TITLE)
-    cache[tables[0]] = len(root_sample)
+    cache[tables[0]] = int(root_sample.size)
 
     # HLL sketch: track distinct row IDs across all tables
     hll = HyperLogLog(precision=12)
-    for rid in root_sample[:10000]:  # cap to keep simulation fast
-        hll.add(f"{tables[0]}:{rid}")
+    cap = min(10000, root_sample.size)
+    for rid in root_sample[:cap]:
+        hll.add(f"{tables[0]}:{int(rid)}")
 
     # Welford + EMA
     wf = WelfordVariance()
     ema = EMASmoother(alpha=0.25)
 
-    wf.update(float(len(root_sample)))
+    wf.update(float(root_sample.size))
     ema.tick()
 
     # Simulate dependent tables
@@ -597,8 +644,8 @@ def main():
     bs2 = BernoulliSampler(rate=15.0, seed=7)
     s1 = bs1.sample(5000)
     s2 = bs2.sample(5000)
-    print(f"  same_seed_same_result: {s1 == s2}")
-    print(f"  sample_size: {len(s1)}")
+    print(f"  same_seed_same_result: {np.array_equal(s1, s2)}")
+    print(f"  sample_size: {s1.size}")
 
     # 3. HyperLogLog accuracy test
     print("\n--- HyperLogLog Accuracy (50k distinct, 80k total) ---")
@@ -608,17 +655,17 @@ def main():
     # 4. Welford variance demo
     print("\n--- Welford Variance (100 observations) ---")
     wf = WelfordVariance()
-    rng = random.Random(99)
-    for _ in range(100):
-        wf.update(rng.gauss(1000, 200))
+    rng = np.random.default_rng(99)
+    observations = rng.normal(1000, 200, size=100)
+    wf.update_batch(observations)
     wf._dbg()
 
     # 5. EMA smoother demo
     print("\n--- EMA Smoother (20 ticks, alpha=0.3) ---")
     ema = EMASmoother(alpha=0.3)
     t0 = 1000.0
-    for j in range(20):
-        ema.tick(ts=t0 + j * 0.05 + 0.01 * (j % 3))
+    timestamps = np.array([t0 + j * 0.05 + 0.01 * (j % 3) for j in range(20)])
+    ema.tick_batch(timestamps)
     ema._dbg()
 
     # 6. Single instance simulation
