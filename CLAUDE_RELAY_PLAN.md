@@ -148,3 +148,25 @@ lynceus-CMD/
 ├── claude_hk_chat.sh
 └── run_lynceus.sh
 ```
+
+---
+
+## 开发进度总览 (Updated by Claude #1 Relay Commander)
+
+| Claude # | 里程碑 | 范围 | 状态 |
+|----------|--------|------|------|
+| Claude #1 (Session 1-8) | M001-M120 | 核心引擎+par2qo+videx初始移植 | ✅ 完成 |
+| Claude #1 Commander (Session 9) | M121-M126 | kepler model_trainer 6模块 (via Opus 4.6) | ✅ 完成 |
+| Claude #2 | M127-M140 | kepler evaluation + 集成测试 + 剩余videx | 📋 待开始 |
+| Claude #3 | M141-M160 | par2qo diagram/data_transform + tabular扩展 | 📋 待开始 |
+| Claude #4 | M161-M180 | training_data_collection_pipeline 全移植 | 📋 待开始 |
+| Claude #5 | M181-M200 | 端到端pipeline打通 + benchmark自动化 | 📋 待开始 |
+| Claude #6 | M201-M220 | 性能优化 + 论文实验复现 + 文档 | 📋 待开始 |
+
+### 子模型调度说明:
+1. 先 `git clone https://github.com/dylanyunlon/claude-hk-config.git /tmp/claude-hk-config`
+2. 从 `raw_curl.txt` 提取cookie: `grep -oP "\-b '\K[^']+" raw_curl.txt`
+3. 用 `dispatch_to_opus.py` 或 `claude_hk_chat.sh` 调用 claude-opus-4-6
+4. 模型选 `claude-opus-4-6`, effort=`high`
+5. 截断时发 `Continue` 续传
+6. 推送: `git push origin main` (PAT已配置)
