@@ -2,7 +2,7 @@
 Lynceus integrations — bridges to upstream PAR2QO, VIDEX, and Tabular.
 
 Ported modules (upstream → lynceus):
-  PAR2QO:
+  PAR2QO (batch 1, Sessions #1-#7):
     robustness.py      → par2qo_robustness.py   (robust query optimization)
     querylets.py        → par2qo_querylets.py    (SQL template fragments)
     cached_robust_plan_dict.py → par2qo_plan_cache.py (plan caching)
@@ -10,7 +10,16 @@ Ported modules (upstream → lynceus):
     diagram.py          → par2qo_bridge.py       (plan diagram / selection)
     postgres.py         → par2qo_cost.py         (cost estimation bridge)
 
-  VIDEX:
+  PAR2QO (batch 2, Session #8 / M101-M120):
+    prep_cardinality.py → par2qo_cardinality.py  (Bayesian cardinality w/ Laplace smoothing)
+    kl.py + plan_reduction*.py → par2qo_divergence.py (Jensen-Shannon, k-medoids)
+    pqo_method.py + par2qo_run.py → par2qo_pqo_engine.py (PQO with CVaR, Halton QMC)
+    plan_inspection.py + diagram*.py → par2qo_plan_inspector.py (Amdahl, convex hull)
+    gen_real_error*.py + prep_sel*.py → par2qo_error_profiler.py (SMAPE, Welford, KDE)
+    db_sliding.py + db_random.py + db_cat*.py → par2qo_db_mutator.py (exp decay, consistent hash)
+    prep_query_template.py + prep_plan_set.py → par2qo_template_engine.py (AST hash, Pareto)
+
+  VIDEX (batch 1, Sessions #1-#7):
     videx_strategy.py   → videx_bridge.py        (virtual index strategy)
     videx_histogram.py  → videx_histogram.py     (histogram engine)
     videx_metadata.py   → videx_metadata.py      (table/column metadata)
@@ -18,6 +27,11 @@ Ported modules (upstream → lynceus):
     ndv_estimator.py    → videx_ndv_estimator.py (NDV estimation methods)
     histogram_utils.py  → videx_histogram_utils.py (histogram construction)
     videx_model_innodb.py → videx_cost_model.py  (InnoDB cost model)
+
+  VIDEX (batch 2, Session #8 / M101-M120):
+    videx_service.py + videx_strategy.py → videx_service_engine.py (circuit breaker, M/M/1)
+    analyze_*.py + estimate_stats*.py → videx_stats_analyzer.py (KS test, Theil-Sen)
+    plm4ndv_model_infer.py + adandv*.py → videx_model_inference.py (L1 PLM, Good-Turing)
 
   Tabular:
     hash_table_common.h → tabular_bridge.py      (index build cost)
