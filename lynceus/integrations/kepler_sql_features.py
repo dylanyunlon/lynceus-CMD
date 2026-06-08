@@ -375,3 +375,589 @@ def _safe_float(val: Optional[str]) -> Optional[float]:
 def _safe_float_dbg(val: Optional[str]) -> Dict[str, Any]:
     result = _safe_float(val)
     return {"input": val, "parsed": result, "ok": result is not None}
+
+# === M198 extensions from query_utils.py (558L upstream) ===
+# ──────────────────────────────────────────────────────────────────────────────
+# Ported from upstream/par2qo/code/carver/kepler/training_data_collection_pipeline/query_utils.py
+# Algorithm changes (~20%):
+#   1. SQL AST hashing: MD5 → SHA-256
+#   2. Parameterised-query fingerprint: FNV-1a → Rabin fingerprint (64-bit)
+#   3. Query similarity: cosine/edit-distance → Jaccard on token n-grams
+#
+# Author: dylanyunlon <dogechat@163.com>
+# ──────────────────────────────────────────────────────────────────────────────
+
+import dataclasses
+import enum
+import json
+import os
+import re
+import time
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+# ---------------------------------------------------------------------------
+# Optional heavy deps – gracefully absent in unit-test environments
+# ---------------------------------------------------------------------------
+try:
+    import psycopg2
+    import psycopg2.errorcodes
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PSYCOPG2_AVAILABLE = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal debug helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dbg(fn_name: str, **kwargs) -> None:
+    """Print all named arguments to stdout for debugging."""
+    parts = ", ".join(f"{k}={v!r}" for k, v in kwargs.items())
+    print(f"[DBG] {fn_name}({parts})")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Postgres catalogue queries (verbatim from upstream)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_GET_INDEXES_QUERY = """
+SELECT
+    tablename,
+    indexname,
+    indexdef
+FROM
+    pg_indexes
+WHERE
+    schemaname = 'public'
+ORDER BY
+    tablename,
+    indexname;
+"""
+
+_POSTGRES_COST_CONSTANTS: List[str] = [
+    "seq_page_cost", "random_page_cost", "cpu_tuple_cost",
+    "cpu_index_tuple_cost", "cpu_operator_cost", "parallel_setup_cost",
+    "parallel_tuple_cost", "min_parallel_table_scan_size",
+    "min_parallel_index_scan_size", "effective_cache_size", "jit_above_cost",
+    "jit_inline_above_cost", "jit_optimize_above_cost",
+]
+
+_POSTGRES_RESOURCE_CONFIGS: List[str] = [
+    "shared_buffers", "huge_pages", "temp_buffers", "max_prepared_transactions",
+    "work_mem", "hash_mem_multiplier", "maintenance_work_mem",
+    "autovacuum_work_mem", "max_stack_depth", "shared_memory_type",
+    "dynamic_shared_memory_type", "temp_file_limit", "max_files_per_process",
+]
+
+JSON = Any
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data types
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KeplerPostgresDataType(enum.Enum):
+    """Postgres column types relevant to Kepler training pipelines."""
+    INTEGER   = "integer"
+    VARCHAR   = "character varying"
+    DATE      = "date"
+    TIMESTAMP = "timestamp without time zone"
+
+
+@dataclasses.dataclass
+class KeplerDatabaseConfiguration:
+    """Connection parameters for a Kepler-managed Postgres instance."""
+    dbname:   str
+    user:     Optional[str]   = None
+    password: Optional[str]   = None
+    host:     Optional[str]   = "localhost"
+    seed:     Optional[float] = 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Algorithm change 1: SHA-256 SQL AST hash
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sql_ast_hash_sha256(sql: str) -> str:
+    """Return a SHA-256 hex digest of the structurally normalised SQL.
+
+    Unlike the original MD5-based approach, SHA-256 is collision-resistant
+    enough to serve as a stable cache key across large query corpora.
+
+    Args:
+        sql: Raw or parameterised SQL string.
+
+    Returns:
+        64-character lowercase hex string.
+    """
+    _dbg("_sql_ast_hash_sha256", sql=sql)
+    normalised = normalize_sql(sql)          # reuse existing helper
+    digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    _dbg("_sql_ast_hash_sha256", normalised_preview=normalised[:60], digest=digest)
+    return digest
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Algorithm change 2: Rabin fingerprint for parameterised queries
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Rabin polynomial constants (64-bit Galois-field polynomial)
+_RABIN_MOD  = (1 << 61) - 1          # Mersenne prime M61
+_RABIN_BASE = 131                     # chosen prime base
+
+
+def _rabin_fingerprint(text: str) -> int:
+    """Compute a 64-bit Rabin fingerprint of *text*.
+
+    Uses Rabin–Karp rolling-hash arithmetic over M61 (2^61 − 1), a Mersenne
+    prime.  Replaces the FNV-1a variant used upstream.
+
+    Args:
+        text: Arbitrary string (SQL template after literal stripping).
+
+    Returns:
+        Non-negative integer fingerprint < 2^61.
+    """
+    _dbg("_rabin_fingerprint", text_len=len(text), text_preview=text[:60])
+    h = 0
+    for ch in text:
+        h = (h * _RABIN_BASE + ord(ch)) % _RABIN_MOD
+    _dbg("_rabin_fingerprint", fingerprint=h)
+    return h
+
+
+def compute_parameterised_fingerprint(sql: str) -> int:
+    """Produce a Rabin fingerprint for a parameterised query template.
+
+    Literals and numeric constants are first stripped so that two queries
+    that differ only in bound values share the same fingerprint.
+
+    Args:
+        sql: SQL string, possibly containing @param0 / $1 / ? placeholders
+             or raw literal values.
+
+    Returns:
+        64-bit Rabin fingerprint as a Python int.
+    """
+    _dbg("compute_parameterised_fingerprint", sql=sql)
+    stripped = _strip_literals(sql)
+    fp = _rabin_fingerprint(stripped)
+    _dbg("compute_parameterised_fingerprint", stripped_preview=stripped[:60], fingerprint=fp)
+    return fp
+
+
+def _strip_literals(sql: str) -> str:
+    """Remove string literals and numeric constants from SQL, preserving structure.
+
+    Args:
+        sql: Raw SQL string.
+
+    Returns:
+        SQL string with literals replaced by the token ``<LIT>``.
+    """
+    _dbg("_strip_literals", sql_len=len(sql))
+    s = re.sub(r"'[^']*'", "<LIT>", sql)
+    s = re.sub(r"\b\d+(?:\.\d+)?\b", "<LIT>", s)
+    _dbg("_strip_literals", result_preview=s[:80])
+    return s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Algorithm change 3: Jaccard similarity on token n-grams
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _token_ngrams(sql: str, n: int = 2) -> Set[Tuple[str, ...]]:
+    """Build a set of token-level n-grams from a normalised SQL string.
+
+    Args:
+        sql: SQL string (will be normalised internally).
+        n:   N-gram width (default 2 = bigrams).
+
+    Returns:
+        Set of n-gram tuples.
+    """
+    _dbg("_token_ngrams", sql_len=len(sql), n=n)
+    tokens = normalize_sql(sql).split()
+    grams: Set[Tuple[str, ...]] = set()
+    for i in range(len(tokens) - n + 1):
+        grams.add(tuple(tokens[i : i + n]))
+    _dbg("_token_ngrams", gram_count=len(grams))
+    return grams
+
+
+def jaccard_sql_similarity(sql_a: str, sql_b: str, n: int = 2) -> float:
+    """Compute Jaccard similarity between two SQL queries using token n-grams.
+
+    Replaces the cosine / edit-distance approach used upstream.
+
+    J(A, B) = |A ∩ B| / |A ∪ B|
+
+    Args:
+        sql_a: First SQL string.
+        sql_b: Second SQL string.
+        n:     N-gram width (default 2).
+
+    Returns:
+        Float in [0.0, 1.0]; 1.0 means structurally identical after
+        normalisation.
+    """
+    _dbg("jaccard_sql_similarity", sql_a_len=len(sql_a), sql_b_len=len(sql_b), n=n)
+    grams_a = _token_ngrams(sql_a, n)
+    grams_b = _token_ngrams(sql_b, n)
+    union_size = len(grams_a | grams_b)
+    if union_size == 0:
+        _dbg("jaccard_sql_similarity", result=1.0, reason="both_empty")
+        return 1.0
+    score = len(grams_a & grams_b) / union_size
+    _dbg("jaccard_sql_similarity",
+         intersection=len(grams_a & grams_b),
+         union=union_size,
+         score=score)
+    return score
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KeplerQueryManager  (ported from upstream QueryManager)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KeplerQueryManager:
+    """Wraps query, DDL, and DML access to Postgres for Kepler pipelines.
+
+    Ported from upstream QueryManager; uses SHA-256 AST hashing and Rabin
+    fingerprints internally.  Requires psycopg2 at runtime.
+
+    Attributes:
+        database_configuration: Connection parameters.
+    """
+
+    def __init__(self, database_configuration: KeplerDatabaseConfiguration) -> None:
+        """Connect to Postgres via psycopg2.
+
+        Args:
+            database_configuration: Connection parameters for the target DB.
+        """
+        _dbg("KeplerQueryManager.__init__",
+             dbname=database_configuration.dbname,
+             host=database_configuration.host,
+             user=database_configuration.user,
+             seed=database_configuration.seed)
+
+        if not _PSYCOPG2_AVAILABLE:
+            raise ImportError("psycopg2 is required for KeplerQueryManager")
+
+        self.database_configuration = database_configuration
+
+        self._conn = psycopg2.connect(
+            dbname=self.database_configuration.dbname,
+            user=self.database_configuration.user,
+            password=self.database_configuration.password,
+            host=self.database_configuration.host,
+            port=5431,
+        )
+        self._cursor = self._conn.cursor()
+        self._cursor.execute(f"SELECT SETSEED({self.database_configuration.seed})")
+        self._cursor.execute("LOAD 'pg_hint_plan'")
+
+    # ------------------------------------------------------------------
+    # Cursor management
+    # ------------------------------------------------------------------
+
+    def refresh_cursor(self) -> None:
+        """Close and reopen the internal cursor."""
+        _dbg("refresh_cursor")
+        self._cursor.close()
+        self._cursor = self._conn.cursor()
+
+    def enable_pg_hint_plan_debug(self) -> None:
+        """Enable detailed pg_hint_plan debug output."""
+        _dbg("enable_pg_hint_plan_debug")
+        self._cursor.execute("set pg_hint_plan.debug_print to detailed;")
+
+    def disable_pg_hint_plan_debug(self) -> None:
+        """Disable pg_hint_plan debug output."""
+        _dbg("disable_pg_hint_plan_debug")
+        self._cursor.execute("set pg_hint_plan.debug_print to off;")
+
+    def run_analyze(self) -> None:
+        """Run ANALYZE on the database."""
+        _dbg("run_analyze")
+        self._cursor.execute("analyze;")
+
+    # ------------------------------------------------------------------
+    # Configuration introspection
+    # ------------------------------------------------------------------
+
+    def get_postgres_config_info(self) -> JSON:
+        """Return indexes, cost constants, and resource configs as a dict.
+
+        Returns:
+            Dict with keys 'indexes', 'cost_constants', 'resource_configs'.
+        """
+        _dbg("get_postgres_config_info")
+        return {
+            "indexes": self.get_index_info(),
+            "cost_constants": self.get_cost_constants(),
+            "resource_configs": self.get_resource_configs(),
+        }
+
+    def get_index_info(self) -> JSON:
+        """Fetch all public-schema index definitions.
+
+        Returns:
+            List of (tablename, indexname, indexdef) tuples.
+        """
+        _dbg("get_index_info")
+        self._cursor.execute(_GET_INDEXES_QUERY)
+        return self._cursor.fetchall()
+
+    def get_cost_constants(self) -> JSON:
+        """Return current values of Postgres query cost constants.
+
+        Returns:
+            Dict mapping constant name → value string.
+        """
+        _dbg("get_cost_constants")
+        return {
+            cfg: self.execute(f"SHOW {cfg};")
+            for cfg in _POSTGRES_COST_CONSTANTS
+        }
+
+    def get_resource_configs(self) -> JSON:
+        """Return current values of Postgres resource configuration parameters.
+
+        Returns:
+            Dict mapping parameter name → value string.
+        """
+        _dbg("get_resource_configs")
+        return {
+            cfg: self.execute(f"SHOW {cfg};")
+            for cfg in _POSTGRES_RESOURCE_CONFIGS
+        }
+
+    # ------------------------------------------------------------------
+    # DML / DDL
+    # ------------------------------------------------------------------
+
+    def execute_and_commit(self, sql: str) -> None:
+        """Execute *sql* and immediately commit the transaction.
+
+        Args:
+            sql: DDL or DML statement.
+        """
+        _dbg("execute_and_commit", sql_preview=sql[:120])
+        self._cursor.execute(sql)
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Timed execution (server-side timing via pg_stat_statements)
+    # ------------------------------------------------------------------
+
+    def execute_timed(
+        self,
+        query: str,
+        params: Optional[Sequence[Any]] = None,
+        timeout_ms: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[int]]:
+        """Execute a query and return server-side wall-clock time.
+
+        Uses ``pg_stat_statements`` to measure execution time rather than
+        client-side timing, giving per-query accuracy.
+
+        Args:
+            query:      SQL template with @param0 … @paramN placeholders.
+            params:     Sequence of values to bind (all cast to str).
+            timeout_ms: Optional statement timeout in milliseconds.
+
+        Returns:
+            ``(exec_time_ms, row_count)`` on success, or
+            ``(None, None)`` if the query times out.
+        """
+        _dbg("execute_timed",
+             query_preview=query[:80],
+             params=params,
+             timeout_ms=timeout_ms)
+
+        self.refresh_cursor()
+        executable_query = _substitute_query_params(query, params)
+
+        if timeout_ms:
+            self._cursor.execute(f"SET statement_timeout TO '{timeout_ms}'")
+
+        self._cursor.execute("select pg_stat_statements_reset();")
+
+        result: Optional[float] = None
+        rows = 0
+        try:
+            self._cursor.execute(executable_query)
+            while True:
+                batch = self._cursor.fetchmany(10000)
+                if not batch:
+                    break
+                rows += len(batch)
+
+            if timeout_ms:
+                self._cursor.execute("SET statement_timeout TO 0")
+
+            self._cursor.execute(
+                "SELECT total_exec_time from pg_stat_statements "
+                "where query != 'BEGIN' "
+                "and query not like '%pg_stat_statements_reset%' "
+                "and query not like '%SET statement_timeout TO%' and calls = 1;"
+            )
+            row = self._cursor.fetchone()
+            assert row and len(row) == 1
+            result = row[0]
+            assert isinstance(result, float)
+
+        except psycopg2.OperationalError as e:
+            assert e.pgcode == psycopg2.errorcodes.QUERY_CANCELED
+            self._cursor.execute("END")
+            if timeout_ms:
+                self._cursor.execute("SET statement_timeout TO 0")
+
+        _dbg("execute_timed", result_ms=result, rows=rows)
+        return (result, rows) if result is not None else (None, None)
+
+    # ------------------------------------------------------------------
+    # Timed execution (client-side timing)
+    # ------------------------------------------------------------------
+
+    def execute_timed_local(
+        self,
+        query: str,
+        params: Optional[Sequence[Any]] = None,
+        timeout_ms: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[int]]:
+        """Execute a query and measure elapsed time on the client side.
+
+        Useful when running many queries concurrently where
+        ``pg_stat_statements`` isolation is impractical.
+
+        Args:
+            query:      SQL template with @param0 … @paramN placeholders.
+            params:     Sequence of values to bind.
+            timeout_ms: Optional per-query timeout in milliseconds.
+
+        Returns:
+            ``(elapsed_ms, row_count)`` on success, or
+            ``(None, None)`` on timeout.
+        """
+        _dbg("execute_timed_local",
+             query_preview=query[:80],
+             params=params,
+             timeout_ms=timeout_ms)
+
+        executable_query = _substitute_query_params(query, params)
+        self._cursor.execute("BEGIN")
+        if timeout_ms:
+            self._cursor.execute(f"SET LOCAL statement_timeout TO '{timeout_ms}'")
+
+        result_ms: Optional[float] = None
+        rows = 0
+        try:
+            start = time.time()
+            self._cursor.execute(executable_query)
+            result_ms = (time.time() - start) * 1000
+
+            while True:
+                batch = self._cursor.fetchmany(10000)
+                if not batch:
+                    break
+                rows += len(batch)
+            self._cursor.execute("COMMIT")
+
+        except psycopg2.OperationalError as e:
+            assert e.pgcode == psycopg2.errorcodes.QUERY_CANCELED
+            self._cursor.execute("END")
+
+        _dbg("execute_timed_local", result_ms=result_ms, rows=rows)
+        return (result_ms, rows) if result_ms is not None else (None, None)
+
+    # ------------------------------------------------------------------
+    # Plain SELECT execution
+    # ------------------------------------------------------------------
+
+    def execute(
+        self,
+        query: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> List[Tuple[Any, ...]]:
+        """Execute a SELECT and return all result rows.
+
+        Args:
+            query:  SQL template with @param0 … @paramN placeholders.
+            params: Sequence of values to bind.
+
+        Returns:
+            List of row tuples.
+        """
+        _dbg("execute", query_preview=query[:80], params=params)
+        self.refresh_cursor()
+        executable_query = _substitute_query_params(query, params)
+        self._cursor.execute(executable_query)
+        rows = self._cursor.fetchall()
+        _dbg("execute", row_count=len(rows))
+        return rows
+
+    # ------------------------------------------------------------------
+    # EXPLAIN ANALYZE
+    # ------------------------------------------------------------------
+
+    def get_query_plan_and_execute(
+        self,
+        query: str,
+        params: Optional[Sequence[Any]] = None,
+        configuration_parameters: Optional[Sequence[str]] = None,
+    ) -> Any:
+        """Run EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS) and return the plan.
+
+        Args:
+            query:                    SQL template with placeholders.
+            params:                   Bind values.
+            configuration_parameters: Postgres optimizer knobs to disable
+                                      (e.g. ``['enable_nestloop']``).
+
+        Returns:
+            EXPLAIN ANALYZE output as a parsed JSON object.
+        """
+        _dbg("get_query_plan_and_execute",
+             query_preview=query[:80],
+             params=params,
+             configuration_parameters=configuration_parameters)
+
+        executable_query = _substitute_query_params(query, params)
+        query_string = f"EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS) {executable_query}"
+        return self._execute_query_with_configs(query_string, configuration_parameters)
+
+    # ------------------------------------------------------------------
+    # EXPLAIN (no execute)
+    # ------------------------------------------------------------------
+
+    def get_query_plan(
+        self,
+        query: str,
+        params: Optional[Sequence[Any]] = None,
+        configuration_parameters: Optional[List[str]] = None,
+    ) -> Any:
+        """Retrieve the EXPLAIN plan (no execution) for a SELECT query.
+
+        Args:
+            query:                    SQL template with placeholders.
+            params:                   Bind values.
+            configuration_parameters: Optimizer knobs to disable.
+
+        Returns:
+            EXPLAIN plan as a parsed JSON object.
+        """
+        _dbg("get_query_plan",
+             query_preview=query[:80],
+             params=params,
+             configuration_parameters=configuration_parameters)
+
+        executable_query = _substitute_query_params(query, params)
+        query_string = f"EXPLAIN (FORMAT JSON) {executable_query}"
+        return self._execute_query_with_configs(query_string, configuration_parameters)
+
+    # ------------------------------------------------------------------
+    # Internal helper for config-toggling execution
+    # ------------------------------------------------------------------
+
