@@ -1,5 +1,5 @@
 """
-M190: videx_mysql_engine — MySQL Command Engine with Explain Analysis
+M190: videx_mysql — MySQL Command Engine with Explain Analysis
 Upstream: mysql_command.py (252L) + explain_result.py (97L) + common_operation.py (123L)
 Algorithm changes (20%):
   - Cost-based explain plan scoring with Amdahl's law parallelism model
@@ -299,7 +299,7 @@ class MySQLCommandEngine:
 
 
 if __name__ == "__main__":
-    print("=== M190 videx_mysql_engine self-test ===")
+    print("=== M190 videx_mysql self-test ===")
 
     eng = MySQLCommandEngine(version=MySQLVersion.MySQL_8)
 

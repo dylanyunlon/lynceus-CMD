@@ -1,5 +1,5 @@
 """
-par2qo_data_utils — Data ingestion and transformation utilities for Lynceus.
+par2qo_data — Data ingestion and transformation utilities for Lynceus.
 
 Ported from:
   - upstream/par2qo/prepend.py (72 lines)

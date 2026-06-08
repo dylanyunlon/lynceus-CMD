@@ -17,7 +17,7 @@ from sub_platforms.sql_opt.histogram.histogram_utils import load_sample_file
 from sub_platforms.sql_opt.videx.videx_histogram import MEANINGLESS_INT
 from sub_platforms.sql_opt.videx.videx_metadata import VidexTableStats, PCT_CACHED_MODE_PREFER_META
 from sub_platforms.sql_opt.videx.model.videx_strategy import VidexModelBase, VidexStrategy, calc_mulcol_ndv_independent
-from sub_platforms.sql_opt.videx.videx_utils import IndexRangeCond, RangeCond
+from sub_platforms.sql_opt.videx.videx_common import IndexRangeCond, RangeCond
 
 
 class VidexModelInnoDB(VidexModelBase):

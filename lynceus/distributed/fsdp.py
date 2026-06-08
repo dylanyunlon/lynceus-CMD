@@ -1,5 +1,5 @@
 """
-lynceus/distributed/fsdp_compat.py — FSDP compatibility layer.
+lynceus/distributed/fsdp.py — FSDP compatibility layer.
 
 算法改动:
     1. k_center_greedy: lazy distance update

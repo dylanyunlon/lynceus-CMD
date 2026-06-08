@@ -32,7 +32,7 @@ from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
 
-logger = logging.getLogger("lynceus.videx_bridge")
+logger = logging.getLogger("lynceus.videx_connector")
 
 
 def _dbg_kde_estimate(col: str, bandwidth: float, n_points: int,

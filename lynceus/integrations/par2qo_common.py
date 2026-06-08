@@ -34,7 +34,7 @@ import time
 import logging
 from typing import List, Dict, Optional, Tuple, Any, Union
 
-logger = logging.getLogger("lynceus.par2qo_utils")
+logger = logging.getLogger("lynceus.par2qo_common")
 
 
 # ── Cardinality helpers (from PAR2QO utility.py:9-20) ──────────────────

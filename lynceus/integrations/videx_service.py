@@ -1,5 +1,5 @@
 """
-videx_service_engine — Virtual index evaluation service for Lynceus.
+videx_service — Virtual index evaluation service for Lynceus.
 
 Ported from:
   - upstream/videx/videx_service.py (691 lines)

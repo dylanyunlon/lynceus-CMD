@@ -2,11 +2,11 @@
 """
 Original: Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
           SPDX-License-Identifier: MIT
-          (upstream/videx/src/sub_platforms/sql_opt/videx/videx_utils.py)
+          (upstream/videx/src/sub_platforms/sql_opt/videx/videx_common.py)
 Modified: Lynceus — B-tree key range utilities and data type helpers with
           GPU-aware index cost annotations.
 
-Modifications from upstream videx_utils.py (~80% structure kept, ~20% changed):
+Modifications from upstream videx_common.py (~80% structure kept, ~20% changed):
   - Removed: Env, RDS, MySQL, pydantic, msgpack, pandas, pickle deps
   - Removed: fetch_create_table_ddls, file I/O helpers (json/pickle/msgpack)
   - Kept:    BTreeKeyOp, BTreeKeySide enums
@@ -20,12 +20,12 @@ Modifications from upstream videx_utils.py (~80% structure kept, ~20% changed):
   - Added:   debug print helpers throughout
 
 References:
-  videx_utils.py:60  — BTreeKeyOp enum
-  videx_utils.py:101 — BTreeKeySide enum
-  videx_utils.py:118 — RangeCond dataclass
-  videx_utils.py:259 — IndexRangeCond dataclass
-  videx_utils.py:444 — GT_Table_Return
-  videx_utils.py:798 — data_type_is_int
+  videx_common.py:60  — BTreeKeyOp enum
+  videx_common.py:101 — BTreeKeySide enum
+  videx_common.py:118 — RangeCond dataclass
+  videx_common.py:259 — IndexRangeCond dataclass
+  videx_common.py:444 — GT_Table_Return
+  videx_common.py:798 — data_type_is_int
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ from enum import Enum, auto
 from typing import List, Dict, Optional, Tuple, Any, Union, Callable, Set
 from datetime import datetime
 
-logger = logging.getLogger("lynceus.videx_utils")
+logger = logging.getLogger("lynceus.videx_common")
 
 
 # ── BTree key operation enum (from upstream line 60) ───────────────────

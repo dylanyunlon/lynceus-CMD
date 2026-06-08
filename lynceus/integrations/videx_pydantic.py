@@ -1,5 +1,5 @@
 """
-videx_pydantic_bridge — Schema evolution and serialization bridge for Lynceus.
+videx_pydantic — Schema evolution and serialization bridge for Lynceus.
 
 Ported from:
   - upstream/videx/common/pydantic_utils.py (58 lines)

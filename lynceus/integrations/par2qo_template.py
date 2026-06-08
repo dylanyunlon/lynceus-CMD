@@ -1,5 +1,5 @@
 """
-par2qo_template_engine — Query template and plan set management for Lynceus.
+par2qo_template — Query template and plan set management for Lynceus.
 
 Ported from:
   - upstream/par2qo/code/prep_query_template.py (2401 lines)

@@ -1,5 +1,5 @@
 """
-par2qo_pqo_engine — Parametric Query Optimization engine for Lynceus.
+par2qo_pqo — Parametric Query Optimization engine for Lynceus.
 
 Ported from:
   - upstream/par2qo/code/pqo_method.py (204 lines)

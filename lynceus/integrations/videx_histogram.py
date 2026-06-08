@@ -19,7 +19,7 @@ from sub_platforms.sql_opt.databases.mysql.mysql_command import MySQLVersion
 from sub_platforms.sql_opt.env.rds_env import Env
 from sub_platforms.sql_opt.meta import Table, Column
 from sub_platforms.sql_opt.videx import videx_logging
-from sub_platforms.sql_opt.videx.videx_utils import BTreeKeySide, target_env_available_for_videx, parse_datetime, \
+from sub_platforms.sql_opt.videx.videx_common import BTreeKeySide, target_env_available_for_videx, parse_datetime, \
     data_type_is_int, reformat_datetime_str
 from sub_platforms.sql_opt.histogram.histogram_utils import (
     block_level_sample,

@@ -1,5 +1,5 @@
 """
-kepler_model_base â Numpy MLP model base for Lynceus.
+kepler_model â Numpy MLP model base for Lynceus.
 
 Ported from upstream/kepler/code/model.py (~180 lines of Keras model).
 Algorithm changes (~20%):

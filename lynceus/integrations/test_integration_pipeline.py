@@ -104,7 +104,7 @@ class IntegrationTestRunner:
             js_divergence, js_distance, hellinger_distance,
             k_medoids_greedy, reduce_plans_by_opt_range
         )
-        from lynceus.integrations.par2qo_pqo_engine import (
+        from lynceus.integrations.par2qo_pqo import (
             _wilson_interval, _halton_samples, PQOMethod
         )
         
@@ -181,7 +181,7 @@ class IntegrationTestRunner:
         from lynceus.integrations.videx_metadata_extended import (
             TableMeta, ColumnMeta, IndexMeta
         )
-        from lynceus.integrations.videx_histogram_engine import (
+        from lynceus.integrations.videx_histogram_calc import (
             StreamingHistogram, HybridNDVEstimator, HistogramBuilder
         )
         
@@ -322,7 +322,7 @@ class IntegrationTestRunner:
     
     def test_serialization_roundtrip(self):
         """Test serialization bridge round-trip."""
-        from lynceus.integrations.videx_pydantic_bridge import (
+        from lynceus.integrations.videx_pydantic import (
             SerializationBridge, SchemaEvolver, TypeRegistry
         )
         
@@ -344,7 +344,7 @@ class IntegrationTestRunner:
     
     def test_data_utils_pipeline(self):
         """Test data ingestion utilities."""
-        from lynceus.integrations.par2qo_data_utils import (
+        from lynceus.integrations.par2qo_data import (
             HyperLogLogSketch, PQOCombinationTokenizer, FrequencyAggregator
         )
         
