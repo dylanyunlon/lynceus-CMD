@@ -1,7 +1,7 @@
 {
   "experiment": "SOTA Comparison",
   "workload": "TPC-H_SF100",
-  "timestamp": "2026-06-08 14:46:39",
+  "timestamp": "2026-06-08 14:59:17",
   "our_methods": {
     "GPU-Only": {
       "mean_latency_us": 41.85,
@@ -59,15 +59,15 @@
       "improvement_pct": 15.6
     },
     "Adaptive": {
-      "mean_latency_us": 65.84,
-      "std_us": 477.97,
-      "ci_95_lo": 37.01,
-      "ci_95_hi": 120.1,
-      "p50_us": 8.68,
-      "p99_us": 351.12,
-      "normalized_vs_gpu_only": 1.573,
-      "ndcg_at_10": 0.8974,
-      "improvement_pct": -57.3
+      "mean_latency_us": 43.55,
+      "std_us": 79.7,
+      "ci_95_lo": 36.28,
+      "ci_95_hi": 51.33,
+      "p50_us": 8.97,
+      "p99_us": 353.7,
+      "normalized_vs_gpu_only": 1.0405,
+      "ndcg_at_10": 0.8947,
+      "improvement_pct": -4.1
     }
   },
   "published_baselines": {
