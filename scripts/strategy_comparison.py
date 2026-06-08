@@ -322,9 +322,11 @@ def check_convergence(latencies: List[float], window: int = 200,
 
 def run_strategy_seed(
     strategy, scheduler, cache_mgr, workload, seed_id: int,
-    strategy_name: str,
+    strategy_name: str, engine=None,
 ) -> Dict:
     """单策略单seed运行。返回包含延迟曲线和诊断信息的字典。"""
+    import random as _rng_mod
+    rng = _rng_mod.Random(42 + seed_id)
     latencies = []
     route_counts = defaultdict(int)
     cumulative = KahanSum()
@@ -333,13 +335,22 @@ def run_strategy_seed(
 
     n = len(workload)
     for idx, q in enumerate(workload):
-        # 路由 + 调度
+        # 路由: 由策略决定device
         decision = strategy.route_one(q, data_location="cpu0")
         dev = decision.device_id
 
-        # 通过scheduler获取精确延迟(含transfer)
-        sched = scheduler.schedule(q, data_location="cpu0")
-        lat = sched.latency_us
+        # 用策略选定的device计算真实延迟 (含transfer)
+        # 而非scheduler重新路由覆盖策略决策
+        if engine is not None:
+            try:
+                dev_cb = engine.estimate_on_device(q, dev, "cpu0")
+                lat = dev_cb.total_us
+            except Exception:
+                lat = decision.cost.total_us if decision.cost else 0.0
+        else:
+            lat = decision.cost.total_us if decision.cost else 0.0
+        # 执行噪声 (±2%)
+        lat *= (1.0 + rng.gauss(0, 0.01))
 
         latencies.append(lat)
         route_counts[dev] += 1
@@ -449,7 +460,7 @@ def run_comparison(n_steps: int, n_seeds: int, output_dir: str) -> Dict:
             workload = build_phaseshift_workload(n_steps, seed=seed_id + strat_idx * 1000)
             result = run_strategy_seed(
                 strategy, scheduler, cache_mgr, workload,
-                seed_id, strat_name)
+                seed_id, strat_name, engine=engine)
 
             seed_data[str(seed_id)] = result
             all_lats_flat.extend(result["latencies"])

@@ -5,7 +5,7 @@
 # ============================================================
 set -euo pipefail
 
-ORG="0009d34c-3e7b-4f8b-9494-399e0088f93e"
+ORG="4ea0dc6d-77d5-4474-be5b-749f34f5ea71"
 BASE="https://claude.hk.cn/api/organizations/${ORG}"
 MODEL="${MODEL:-claude-sonnet-4-6}"
 EFFORT="${EFFORT:-high}"

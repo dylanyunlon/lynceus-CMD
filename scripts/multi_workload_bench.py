@@ -301,15 +301,19 @@ def run_benchmark(steps: int, seeds: int) -> dict:
                         device_id = decision.device_id if decision else "cpu0"
                         cost = decision.cost.total_us if decision and decision.cost else 0.0
 
-                        # scheduling latency
+                        # 用策略选择的device计算真实延迟（含transfer）
+                        # 而非scheduler重新做路由决策覆盖策略
                         try:
-                            sched = scheduler.schedule(q, data_location="cpu0")
-                            lat = sched.latency_us if sched else cost
+                            dev_cb = engine.estimate_on_device(q, device_id, "cpu0")
+                            lat = dev_cb.total_us
                         except Exception:
                             lat = cost
+                        # 添加噪声模拟真实执行波动 (±3%)
+                        noise_factor = 1.0 + (rng.gauss(0, 0.015))
+                        lat *= max(0.9, noise_factor)
 
                         step_latency += lat
-                        kahan.add(cost)
+                        kahan.add(lat)
                         seed_device_counts[device_id] += 1
 
                         # cache simulation

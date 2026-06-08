@@ -76,12 +76,22 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
         return "PAR2QO-Enhanced"
 
     def _fpl_select(self, estimates: Dict[str, CostBreakdown]) -> str:
-        """Follow the Perturbed Leader: 对累积loss加指数噪声, 选最小。
-        扰动分布: Exp(1/η), 使得在线后悔 O(√(T·ln N))"""
+        """Follow the Perturbed Leader with annealing exploration.
+        前T_warmup步用较大扰动探索, 之后退火到精细选择。
+        扰动分布: Exp(1/η_t), η_t = η_0 / sqrt(1 + t/T_warmup)
+        使得在线后悔 O(√(T·ln N)) 且前期充分探索各device"""
+        T_warmup = 30
+        anneal = self._fpl_eta / math.sqrt(1.0 + self._fpl_step / max(1, T_warmup))
         perturbed_loss: Dict[str, float] = {}
         for dev_id, cb in estimates.items():
-            noise = _random.expovariate(1.0 / max(1e-6, self._fpl_eta))
-            perturbed_loss[dev_id] = self._cum_loss[dev_id] + cb.total_us - noise
+            noise = _random.expovariate(1.0 / max(1e-8, anneal))
+            # 用transfer-aware penalty: 高transfer占比的估计额外惩罚
+            transfer_penalty = 0.0
+            if cb.total_us > 0:
+                transfer_ratio = cb.transfer_cost_us / cb.total_us
+                transfer_penalty = transfer_ratio * 0.12 * cb.total_us
+            perturbed_loss[dev_id] = (self._cum_loss[dev_id]
+                                      + cb.total_us + transfer_penalty - noise)
         return min(perturbed_loss, key=perturbed_loss.get)
 
     def _hedge_weight_for(self, device_id: str) -> float:
