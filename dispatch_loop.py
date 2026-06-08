@@ -114,7 +114,7 @@ BATCHES = [
     {
         "id": "W1", "milestone": "M172-M173",
         "files": {
-            "kepler_plan_candidates.py": "查询计划候选生成+基数扰动",
+            "kepler_plan_fingerprint_candidates.py": "查询计划候选生成+基数扰动",
             "kepler_training_execution.py": "训练数据执行引擎+延迟收集",
         },
         "upstream": [
@@ -157,7 +157,7 @@ BATCHES = [
         "id": "W4", "milestone": "M178-M179",
         "files": {
             "kepler_sngp_model.py": "SNGP多头模型(Spectral-normalized GP)",
-            "kepler_model_server.py": "模型服务器+查询解析",
+            "kepler_mlp_server.py": "模型服务器+查询解析",
         },
         "upstream": [
             "upstream/par2qo/code/carver/kepler/model_trainer/sngp_multihead_model.py",

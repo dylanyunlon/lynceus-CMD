@@ -1,5 +1,5 @@
 """
-kepler_trainer_util â Training / data-preparation utilities for Lynceus.
+kepler_training_prep â Training / data-preparation utilities for Lynceus.
 
 Ported from upstream/kepler/code/trainer_util.py (~160 lines).
 Algorithm changes (~20%):

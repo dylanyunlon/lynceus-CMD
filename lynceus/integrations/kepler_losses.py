@@ -1,5 +1,5 @@
 """
-kepler_loss_functions â Loss function utilities for Lynceus.
+kepler_losses â Loss function utilities for Lynceus.
 
 Ported from upstream/kepler/code/loss_functions.py (50 lines).
 Algorithm changes (~20%):

@@ -1,5 +1,5 @@
 """
-M189: videx_sample_data — Sample Data Management with Reservoir Sampling
+M189: videx_sampler — Sample Data Management with Reservoir Sampling
 Upstream: sample_info.py (108L) + sample_file_info.py (82L) + statistics_info.py (74L)
 Algorithm changes (20%):
   - Reservoir sampling (Vitter Algorithm R) for row selection instead of full scan
@@ -254,7 +254,7 @@ class TableStatisticsInfo:
 
 
 if __name__ == "__main__":
-    print("=== M189 videx_sample_data self-test ===")
+    print("=== M189 videx_sampler self-test ===")
 
     # Test SampleColumnInfo
     col = SampleColumnInfo.new_ins("mydb", "users", "email", data_type="varchar")

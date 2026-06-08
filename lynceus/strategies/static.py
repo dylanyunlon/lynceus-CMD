@@ -2,9 +2,9 @@
 from __future__ import annotations
 import math
 from typing import Optional
-from ..cost_model import CostModelEngine, QueryDescriptor
+from ..costing import CostModelEngine, QueryDescriptor
 from ..schema import HardwareKind
-from .base import RoutingDecision, RoutingStrategyBase
+from .foundation import RoutingDecision, RoutingStrategyBase
 
 class GPUOnlyStrategy(RoutingStrategyBase):
     def __init__(self, engine: CostModelEngine, *, gpu_id: str = "gpu0", **kwargs):

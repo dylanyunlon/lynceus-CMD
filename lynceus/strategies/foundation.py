@@ -1,5 +1,5 @@
 """
-lynceus/strategies/base.py — Abstract base for routing strategies.
+lynceus/strategies/foundation.py — Abstract base for routing strategies.
 
 Every routing strategy inherits from RoutingStrategyBase and implements
 route_one(). The registry pattern mirrors NCCL's algorithm selection
@@ -22,7 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
-from ..cost_model import (
+from ..costing import (
     CostBreakdown,
     CostModelEngine,
     QueryDescriptor,

@@ -198,7 +198,7 @@ class ExperimentMeta:
     gpu_arch: str = "A100"
     n_workers: int = 1
     sharding_strategy: str = "FULL_SHARD"
-    cost_model_version: str = "v1.0"
+    costing_version: str = "v1.0"
     def dump_debug(self, prefix: str = "") -> str:
         return (f"{prefix}Experiment({self.experiment_id}): "
                 f"{self.workload_name} N={self.n_samples} "
@@ -375,7 +375,7 @@ class DataWriter:
                 "gpu_arch": self._experiment.gpu_arch,
                 "n_workers": self._experiment.n_workers,
                 "sharding": self._experiment.sharding_strategy,
-                "cost_model_version": self._experiment.cost_model_version,
+                "costing_version": self._experiment.costing_version,
             },
             "summary": {
                 "n_records": len(self._records),

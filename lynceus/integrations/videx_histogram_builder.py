@@ -1,5 +1,5 @@
 """
-videx_histogram_calc — Advanced histogram construction and analysis for Lynceus.
+videx_histogram_builder — Advanced histogram construction and analysis for Lynceus.
 
 Ported from:
   - upstream/videx/histogram/ndv_estimator.py (743 lines)

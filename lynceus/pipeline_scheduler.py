@@ -23,7 +23,7 @@ import hashlib
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
-from .cost_model import CostBreakdown, CostModelEngine, QueryDescriptor, QueryType
+from .costing import CostBreakdown, CostModelEngine, QueryDescriptor, QueryType
 from .schema import HardwareKind
 
 

@@ -1,5 +1,5 @@
 """
-lynceus/cost_model.py — Heterogeneous cost model for query routing.
+lynceus/costing.py — Heterogeneous cost model for query routing.
 
 Architecture references:
     - PAR2QO get_plan_cost(), VIDEX scan_time(), CUTLASS GemmUniversal,

@@ -1,8 +1,8 @@
 """
-videx_service — Virtual index evaluation service for Lynceus.
+videx_evaluator — Virtual index evaluation service for Lynceus.
 
 Ported from:
-  - upstream/videx/videx_service.py (691 lines)
+  - upstream/videx/videx_evaluator.py (691 lines)
   - upstream/videx/videx_strategy.py (201 lines)
   - upstream/videx/videx_model_innodb.py (321 lines)
 

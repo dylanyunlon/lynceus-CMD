@@ -10,21 +10,21 @@ def banner(m): print(f"\n{'='*60}\n  {m}\n{'='*60}")
 def main():
     t0 = time.time(); R = {}
 
-    banner("M121: kepler_loss_functions")
-    from lynceus.integrations.kepler_loss_functions import mse_loss, log_mse_loss, huber_loss, asymmetric_loss
+    banner("M121: kepler_losses")
+    from lynceus.integrations.kepler_losses import mse_loss, log_mse_loss, huber_loss, asymmetric_loss
     yt, yp = np.array([10.,20.,5.,15.]), np.array([12.,18.,7.,14.])
     vals = {n: float(f(yt,yp)) for n,f in [("mse",mse_loss),("log_mse",log_mse_loss),("huber",lambda a,b:huber_loss(a,b,delta=1.5)),("asym",lambda a,b:asymmetric_loss(a,b,alpha_over=2.0,alpha_under=1.0))]}
     print(f"  {vals}"); R["loss"] = vals; assert vals["mse"]>0; print("  ✓ OK")
 
-    banner("M122: kepler_model_base")
-    from lynceus.integrations.kepler_model_base import NumpyMLP
+    banner("M122: kepler_mlp_base")
+    from lynceus.integrations.kepler_mlp_base import NumpyMLP
     mlp = NumpyMLP(layer_dims=[8,16,8,4], activation="relu", dropout_rate=0.1)
     X = np.random.randn(32,8).astype(np.float32)
     out = mlp.forward(X, training=False)
     print(f"  {X.shape}→{out.shape} mean={out.mean():.4f}"); R["mlp"]={"shape":list(out.shape)}; assert out.shape==(32,4); print("  ✓ OK")
 
-    banner("M123: kepler_trainer_util")
-    from lynceus.integrations.kepler_trainer_util import get_np_type, normalize, one_hot
+    banner("M123: kepler_training_prep")
+    from lynceus.integrations.kepler_training_prep import get_np_type, normalize, one_hot
     print(f"  float→{get_np_type('float')}")
     normed = normalize(np.random.randn(50,3).astype(np.float32))[0]
     print(f"  normalized mean≈{normed.mean(axis=0).round(6)}")

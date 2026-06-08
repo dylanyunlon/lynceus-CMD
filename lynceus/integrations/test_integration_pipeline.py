@@ -181,7 +181,7 @@ class IntegrationTestRunner:
         from lynceus.integrations.videx_metadata_extended import (
             TableMeta, ColumnMeta, IndexMeta
         )
-        from lynceus.integrations.videx_histogram_calc import (
+        from lynceus.integrations.videx_histogram_builder import (
             StreamingHistogram, HybridNDVEstimator, HistogramBuilder
         )
         
@@ -322,7 +322,7 @@ class IntegrationTestRunner:
     
     def test_serialization_roundtrip(self):
         """Test serialization bridge round-trip."""
-        from lynceus.integrations.videx_pydantic import (
+        from lynceus.integrations.videx_schema import (
             SerializationBridge, SchemaEvolver, TypeRegistry
         )
         
@@ -344,7 +344,7 @@ class IntegrationTestRunner:
     
     def test_data_utils_pipeline(self):
         """Test data ingestion utilities."""
-        from lynceus.integrations.par2qo_data import (
+        from lynceus.integrations.par2qo_ingestion import (
             HyperLogLogSketch, PQOCombinationTokenizer, FrequencyAggregator
         )
         

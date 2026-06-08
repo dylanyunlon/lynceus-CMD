@@ -1,5 +1,5 @@
 """
-M196: kepler_cost_predictor — MLP Query Cost Predictor with Online Learning
+M196: kepler_cost_mlp — MLP Query Cost Predictor with Online Learning
 Upstream: kepler model training infrastructure (~400L across multiple files)
 Algorithm changes (20%):
   - Xavier/Glorot initialization (upstream: random)
@@ -202,7 +202,7 @@ class CostPredictor:
 
 
 if __name__ == "__main__":
-    print("=== M196 kepler_cost_predictor self-test ===")
+    print("=== M196 kepler_cost_mlp self-test ===")
     
     fe = FeatureExtractor()
     plan = {"num_tables": 3, "num_joins": 2, "estimated_rows": 50000,

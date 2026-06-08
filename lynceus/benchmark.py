@@ -17,11 +17,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from .schema import (BenchmarkOutput, MetricKind, MethodResult, PanelResult,
                      RoutingStrategy, SeedCurve)
-from .cost_model import (CostModelEngine, CPUCostModel, GPUCostModel,
+from .costing import (CostModelEngine, CPUCostModel, GPUCostModel,
                          QueryDescriptor, QueryType, CostBreakdown,
                          create_default_topology)
 from .router import Router
-from .strategies.base import RoutingStrategyBase
+from .strategies.foundation import RoutingStrategyBase
 
 
 @dataclass
@@ -125,7 +125,7 @@ class StrategyExecutor:
         return self.execute_strategy(RoutingStrategy.CPU_ONLY, queries, data_location)
     def execute_hybrid_static(self, queries, data_location="cpu0", **_kw):
         return self.execute_strategy(RoutingStrategy.HYBRID_STATIC, queries, data_location)
-    def execute_cost_model_routed(self, queries, data_location="cpu0"):
+    def execute_costing_routed(self, queries, data_location="cpu0"):
         return self.execute_strategy(RoutingStrategy.COST_MODEL_ROUTED, queries, data_location)
     def execute_par2qo_enhanced(self, queries, data_location="cpu0"):
         return self.execute_strategy(RoutingStrategy.PAR2QO_ENHANCED, queries, data_location)

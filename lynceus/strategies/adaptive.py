@@ -13,9 +13,9 @@ import math
 import random as _random
 from collections import defaultdict
 from typing import Dict, List, Optional
-from ..cost_model import CostBreakdown, CostModelEngine, QueryDescriptor
+from ..costing import CostBreakdown, CostModelEngine, QueryDescriptor
 from ..schema import HardwareKind
-from .base import RoutingDecision, RoutingStrategyBase
+from .foundation import RoutingDecision, RoutingStrategyBase
 
 
 def _beta_sample(alpha: float, beta: float) -> float:

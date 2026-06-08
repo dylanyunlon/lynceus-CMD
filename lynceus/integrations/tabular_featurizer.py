@@ -1,5 +1,5 @@
 """
-lynceus/integrations/tabular_connector.py — Tabular index-build cost bridge.
+lynceus/integrations/tabular_featurizer.py — Tabular index-build cost bridge.
 
 Ported from upstream/tabular (sfu-dis/tabular):
   - src/tabular/table_group.{h,cc}    → TableGroup lifecycle simulation
@@ -286,7 +286,7 @@ def estimate_btree_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     )
 
     if config.debug_print:
-        print(f"\n[tabular_connector] BTree build estimation completed in {elapsed*1000:.2f}ms")
+        print(f"\n[tabular_featurizer] BTree build estimation completed in {elapsed*1000:.2f}ms")
         print(result.dump_debug("  "))
         print(f"  [DEBUG] fanout computation: node={BTREE_NODE_SIZE_BYTES}B, "
               f"header={BTREE_HEADER_BYTES}B, entry={config.key_size_bytes}+"
@@ -347,7 +347,7 @@ def estimate_hash_build_cost(config: IndexBuildConfig) -> IndexBuildCost:
     )
 
     if config.debug_print:
-        print(f"\n[tabular_connector] Hash build estimation completed in {elapsed*1000:.2f}ms")
+        print(f"\n[tabular_featurizer] Hash build estimation completed in {elapsed*1000:.2f}ms")
         print(result.dump_debug("  "))
         print(f"  [DEBUG] load_factor={alpha:.3f}, buckets={n_buckets:,}, "
               f"entries/bucket={entries_per_bucket}")
@@ -469,7 +469,7 @@ def estimate_index_build(
 ) -> IndexBuildCost:
     """High-level API: estimate the cost of building an index.
 
-    This is the main entry point for Lynceus cost_model.py to call.
+    This is the main entry point for Lynceus costing.py to call.
     It bridges upstream tabular's index infrastructure into a cost number
     that the router can compare against GPU kernel costs.
     """
@@ -483,7 +483,7 @@ def estimate_index_build(
 
     if debug_print:
         print(f"\n{'='*60}")
-        print(f"[tabular_connector] estimate_index_build()")
+        print(f"[tabular_featurizer] estimate_index_build()")
         print(f"  table_name  = {table_name}")
         print(f"  n_rows      = {n_rows:,}")
         print(f"  key_size    = {key_size}B")
@@ -549,7 +549,7 @@ def trace_insert_progress(step: int, total: int, cost_so_far_ns: float,
         for step in range(n_steps):
             ...
             if step % trace_every == 0:
-                tabular_connector.trace_insert_progress(step, n_steps, cumulative_ns, config)
+                tabular_featurizer.trace_insert_progress(step, n_steps, cumulative_ns, config)
     """
     pct = 100.0 * step / max(1, total)
     rate = step / max(1e-9, cost_so_far_ns / 1e9)  # inserts/sec
@@ -560,7 +560,7 @@ def trace_insert_progress(step: int, total: int, cost_so_far_ns: float,
 def compare_index_types(table_name: str, n_rows: int, key_size: int = 8) -> Dict[str, IndexBuildCost]:
     """Compare BTree vs Hash build costs — useful for experiment analysis."""
     print(f"\n{'='*60}")
-    print(f"[tabular_connector] Index Type Comparison: {table_name} ({n_rows:,} rows)")
+    print(f"[tabular_featurizer] Index Type Comparison: {table_name} ({n_rows:,} rows)")
     print(f"{'='*60}")
 
     results = {}

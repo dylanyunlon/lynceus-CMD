@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-scripts/cost_model_accuracy.py — CostModel 预测准确性评估 (M291-M300)
+scripts/costing_accuracy.py — CostModel 预测准确性评估 (M291-M300)
 
 生成 1000 个随机查询，对每个查询:
-  1. cost_model.recommend() → 推荐设备 + 预估延迟
+  1. costing.recommend() → 推荐设备 + 预估延迟
   2. scheduler.schedule()   → 真实延迟 (pipeline critical path)
   3. 对比推荐 vs 非推荐设备的延迟差距
 
@@ -14,10 +14,10 @@ scripts/cost_model_accuracy.py — CostModel 预测准确性评估 (M291-M300)
   - 推荐 vs 非推荐延迟差距: 推荐设备的真实延迟 相对 非推荐设备均值的节省
 
 用法:
-    python scripts/cost_model_accuracy.py
-    python scripts/cost_model_accuracy.py --num-queries 500 --seed 42
+    python scripts/costing_accuracy.py
+    python scripts/costing_accuracy.py --num-queries 500 --seed 42
 
-输出: output/cost_model_accuracy.json
+输出: output/costing_accuracy.json
 """
 
 import argparse
@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ["LYNCEUS_DBG"] = "0"  # 关闭 debug 噪声
 
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, CostBreakdown, QueryDescriptor, QueryType,
     create_default_topology,
 )
@@ -330,12 +330,12 @@ def main():
     parser.add_argument("--data-location", type=str, default="cpu0",
                         help="Initial data location (default: cpu0)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output JSON path (default: output/cost_model_accuracy.json)")
+                        help="Output JSON path (default: output/costing_accuracy.json)")
     args = parser.parse_args()
 
     out_path = args.output or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "output",
-        "cost_model_accuracy.json")
+        "costing_accuracy.json")
 
     result = evaluate(
         num_queries=args.num_queries,

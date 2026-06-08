@@ -53,7 +53,7 @@ class PQOEvalConfig:
 # Query-ID helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _kepler_query_id(pqo_qid: str) -> str:
+def _kepler_sql_features_id(pqo_qid: str) -> str:
     """Convert PQO style 'q7-t0' -> kepler style '7-0'."""
     # pqo_qid: q{A}-t{B}
     parts = pqo_qid.split("-")
@@ -368,8 +368,8 @@ if __name__ == "__main__":
         assert hm2 <= am2 + 1e-9, "Harmonic mean should not exceed arithmetic mean"
 
         # Query ID conversion
-        assert _kepler_query_id("q7-t0") == "7-0"
-        assert _kepler_query_id("q16-t0") == "16-0"
+        assert _kepler_sql_features_id("q7-t0") == "7-0"
+        assert _kepler_sql_features_id("q16-t0") == "16-0"
 
         # Welford stability
         acc = _WelfordAcc()

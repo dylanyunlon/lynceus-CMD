@@ -112,9 +112,9 @@ class LatencySimulator:
         self._history.append(result)
         return round(result, 5)
     
-    def get_plan_cost(self, cost_model, n_rows, hint=None):
+    def get_plan_cost(self, costing, n_rows, hint=None):
         """Get simulated plan cost with optional hint adjustment."""
-        base = cost_model.estimate_cost(n_rows)
+        base = costing.estimate_cost(n_rows)
         if hint:
             base *= 0.85  # Hinted plans slightly cheaper
         return base

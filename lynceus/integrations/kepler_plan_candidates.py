@@ -737,7 +737,7 @@ def generate_by_row_num_evolution(
 if __name__ == "__main__":
     enable_debug(True)
     print("=" * 60)
-    print("  kepler_plan_candidates — self-test")
+    print("  kepler_plan_fingerprint_candidates — self-test")
     print("=" * 60)
 
     qm = SimulatedQueryManager(seed=99)

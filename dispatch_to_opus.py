@@ -235,17 +235,17 @@ def build_porting_prompt():
 
 ## 你需要输出以下6个文件（每个文件用 ```python 代码块，第一行写 # FILE: 文件名）
 
-1. **# FILE: kepler_loss_functions.py** — 损失函数 (numpy实现 MSE/LogMSE，额外加 Huber loss 和 asymmetric loss)
-2. **# FILE: kepler_model_base.py** — 模型基类 (numpy MLP前向传播，Xavier初始化，ReLU/GELU激活，dropout用mask)
+1. **# FILE: kepler_losses.py** — 损失函数 (numpy实现 MSE/LogMSE，额外加 Huber loss 和 asymmetric loss)
+2. **# FILE: kepler_mlp_base.py** — 模型基类 (numpy MLP前向传播，Xavier初始化，ReLU/GELU激活，dropout用mask)
 3. **# FILE: kepler_trainer.py** — 训练器 (Classification/Regression/NearOptimal三种，numpy SGD+momentum+weight decay)
-4. **# FILE: kepler_trainer_util.py** — 工具函数 (类型转换、预处理、sample_weight计算，无TF)
+4. **# FILE: kepler_training_prep.py** — 工具函数 (类型转换、预处理、sample_weight计算，无TF)
 5. **# FILE: kepler_workload.py** — 工作负载管理 (QueryInstance/Workload/WorkloadGenerator，加reservoir采样)
 6. **# FILE: kepler_db_simulator.py** — 数据库模拟器 (PlannedQuery/DatabaseSimulator，加延迟抖动模拟和缓存)
 
 每个文件 200-400 行，总计 ~1800 行。关键：
 - 每个函数必须有 `_dbg()` 调用
 - 算法部分真正改动（不是改注释）
-- 可以直接运行 `python3 -c "import kepler_loss_functions"` 无报错
+- 可以直接运行 `python3 -c "import kepler_losses"` 无报错
 
 开始输出代码："""
 

@@ -1,5 +1,5 @@
 """
-kepler_model â Numpy MLP model base for Lynceus.
+kepler_mlp â Numpy MLP model base for Lynceus.
 
 Ported from upstream/kepler/code/model.py (~180 lines of Keras model).
 Algorithm changes (~20%):
@@ -19,7 +19,7 @@ _DBG = bool(os.environ.get("LYNCEUS_DBG", ""))
 def _dbg(tag, **kw):
     if _DBG:
         items = ", ".join(f"{k}={v!r}" for k, v in kw.items())
-        print(f"[kepler_model] {tag}: {items}")
+        print(f"[kepler_mlp] {tag}: {items}")
 
 
 # ââ Activation helpers âââââââââââââââââââââââââââââââââââââââââââ

@@ -19,7 +19,7 @@
 from __future__ import annotations
 import sys
 from .schema import HardwareKind
-from .cost_model import (
+from .costing import (
     HardwareNode, HardwareTopology, TopologyEdge, CostModelEngine,
 )
 
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     print("=== ags1 Topology Debug ===")
     engine = create_ags1_engine(debug=True)
     # 快速测试: 估计一个scan query在各device上的cost
-    from .cost_model import QueryDescriptor, QueryType
+    from .costing import QueryDescriptor, QueryType
     q = QueryDescriptor(
         query_id="test_scan", query_type=QueryType.SCAN,
         estimated_rows=1_000_000, estimated_width_bytes=64,

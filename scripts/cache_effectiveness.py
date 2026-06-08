@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ.setdefault("LYNCEUS_DBG", "0")
 
-from lynceus.cost_model import QueryDescriptor, QueryType
+from lynceus.costing import QueryDescriptor, QueryType
 from lynceus.cache_manager import TopologyCacheManager, DEFAULT_BLOCK_BYTES
 from lynceus.schema import (
     HardwareKind, HardwareNode, HardwareTopology, TopologyEdge,

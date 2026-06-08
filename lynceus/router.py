@@ -17,9 +17,9 @@ import hashlib
 import math
 import struct
 from typing import Dict, List, Optional, Tuple
-from .cost_model import CostModelEngine, QueryDescriptor
+from .costing import CostModelEngine, QueryDescriptor
 from .schema import RoutingStrategy
-from .strategies.base import RoutingDecision, RoutingStrategyBase
+from .strategies.foundation import RoutingDecision, RoutingStrategyBase
 from .strategies.static import CPUOnlyStrategy, GPUOnlyStrategy, HybridStaticStrategy
 from .strategies.cost_driven import CostModelRoutedStrategy, PAR2QOEnhancedStrategy
 from .strategies.adaptive import AdaptiveStrategy

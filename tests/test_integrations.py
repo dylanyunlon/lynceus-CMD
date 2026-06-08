@@ -81,7 +81,7 @@ try:
     run("tabular_bridge: compute_btree_height", lambda: assert_(compute_btree_height(1000000, 100) >= 1))
 except ImportError as e: skip("tabular_bridge", str(e))
 
-skip("videx_cost_model", "requires cachetools")
+skip("videx_costing", "requires cachetools")
 skip("videx_histogram", "requires pydantic")
 
 print(f"\n{'='*60}\n  RESULTS: {passed} passed, {failed} failed, {skipped} skipped\n{'='*60}")

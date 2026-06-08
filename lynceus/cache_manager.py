@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from .cost_model import QueryDescriptor
+from .costing import QueryDescriptor
 from .schema import HardwareKind, HardwareTopology
 
 DEFAULT_BLOCK_BYTES: int = 2 * (1 << 20)

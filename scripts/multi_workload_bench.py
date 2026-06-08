@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine,
     QueryDescriptor,
     QueryType,

@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ.setdefault("LYNCEUS_DEBUG", "0")
 
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, QueryDescriptor, QueryType, create_default_topology,
 )
 from lynceus.pipeline_scheduler import QueryPipelineScheduler

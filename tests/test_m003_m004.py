@@ -26,7 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lynceus.schema import RoutingStrategy
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, QueryDescriptor, QueryType, create_default_topology,
 )
 from lynceus.router import Router
@@ -148,7 +148,7 @@ def test_hybrid_threshold():
     print("  PASS: HybridStaticStrategy threshold")
 
 
-def test_cost_model_routed_matches_engine():
+def test_costing_routed_matches_engine():
     engine = _make_engine()
     s = CostModelRoutedStrategy(engine)
     q = _make_query(rows=500_000)
@@ -277,7 +277,7 @@ if __name__ == "__main__":
     test_gpu_only_routes_to_gpu()
     test_cpu_only_routes_to_cpu()
     test_hybrid_threshold()
-    test_cost_model_routed_matches_engine()
+    test_costing_routed_matches_engine()
     test_par2qo_robustness()
     test_adaptive_warmup()
     test_adaptive_ema_correction()

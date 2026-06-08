@@ -4,7 +4,7 @@ dispatch_m135_m140.py — M135-M140 里程碑: training_data_collection_pipeline
 向 Opus 4.6 子模型发送6个移植任务批次, 收集代码 → 验证 → 实验
 
 本轮移植范围:
-  M135: kepler_plan_candidates.py      ← pg_generate_plan_candidates + pg_perturb_plan_cardinalities
+  M135: kepler_plan_fingerprint_candidates.py      ← pg_generate_plan_candidates + pg_perturb_plan_cardinalities
   M136: kepler_training_execution.py   ← pg_execute_training_data_queries + pg_execute_explain_tools
   M137: kepler_hint_extractor.py       ← pg_plan_hint_extractor + query_text_utils + query_plan_utils
   M138: kepler_param_gen_pipeline.py   ← parameter_generator + param_gen_new + param_PQO_files_generate
@@ -262,7 +262,7 @@ def main():
         {
             "milestone": "M135",
             "output_files": {
-                "kepler_plan_candidates.py": 
+                "kepler_plan_fingerprint_candidates.py": 
                     "查询计划候选生成: powerset配置组合 + 计划去重 + 基数扰动. "
                     "用ThreadPoolExecutor替代multiprocessing, 加入Jaccard plan similarity去重, "
                     "基数扰动用log-normal噪声替代均匀分布",

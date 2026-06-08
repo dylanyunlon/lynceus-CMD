@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("LYNCEUS_DEBUG", "0")
 
 from lynceus.topology_ags1 import create_ags1_topology, create_ags1_engine
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, QueryDescriptor, QueryType, CostBreakdown,
 )
 from lynceus.pipeline_scheduler import QueryPipelineScheduler

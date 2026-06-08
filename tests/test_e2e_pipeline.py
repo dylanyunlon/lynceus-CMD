@@ -26,7 +26,7 @@ from lynceus.schema import (
     HardwareKind, HardwareNode, HardwareTopology, TopologyEdge,
     RoutingStrategy, MethodResult, SeedCurve,
 )
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, QueryDescriptor, QueryType, CostBreakdown,
     create_default_topology,
 )

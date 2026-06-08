@@ -11,7 +11,7 @@ def run(name, fn):
     except Exception as e: print(f"  \033[31mFAIL\033[0m  {name}: {e}"); failed += 1
 print("=" * 60); print("  topology + sharding + gpu_cost_kernel tests"); print("=" * 60)
 
-from lynceus.cost_model import CostModelEngine, QueryDescriptor, QueryType, create_default_topology
+from lynceus.costing import CostModelEngine, QueryDescriptor, QueryType, create_default_topology
 from lynceus.schema import HardwareKind
 topo = create_default_topology()
 

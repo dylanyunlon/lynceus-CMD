@@ -17,7 +17,7 @@ from lynceus_port.schema import (
     MetricKind, MethodResult, PanelResult, RoutingStrategy, SeedCurve,
     TopologyEdge,
 )
-from lynceus_port.cost_model import (
+from lynceus_port.costing import (
     CostBreakdown, CostModelEngine, CPUCostModel, GPUCostModel,
     QueryDescriptor, QueryType, create_default_topology,
 )
@@ -118,7 +118,7 @@ def test_topology_transfer_cost():
     print("  PASS: Topology transfer cost")
 
 
-def test_cpu_cost_model_basic():
+def test_cpu_costing_basic():
     topo = create_default_topology()
     model = CPUCostModel()
     node = topo.get_node("cpu0")
@@ -141,7 +141,7 @@ def test_cpu_cost_model_basic():
     print("  PASS: CPU cost model (point < scan)")
 
 
-def test_gpu_cost_model_basic():
+def test_gpu_costing_basic():
     topo = create_default_topology()
     model = GPUCostModel()
     node = topo.get_node("gpu0")
@@ -164,7 +164,7 @@ def test_gpu_cost_model_basic():
     print("  PASS: GPU cost model (transfer + no-transfer)")
 
 
-def test_cost_model_routing_logic():
+def test_costing_routing_logic():
     topo = create_default_topology()
     engine = CostModelEngine(topo)
 
@@ -271,9 +271,9 @@ if __name__ == "__main__":
     test_method_result_serialization()
     test_benchmark_output_save_load()
     test_topology_transfer_cost()
-    test_cpu_cost_model_basic()
-    test_gpu_cost_model_basic()
-    test_cost_model_routing_logic()
+    test_cpu_costing_basic()
+    test_gpu_costing_basic()
+    test_costing_routing_logic()
     test_seed_reproducibility()
     test_zero_row_query()
     test_bug1_seed_overflow()

@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("LYNCEUS_DEBUG", "0")
 
 from lynceus.schema import RoutingStrategy, MethodResult, SeedCurve
-from lynceus.cost_model import (
+from lynceus.costing import (
     CostModelEngine, QueryDescriptor, QueryType, create_default_topology,
 )
 from lynceus.pipeline_scheduler import QueryPipelineScheduler, decompose_query

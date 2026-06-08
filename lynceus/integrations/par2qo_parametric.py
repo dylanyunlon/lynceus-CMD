@@ -540,7 +540,7 @@ class HeterogeneousPlanDiagram:
     def _dbg():
         """Enable debug output for all HeterogeneousPlanDiagram instances."""
         _dbg_enable()
-        print("[par2qo_connector] Debug mode enabled — Pareto frontier, "
+        print("[par2qo_parametric] Debug mode enabled — Pareto frontier, "
               "softmax reweighting, and bootstrap CI diagnostics will print.")
 
     # -------------------------------------------------------------------
