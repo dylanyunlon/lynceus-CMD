@@ -1,0 +1,17 @@
+\begin{table}[htbp]
+\centering
+\caption{Strategy Comparison — TPC-H SF100 (2000 steps $\times$ 3 seeds)}
+\label{tab:strategy-comparison}
+\begin{tabular}{clrrrrr}
+\toprule
+Rank & Strategy & Mean ($\mu$s) & Std ($\mu$s) & P95 ($\mu$s) & Entropy & Cache Hit \\
+\midrule
+  \#1 & CostModel-Routed & \textbf{4689.5} & 183.5 & \textbf{15097.7} & 0.000 & 99.9% \\
+  \#2 & PAR2QO-Enhanced & 4744.8 & 12.2 & 15105.3 & 0.000 & 99.9% \\
+  \#3 & GPU-Only & 4865.7 & 125.9 & 15104.2 & 0.000 & 99.9% \\
+  \#4 & Hybrid-Static & 5837.6 & 100.0 & 15105.9 & 0.673 & 99.9% \\
+  \#5 & Adaptive & 12308.9 & 235.8 & 47417.1 & \textbf{1.738} & 99.1% \\
+  \#6 & CPU-Only & 18373.3 & 436.1 & 47073.9 & 0.000 & 0.0% \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -75,24 +75,45 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
     def name(self) -> str:
         return "PAR2QO-Enhanced"
 
-    def _fpl_select(self, estimates: Dict[str, CostBreakdown]) -> str:
-        """Follow the Perturbed Leader with annealing exploration.
-        前T_warmup步用较大扰动探索, 之后退火到精细选择。
+    def _fpl_select(self, estimates: Dict[str, CostBreakdown],
+                    query: Optional[QueryDescriptor] = None) -> str:
+        """Follow the Perturbed Leader with momentum + query-aware transfer penalty.
+        改动: 加入momentum防止设备间振荡, transfer penalty按query type加权。
         扰动分布: Exp(1/η_t), η_t = η_0 / sqrt(1 + t/T_warmup)
-        使得在线后悔 O(√(T·ln N)) 且前期充分探索各device"""
+        Momentum: 最近device的EMA, 切换时加switching cost"""
         T_warmup = 30
         anneal = self._fpl_eta / math.sqrt(1.0 + self._fpl_step / max(1, T_warmup))
+        # Query-type transfer sensitivity (改动: 替代固定0.12)
+        xfer_sens = 0.12
+        if query is not None:
+            from ..costing import QueryType
+            _sens_map = {
+                QueryType.JOIN: 0.22,           # joins最怕transfer
+                QueryType.FULL_TABLE_SCAN: 0.20,
+                QueryType.RANGE_SCAN: 0.16,
+                QueryType.AGGREGATE: 0.14,
+                QueryType.SORT: 0.13,
+                QueryType.INDEX_SCAN: 0.08,
+                QueryType.POINT_LOOKUP: 0.05,   # point lookup transfer不敏感
+            }
+            xfer_sens = _sens_map.get(query.query_type, 0.12)
         perturbed_loss: Dict[str, float] = {}
         for dev_id, cb in estimates.items():
             noise = _random.expovariate(1.0 / max(1e-8, anneal))
-            # 用transfer-aware penalty: 高transfer占比的估计额外惩罚
             transfer_penalty = 0.0
             if cb.total_us > 0:
                 transfer_ratio = cb.transfer_cost_us / cb.total_us
-                transfer_penalty = transfer_ratio * 0.12 * cb.total_us
+                transfer_penalty = transfer_ratio * xfer_sens * cb.total_us
+            # Momentum: 如果最近选了这个device, 给一个switching cost discount
+            momentum_bonus = 0.0
+            if hasattr(self, '_last_chosen') and self._last_chosen == dev_id:
+                momentum_bonus = -0.05 * cb.total_us  # 倾向不切换
             perturbed_loss[dev_id] = (self._cum_loss[dev_id]
-                                      + cb.total_us + transfer_penalty - noise)
-        return min(perturbed_loss, key=perturbed_loss.get)
+                                      + cb.total_us + transfer_penalty
+                                      + momentum_bonus - noise)
+        chosen = min(perturbed_loss, key=perturbed_loss.get)
+        self._last_chosen = chosen
+        return chosen
 
     def _hedge_weight_for(self, device_id: str) -> float:
         """返回Hedge算法下device的归一化权重"""
@@ -117,8 +138,8 @@ class PAR2QOEnhancedStrategy(RoutingStrategyBase):
                 cost=cb, confidence=0.5,
                 metadata={"reason": "fallback_incomplete_topology"})
 
-        # FPL选择: 在所有device中选扰动后loss最小的
-        fpl_chosen = self._fpl_select(estimates)
+        # FPL选择: 在所有device中选扰动后loss最小的 (改动: 传入query用于type-aware penalty)
+        fpl_chosen = self._fpl_select(estimates, query)
 
         # Hedge修正: 用hedge权重调整FPL选择
         # 如果hedge权重表示FPL选的device权重太低, 转向权重最高的

@@ -1,0 +1,17 @@
+\begin{table}[htbp]
+\centering
+\caption{Mean Latency ($\mu$s) Across Workloads and Strategies}
+\label{tab:multi-workload}
+\begin{tabular}{lrrr}
+\toprule
+Strategy & TPC-H & TPC-DS & YCSB \\
+\midrule
+  GPU-Only & 36131.0 & 23689.3 & 9473.9 \\
+  CPU-Only & 334846.6 & 214597.6 & 76045.5 \\
+  Hybrid-Static & 37278.8 & 25108.6 & 11403.4 \\
+  CostModel-Routed & \textbf{33555.0} & \textbf{21828.1} & \textbf{8715.7} \\
+  PAR2QO-Enhanced & 33852.8 & 21958.5 & 8748.9 \\
+  Adaptive & 166841.4 & 111124.1 & 44141.1 \\
+\bottomrule
+\end{tabular}
+\end{table}

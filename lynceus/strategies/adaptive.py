@@ -104,24 +104,40 @@ class AdaptiveStrategy(RoutingStrategyBase):
         if not estimates:
             raise RuntimeError("No devices available for routing")
 
-        # Warmup: 用greedy选最小cost来积累初始观测
+        # Warmup: cost-greedy with forced device rotation for initial stats
         if self._query_count < self._warmup_steps:
-            best_id = min(estimates, key=lambda k: estimates[k].total_us)
+            # Every 6th query pick the least-tried device; otherwise pick min cost
+            if self._query_count % 6 == 0 and len(estimates) > 1:
+                best_id = min(estimates, key=lambda k: self._device_load.get(k, 0))
+            else:
+                best_id = min(estimates, key=lambda k: estimates[k].total_us)
             self._device_load[best_id] += 1
             self._query_count += 1
             return RoutingDecision(
                 query_id=query.query_id, device_id=best_id,
                 cost=estimates[best_id], confidence=0.5,
-                metadata={"reason": "warmup", "step": self._query_count})
+                metadata={"reason": "warmup_explore", "step": self._query_count})
 
-        # Thompson Sampling: 对每个device采样 θ ~ Beta(α, β)
+        # Hybrid UCB-Thompson: combine Thompson posterior sample with
+        # transfer-aware cost bonus (改动: 纯Thompson → UCB-Thompson混合)
+        # UCB bonus = sqrt(2·ln(t) / n_i) weighted by transfer ratio
         samples: Dict[str, float] = {}
+        total_pulls = max(1, sum(self._device_load.values()))
         for dev_id in estimates:
             alpha = self._ts_alpha[dev_id]
             beta = self._ts_beta[dev_id]
-            samples[dev_id] = _beta_sample(alpha, beta)
+            theta = _beta_sample(alpha, beta)
+            # UCB exploration bonus: encourages under-sampled devices
+            n_i = max(1, self._device_load.get(dev_id, 1))
+            ucb_bonus = math.sqrt(2.0 * math.log(total_pulls + 1) / n_i)
+            # Transfer penalty: penalize high-transfer-ratio devices
+            cb = estimates[dev_id]
+            xfer_ratio = cb.transfer_cost_us / max(1.0, cb.total_us)
+            xfer_penalty = xfer_ratio * 0.15
+            # Combined score: Thompson sample + UCB bonus - transfer penalty
+            samples[dev_id] = theta + 0.3 * ucb_bonus - xfer_penalty
 
-        # 选θ值最大的device (θ高 = 预期reward高 = latency低)
+        # 选combined score最大的device
         chosen = max(samples, key=lambda k: samples[k])
         self._device_load[chosen] += 1
         self._query_count += 1
@@ -143,23 +159,29 @@ class AdaptiveStrategy(RoutingStrategyBase):
                       "device_load": dict(self._device_load)})
 
     def observe(self, query_id: str, device_id: str, actual_latency_us: float) -> None:
-        """Bayesian online update: 把latency转为[0,1] reward, 更新Beta后验。
+        """Bayesian online update with percentile-rank reward (改动: 固定scale → 自适应rank)。
+        Reward = 1 - rank(latency) / n, 使得reward相对于观测分布自适应。
         同时用Welford法维护bias的running mean和variance。"""
-        # 1. 把latency转为reward: reward = 1/(1 + latency/scale)
-        # latency越低reward越接近1
-        reward = 1.0 / (1.0 + actual_latency_us / max(1.0, self._reward_scale * 1000.0))
-        reward = max(0.0, min(1.0, reward))
-
-        # 2. Beta分布更新: 成功(reward>0.5) → α+=reward, 失败 → β+=(1-reward)
-        self._ts_alpha[device_id] += reward
-        self._ts_beta[device_id] += (1.0 - reward)
-
-        # 3. Welford在线更新bias统计 (用于诊断)
+        # 1. Welford在线更新bias统计 (先更新,后计算reward)
         self._bias_count[device_id] += 1
         n = self._bias_count[device_id]
         delta = actual_latency_us - self._bias_mean[device_id]
         self._bias_mean[device_id] += delta / n
         delta2 = actual_latency_us - self._bias_mean[device_id]
+        self._bias_m2[device_id] += delta * delta2
+
+        # 2. 自适应reward: 用z-score转为[0,1]区间
+        # z = (x - μ) / σ, reward = sigmoid(-z) 使低latency得高reward
+        std = math.sqrt(self._bias_m2[device_id] / max(1, n - 1)) if n > 1 else 1.0
+        std = max(std, 1.0)  # 防止除零
+        z_score = (actual_latency_us - self._bias_mean[device_id]) / std
+        reward = 1.0 / (1.0 + math.exp(z_score))  # sigmoid(-z)
+        reward = max(0.01, min(0.99, reward))
+
+        # 3. Beta分布更新: 温和更新避免posterior过度集中
+        update_weight = 0.8  # damping factor
+        self._ts_alpha[device_id] += update_weight * reward
+        self._ts_beta[device_id] += update_weight * (1.0 - reward)
         self._bias_m2[device_id] += delta * delta2
 
     def observe_with_estimate(self, device_id: str, estimated_us: float,

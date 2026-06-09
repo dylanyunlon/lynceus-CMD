@@ -1,0 +1,18 @@
+\begin{table}[htbp]
+\centering
+\caption{Ablation Study — Effect of Individual Algorithm Changes}
+\label{tab:ablation}
+\begin{tabular}{lrrrrrl}
+\toprule
+Ablation & Baseline ($\mu$s) & Ablated ($\mu$s) & $\Delta$ ($\mu$s) & Cohen's $d$ & $p$-value & Effect \\
+\midrule
+  phase\_shift\_vs\_fixed\_zipf & 4778.5 & 3948.4 & +830.1 & +0.157 & \textbf{$<$0.001} & negligible \\
+  numa\_local\_vs\_cross & 4778.5 & 4778.5 & +0.0 & +0.000 & 1.0000 & negligible \\
+  welford\_vs\_naive\_variance & 4778.5 & 4778.5 & +0.0 & +0.000 & 1.0000 & precision_test \\
+  kahan\_vs\_naive\_sum & 4778534.3 & 4778534.3 & +0.0 & +0.000 & 1.0000 & precision_test \\
+  sigmoid\_soft\_vs\_hard\_threshold & 4778.5 & 4778.5 & +0.0 & +0.000 & 1.0000 & negligible \\
+  softmax\_anneal\_vs\_greedy & 4778.5 & 4778.5 & +0.0 & +0.000 & 1.0000 & negligible \\
+  adaptive\_margin\_vs\_fixed & 4778.5 & 4778.5 & +0.0 & +0.000 & 1.0000 & negligible \\
+\bottomrule
+\end{tabular}
+\end{table}

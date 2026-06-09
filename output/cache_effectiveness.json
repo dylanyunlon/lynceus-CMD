@@ -3,7 +3,7 @@
     "script": "scripts/cache_effectiveness.py",
     "task": "M301-M310",
     "description": "缓存效果分析 — 命中率 × cache_fraction",
-    "timestamp": "20260605_105634",
+    "timestamp": "20260609_102822",
     "params": {
       "steps": 300,
       "seeds": 3,
@@ -18,7 +18,7 @@
       ],
       "query_templates": 10
     },
-    "elapsed_seconds": 0.62
+    "elapsed_seconds": 0.39
   },
   "warmup_curve": {
     "description": "冷启动→预热命中率曲线 (cache_fraction=0.5)",

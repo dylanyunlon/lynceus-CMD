@@ -1,5 +1,5 @@
 """
-tests/test_port_m001_m002.py — Validation for lynceus_port M001-M002 deliverables.
+tests/test_m001_m002_validation.py — Validation for lynceus_port M001-M002 deliverables.
 
 Same tests as test_m001_m002.py but imports from lynceus_port.
 """

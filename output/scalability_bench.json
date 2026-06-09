@@ -18,7 +18,7 @@
     ],
     "n_combos": 25,
     "total_queries_executed": 8300,
-    "elapsed_seconds": 71.48,
+    "elapsed_seconds": 20.66,
     "seed": 42,
     "algorithms": {
       "cumulative": "Kahan compensated summation",
@@ -33,9 +33,9 @@
       "total_latency_us": 1150.26,
       "mean_latency_us": 115.03,
       "std_latency_us": 97.86,
-      "throughput_qps": 166.37,
+      "throughput_qps": 1595.42,
       "simulated_throughput_qps": 8693.68,
-      "wall_clock_sec": 0.0601,
+      "wall_clock_sec": 0.0063,
       "route_distribution": {
         "gpu3": 1,
         "gpu0": 9
@@ -48,9 +48,9 @@
       "total_latency_us": 4969.48,
       "mean_latency_us": 99.39,
       "std_latency_us": 79.39,
-      "throughput_qps": 171.78,
+      "throughput_qps": 1729.06,
       "simulated_throughput_qps": 10061.42,
-      "wall_clock_sec": 0.2911,
+      "wall_clock_sec": 0.0289,
       "route_distribution": {
         "gpu0": 48,
         "cpu0": 2
@@ -63,9 +63,9 @@
       "total_latency_us": 8579.16,
       "mean_latency_us": 85.79,
       "std_latency_us": 72.49,
-      "throughput_qps": 172.03,
+      "throughput_qps": 1729.42,
       "simulated_throughput_qps": 11656.15,
-      "wall_clock_sec": 0.5813,
+      "wall_clock_sec": 0.0578,
       "route_distribution": {
         "gpu0": 94,
         "cpu0": 6
@@ -78,9 +78,9 @@
       "total_latency_us": 45678.28,
       "mean_latency_us": 91.36,
       "std_latency_us": 82.97,
-      "throughput_qps": 184.84,
+      "throughput_qps": 1832.97,
       "simulated_throughput_qps": 10946.12,
-      "wall_clock_sec": 2.7051,
+      "wall_clock_sec": 0.2728,
       "route_distribution": {
         "gpu0": 464,
         "cpu0": 36
@@ -93,9 +93,9 @@
       "total_latency_us": 92776.41,
       "mean_latency_us": 92.78,
       "std_latency_us": 84.8,
-      "throughput_qps": 185.66,
+      "throughput_qps": 1901.12,
       "simulated_throughput_qps": 10778.6,
-      "wall_clock_sec": 5.3861,
+      "wall_clock_sec": 0.526,
       "route_distribution": {
         "gpu0": 914,
         "cpu0": 86
@@ -108,9 +108,9 @@
       "total_latency_us": 9825.5,
       "mean_latency_us": 982.55,
       "std_latency_us": 1031.99,
-      "throughput_qps": 172.05,
+      "throughput_qps": 1395.53,
       "simulated_throughput_qps": 1017.76,
-      "wall_clock_sec": 0.0581,
+      "wall_clock_sec": 0.0072,
       "route_distribution": {
         "gpu0": 10
       },
@@ -122,9 +122,9 @@
       "total_latency_us": 41374.08,
       "mean_latency_us": 827.48,
       "std_latency_us": 801.29,
-      "throughput_qps": 177.15,
+      "throughput_qps": 1681.94,
       "simulated_throughput_qps": 1208.49,
-      "wall_clock_sec": 0.2822,
+      "wall_clock_sec": 0.0297,
       "route_distribution": {
         "gpu0": 49,
         "cpu0": 1
@@ -137,9 +137,9 @@
       "total_latency_us": 69268.32,
       "mean_latency_us": 692.68,
       "std_latency_us": 727.66,
-      "throughput_qps": 175.8,
+      "throughput_qps": 1736.66,
       "simulated_throughput_qps": 1443.66,
-      "wall_clock_sec": 0.5688,
+      "wall_clock_sec": 0.0576,
       "route_distribution": {
         "gpu0": 98,
         "cpu0": 2
@@ -152,9 +152,9 @@
       "total_latency_us": 379815.72,
       "mean_latency_us": 759.63,
       "std_latency_us": 840.65,
-      "throughput_qps": 186.0,
+      "throughput_qps": 1807.79,
       "simulated_throughput_qps": 1316.43,
-      "wall_clock_sec": 2.6882,
+      "wall_clock_sec": 0.2766,
       "route_distribution": {
         "gpu0": 493,
         "cpu0": 7
@@ -167,9 +167,9 @@
       "total_latency_us": 774110.02,
       "mean_latency_us": 774.11,
       "std_latency_us": 858.25,
-      "throughput_qps": 186.48,
+      "throughput_qps": 1759.58,
       "simulated_throughput_qps": 1291.81,
-      "wall_clock_sec": 5.3625,
+      "wall_clock_sec": 0.5683,
       "route_distribution": {
         "gpu0": 984,
         "cpu0": 16
@@ -182,9 +182,9 @@
       "total_latency_us": 96577.83,
       "mean_latency_us": 9657.78,
       "std_latency_us": 10379.65,
-      "throughput_qps": 159.01,
+      "throughput_qps": 968.72,
       "simulated_throughput_qps": 103.54,
-      "wall_clock_sec": 0.0629,
+      "wall_clock_sec": 0.0103,
       "route_distribution": {
         "gpu0": 10
       },
@@ -196,9 +196,9 @@
       "total_latency_us": 405323.33,
       "mean_latency_us": 8106.47,
       "std_latency_us": 8028.63,
-      "throughput_qps": 155.89,
+      "throughput_qps": 916.55,
       "simulated_throughput_qps": 123.36,
-      "wall_clock_sec": 0.3207,
+      "wall_clock_sec": 0.0546,
       "route_distribution": {
         "gpu0": 50
       },
@@ -210,9 +210,9 @@
       "total_latency_us": 675832.51,
       "mean_latency_us": 6758.33,
       "std_latency_us": 7288.82,
-      "throughput_qps": 156.59,
+      "throughput_qps": 970.78,
       "simulated_throughput_qps": 147.97,
-      "wall_clock_sec": 0.6386,
+      "wall_clock_sec": 0.103,
       "route_distribution": {
         "gpu0": 100
       },
@@ -224,9 +224,9 @@
       "total_latency_us": 3719442.33,
       "mean_latency_us": 7438.88,
       "std_latency_us": 8425.61,
-      "throughput_qps": 163.18,
+      "throughput_qps": 963.6,
       "simulated_throughput_qps": 134.43,
-      "wall_clock_sec": 3.0642,
+      "wall_clock_sec": 0.5189,
       "route_distribution": {
         "gpu0": 500
       },
@@ -238,9 +238,9 @@
       "total_latency_us": 7583201.36,
       "mean_latency_us": 7583.2,
       "std_latency_us": 8601.5,
-      "throughput_qps": 155.77,
+      "throughput_qps": 986.94,
       "simulated_throughput_qps": 131.87,
-      "wall_clock_sec": 6.4197,
+      "wall_clock_sec": 1.0132,
       "route_distribution": {
         "gpu0": 1000
       },
@@ -252,9 +252,9 @@
       "total_latency_us": 482143.91,
       "mean_latency_us": 48214.39,
       "std_latency_us": 51925.06,
-      "throughput_qps": 105.45,
+      "throughput_qps": 358.38,
       "simulated_throughput_qps": 20.74,
-      "wall_clock_sec": 0.0948,
+      "wall_clock_sec": 0.0279,
       "route_distribution": {
         "gpu0": 10
       },
@@ -266,9 +266,9 @@
       "total_latency_us": 2022868.75,
       "mean_latency_us": 40457.37,
       "std_latency_us": 40150.52,
-      "throughput_qps": 92.62,
+      "throughput_qps": 288.83,
       "simulated_throughput_qps": 24.72,
-      "wall_clock_sec": 0.5399,
+      "wall_clock_sec": 0.1731,
       "route_distribution": {
         "gpu0": 50
       },
@@ -280,9 +280,9 @@
       "total_latency_us": 3371666.89,
       "mean_latency_us": 33716.67,
       "std_latency_us": 36449.87,
-      "throughput_qps": 98.38,
+      "throughput_qps": 322.01,
       "simulated_throughput_qps": 29.66,
-      "wall_clock_sec": 1.0165,
+      "wall_clock_sec": 0.3106,
       "route_distribution": {
         "gpu0": 100
       },
@@ -294,9 +294,9 @@
       "total_latency_us": 18562228.54,
       "mean_latency_us": 37124.46,
       "std_latency_us": 42136.76,
-      "throughput_qps": 104.44,
+      "throughput_qps": 325.14,
       "simulated_throughput_qps": 26.94,
-      "wall_clock_sec": 4.7873,
+      "wall_clock_sec": 1.5378,
       "route_distribution": {
         "gpu0": 500
       },
@@ -308,9 +308,9 @@
       "total_latency_us": 37845816.62,
       "mean_latency_us": 37845.82,
       "std_latency_us": 43016.17,
-      "throughput_qps": 106.29,
+      "throughput_qps": 321.97,
       "simulated_throughput_qps": 26.42,
-      "wall_clock_sec": 9.4086,
+      "wall_clock_sec": 3.1059,
       "route_distribution": {
         "gpu0": 1000
       },
@@ -322,9 +322,9 @@
       "total_latency_us": 964101.48,
       "mean_latency_us": 96410.15,
       "std_latency_us": 103856.82,
-      "throughput_qps": 66.98,
+      "throughput_qps": 165.44,
       "simulated_throughput_qps": 10.37,
-      "wall_clock_sec": 0.1493,
+      "wall_clock_sec": 0.0604,
       "route_distribution": {
         "gpu0": 10
       },
@@ -336,9 +336,9 @@
       "total_latency_us": 4044800.53,
       "mean_latency_us": 80896.01,
       "std_latency_us": 80302.89,
-      "throughput_qps": 65.69,
+      "throughput_qps": 164.68,
       "simulated_throughput_qps": 12.36,
-      "wall_clock_sec": 0.7612,
+      "wall_clock_sec": 0.3036,
       "route_distribution": {
         "gpu0": 50
       },
@@ -350,9 +350,9 @@
       "total_latency_us": 6741459.86,
       "mean_latency_us": 67414.6,
       "std_latency_us": 72901.18,
-      "throughput_qps": 74.09,
+      "throughput_qps": 188.14,
       "simulated_throughput_qps": 14.83,
-      "wall_clock_sec": 1.3498,
+      "wall_clock_sec": 0.5315,
       "route_distribution": {
         "gpu0": 100
       },
@@ -364,9 +364,9 @@
       "total_latency_us": 37115710.97,
       "mean_latency_us": 74231.42,
       "std_latency_us": 84275.69,
-      "throughput_qps": 74.12,
+      "throughput_qps": 178.93,
       "simulated_throughput_qps": 13.47,
-      "wall_clock_sec": 6.7457,
+      "wall_clock_sec": 2.7943,
       "route_distribution": {
         "gpu0": 500
       },
@@ -378,9 +378,9 @@
       "total_latency_us": 75674085.42,
       "mean_latency_us": 75674.09,
       "std_latency_us": 86034.51,
-      "throughput_qps": 72.93,
+      "throughput_qps": 177.41,
       "simulated_throughput_qps": 13.21,
-      "wall_clock_sec": 13.7124,
+      "wall_clock_sec": 5.6366,
       "route_distribution": {
         "gpu0": 1000
       },
@@ -398,9 +398,9 @@
           "total_latency_us": 1150.26,
           "mean_latency_us": 115.03,
           "std_latency_us": 97.86,
-          "throughput_qps": 166.37,
+          "throughput_qps": 1595.42,
           "simulated_throughput_qps": 8693.68,
-          "wall_clock_sec": 0.0601,
+          "wall_clock_sec": 0.0063,
           "route_distribution": {
             "gpu3": 1,
             "gpu0": 9
@@ -413,9 +413,9 @@
           "total_latency_us": 4969.48,
           "mean_latency_us": 99.39,
           "std_latency_us": 79.39,
-          "throughput_qps": 171.78,
+          "throughput_qps": 1729.06,
           "simulated_throughput_qps": 10061.42,
-          "wall_clock_sec": 0.2911,
+          "wall_clock_sec": 0.0289,
           "route_distribution": {
             "gpu0": 48,
             "cpu0": 2
@@ -428,9 +428,9 @@
           "total_latency_us": 8579.16,
           "mean_latency_us": 85.79,
           "std_latency_us": 72.49,
-          "throughput_qps": 172.03,
+          "throughput_qps": 1729.42,
           "simulated_throughput_qps": 11656.15,
-          "wall_clock_sec": 0.5813,
+          "wall_clock_sec": 0.0578,
           "route_distribution": {
             "gpu0": 94,
             "cpu0": 6
@@ -443,9 +443,9 @@
           "total_latency_us": 45678.28,
           "mean_latency_us": 91.36,
           "std_latency_us": 82.97,
-          "throughput_qps": 184.84,
+          "throughput_qps": 1832.97,
           "simulated_throughput_qps": 10946.12,
-          "wall_clock_sec": 2.7051,
+          "wall_clock_sec": 0.2728,
           "route_distribution": {
             "gpu0": 464,
             "cpu0": 36
@@ -458,9 +458,9 @@
           "total_latency_us": 92776.41,
           "mean_latency_us": 92.78,
           "std_latency_us": 84.8,
-          "throughput_qps": 185.66,
+          "throughput_qps": 1901.12,
           "simulated_throughput_qps": 10778.6,
-          "wall_clock_sec": 5.3861,
+          "wall_clock_sec": 0.526,
           "route_distribution": {
             "gpu0": 914,
             "cpu0": 86
@@ -479,9 +479,9 @@
           "total_latency_us": 9825.5,
           "mean_latency_us": 982.55,
           "std_latency_us": 1031.99,
-          "throughput_qps": 172.05,
+          "throughput_qps": 1395.53,
           "simulated_throughput_qps": 1017.76,
-          "wall_clock_sec": 0.0581,
+          "wall_clock_sec": 0.0072,
           "route_distribution": {
             "gpu0": 10
           },
@@ -493,9 +493,9 @@
           "total_latency_us": 41374.08,
           "mean_latency_us": 827.48,
           "std_latency_us": 801.29,
-          "throughput_qps": 177.15,
+          "throughput_qps": 1681.94,
           "simulated_throughput_qps": 1208.49,
-          "wall_clock_sec": 0.2822,
+          "wall_clock_sec": 0.0297,
           "route_distribution": {
             "gpu0": 49,
             "cpu0": 1
@@ -508,9 +508,9 @@
           "total_latency_us": 69268.32,
           "mean_latency_us": 692.68,
           "std_latency_us": 727.66,
-          "throughput_qps": 175.8,
+          "throughput_qps": 1736.66,
           "simulated_throughput_qps": 1443.66,
-          "wall_clock_sec": 0.5688,
+          "wall_clock_sec": 0.0576,
           "route_distribution": {
             "gpu0": 98,
             "cpu0": 2
@@ -523,9 +523,9 @@
           "total_latency_us": 379815.72,
           "mean_latency_us": 759.63,
           "std_latency_us": 840.65,
-          "throughput_qps": 186.0,
+          "throughput_qps": 1807.79,
           "simulated_throughput_qps": 1316.43,
-          "wall_clock_sec": 2.6882,
+          "wall_clock_sec": 0.2766,
           "route_distribution": {
             "gpu0": 493,
             "cpu0": 7
@@ -538,9 +538,9 @@
           "total_latency_us": 774110.02,
           "mean_latency_us": 774.11,
           "std_latency_us": 858.25,
-          "throughput_qps": 186.48,
+          "throughput_qps": 1759.58,
           "simulated_throughput_qps": 1291.81,
-          "wall_clock_sec": 5.3625,
+          "wall_clock_sec": 0.5683,
           "route_distribution": {
             "gpu0": 984,
             "cpu0": 16
@@ -559,9 +559,9 @@
           "total_latency_us": 96577.83,
           "mean_latency_us": 9657.78,
           "std_latency_us": 10379.65,
-          "throughput_qps": 159.01,
+          "throughput_qps": 968.72,
           "simulated_throughput_qps": 103.54,
-          "wall_clock_sec": 0.0629,
+          "wall_clock_sec": 0.0103,
           "route_distribution": {
             "gpu0": 10
           },
@@ -573,9 +573,9 @@
           "total_latency_us": 405323.33,
           "mean_latency_us": 8106.47,
           "std_latency_us": 8028.63,
-          "throughput_qps": 155.89,
+          "throughput_qps": 916.55,
           "simulated_throughput_qps": 123.36,
-          "wall_clock_sec": 0.3207,
+          "wall_clock_sec": 0.0546,
           "route_distribution": {
             "gpu0": 50
           },
@@ -587,9 +587,9 @@
           "total_latency_us": 675832.51,
           "mean_latency_us": 6758.33,
           "std_latency_us": 7288.82,
-          "throughput_qps": 156.59,
+          "throughput_qps": 970.78,
           "simulated_throughput_qps": 147.97,
-          "wall_clock_sec": 0.6386,
+          "wall_clock_sec": 0.103,
           "route_distribution": {
             "gpu0": 100
           },
@@ -601,9 +601,9 @@
           "total_latency_us": 3719442.33,
           "mean_latency_us": 7438.88,
           "std_latency_us": 8425.61,
-          "throughput_qps": 163.18,
+          "throughput_qps": 963.6,
           "simulated_throughput_qps": 134.43,
-          "wall_clock_sec": 3.0642,
+          "wall_clock_sec": 0.5189,
           "route_distribution": {
             "gpu0": 500
           },
@@ -615,9 +615,9 @@
           "total_latency_us": 7583201.36,
           "mean_latency_us": 7583.2,
           "std_latency_us": 8601.5,
-          "throughput_qps": 155.77,
+          "throughput_qps": 986.94,
           "simulated_throughput_qps": 131.87,
-          "wall_clock_sec": 6.4197,
+          "wall_clock_sec": 1.0132,
           "route_distribution": {
             "gpu0": 1000
           },
@@ -635,9 +635,9 @@
           "total_latency_us": 482143.91,
           "mean_latency_us": 48214.39,
           "std_latency_us": 51925.06,
-          "throughput_qps": 105.45,
+          "throughput_qps": 358.38,
           "simulated_throughput_qps": 20.74,
-          "wall_clock_sec": 0.0948,
+          "wall_clock_sec": 0.0279,
           "route_distribution": {
             "gpu0": 10
           },
@@ -649,9 +649,9 @@
           "total_latency_us": 2022868.75,
           "mean_latency_us": 40457.37,
           "std_latency_us": 40150.52,
-          "throughput_qps": 92.62,
+          "throughput_qps": 288.83,
           "simulated_throughput_qps": 24.72,
-          "wall_clock_sec": 0.5399,
+          "wall_clock_sec": 0.1731,
           "route_distribution": {
             "gpu0": 50
           },
@@ -663,9 +663,9 @@
           "total_latency_us": 3371666.89,
           "mean_latency_us": 33716.67,
           "std_latency_us": 36449.87,
-          "throughput_qps": 98.38,
+          "throughput_qps": 322.01,
           "simulated_throughput_qps": 29.66,
-          "wall_clock_sec": 1.0165,
+          "wall_clock_sec": 0.3106,
           "route_distribution": {
             "gpu0": 100
           },
@@ -677,9 +677,9 @@
           "total_latency_us": 18562228.54,
           "mean_latency_us": 37124.46,
           "std_latency_us": 42136.76,
-          "throughput_qps": 104.44,
+          "throughput_qps": 325.14,
           "simulated_throughput_qps": 26.94,
-          "wall_clock_sec": 4.7873,
+          "wall_clock_sec": 1.5378,
           "route_distribution": {
             "gpu0": 500
           },
@@ -691,9 +691,9 @@
           "total_latency_us": 37845816.62,
           "mean_latency_us": 37845.82,
           "std_latency_us": 43016.17,
-          "throughput_qps": 106.29,
+          "throughput_qps": 321.97,
           "simulated_throughput_qps": 26.42,
-          "wall_clock_sec": 9.4086,
+          "wall_clock_sec": 3.1059,
           "route_distribution": {
             "gpu0": 1000
           },
@@ -711,9 +711,9 @@
           "total_latency_us": 964101.48,
           "mean_latency_us": 96410.15,
           "std_latency_us": 103856.82,
-          "throughput_qps": 66.98,
+          "throughput_qps": 165.44,
           "simulated_throughput_qps": 10.37,
-          "wall_clock_sec": 0.1493,
+          "wall_clock_sec": 0.0604,
           "route_distribution": {
             "gpu0": 10
           },
@@ -725,9 +725,9 @@
           "total_latency_us": 4044800.53,
           "mean_latency_us": 80896.01,
           "std_latency_us": 80302.89,
-          "throughput_qps": 65.69,
+          "throughput_qps": 164.68,
           "simulated_throughput_qps": 12.36,
-          "wall_clock_sec": 0.7612,
+          "wall_clock_sec": 0.3036,
           "route_distribution": {
             "gpu0": 50
           },
@@ -739,9 +739,9 @@
           "total_latency_us": 6741459.86,
           "mean_latency_us": 67414.6,
           "std_latency_us": 72901.18,
-          "throughput_qps": 74.09,
+          "throughput_qps": 188.14,
           "simulated_throughput_qps": 14.83,
-          "wall_clock_sec": 1.3498,
+          "wall_clock_sec": 0.5315,
           "route_distribution": {
             "gpu0": 100
           },
@@ -753,9 +753,9 @@
           "total_latency_us": 37115710.97,
           "mean_latency_us": 74231.42,
           "std_latency_us": 84275.69,
-          "throughput_qps": 74.12,
+          "throughput_qps": 178.93,
           "simulated_throughput_qps": 13.47,
-          "wall_clock_sec": 6.7457,
+          "wall_clock_sec": 2.7943,
           "route_distribution": {
             "gpu0": 500
           },
@@ -767,9 +767,9 @@
           "total_latency_us": 75674085.42,
           "mean_latency_us": 75674.09,
           "std_latency_us": 86034.51,
-          "throughput_qps": 72.93,
+          "throughput_qps": 177.41,
           "simulated_throughput_qps": 13.21,
-          "wall_clock_sec": 13.7124,
+          "wall_clock_sec": 5.6366,
           "route_distribution": {
             "gpu0": 1000
           },

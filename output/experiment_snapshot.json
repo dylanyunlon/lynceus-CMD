@@ -1,0 +1,135 @@
+{
+  "timestamp": "20260609_102918",
+  "experiments": {
+    "ablation_results": {
+      "keys": [
+        "metadata",
+        "ablations"
+      ],
+      "size_bytes": 3898
+    },
+    "cache_effectiveness": {
+      "keys": [
+        "metadata",
+        "warmup_curve",
+        "cache_fraction_sweep",
+        "repeated_vs_random"
+      ],
+      "size_bytes": 107558
+    },
+    "cost_model_accuracy": {
+      "keys": [
+        "summary",
+        "per_query"
+      ],
+      "size_bytes": 363676
+    },
+    "costing_accuracy": {
+      "keys": [
+        "summary",
+        "per_query"
+      ],
+      "size_bytes": 363677
+    },
+    "cumulative_latency": {
+      "keys": [
+        "metadata",
+        "cumulative_mean"
+      ],
+      "size_bytes": 2468
+    },
+    "latency_vs_step": {
+      "keys": [
+        "metadata",
+        "mean",
+        "std",
+        "seeds"
+      ],
+      "size_bytes": 5442
+    },
+    "multi_workload": {
+      "keys": [
+        "metadata",
+        "fig1_data",
+        "fig2_data",
+        "fig3_data",
+        "fig4_data"
+      ],
+      "size_bytes": 614274
+    },
+    "scalability_bench": {
+      "keys": [
+        "metadata",
+        "matrix",
+        "by_table_size",
+        "by_batch_size",
+        "summary"
+      ],
+      "size_bytes": 22315
+    },
+    "sota_comparison": {
+      "keys": [
+        "experiment",
+        "workload",
+        "timestamp",
+        "our_methods",
+        "published_baselines"
+      ],
+      "size_bytes": 2577,
+      "results": {
+        "GPU-Only": {
+          "mean_us": 27.12,
+          "improvement_pct": 0.0,
+          "p99_us": 291.71
+        },
+        "CPU-Only": {
+          "mean_us": 57.36,
+          "improvement_pct": -111.5,
+          "p99_us": 599.14
+        },
+        "Hybrid-Static": {
+          "mean_us": 27.25,
+          "improvement_pct": -0.5,
+          "p99_us": 291.71
+        },
+        "CostModel-Routed": {
+          "mean_us": 23.12,
+          "improvement_pct": 14.7,
+          "p99_us": 237.28
+        },
+        "PAR2QO-Enhanced": {
+          "mean_us": 23.13,
+          "improvement_pct": 14.7,
+          "p99_us": 237.28
+        },
+        "Adaptive": {
+          "mean_us": 40.46,
+          "improvement_pct": -49.2,
+          "p99_us": 349.83
+        }
+      }
+    },
+    "strategy_comparison": {
+      "keys": [
+        "metadata",
+        "methods",
+        "ranking",
+        "smape_matrix"
+      ],
+      "size_bytes": 995526
+    }
+  },
+  "file_counts": {
+    "integration_py": 149,
+    "total_lines": 58799,
+    "scripts": 16,
+    "tests": 10,
+    "output_json": 10,
+    "output_tex": 3
+  },
+  "tex_tables": [
+    "table1_strategy_comparison.tex",
+    "table2_ablation.tex",
+    "table3_multi_workload.tex"
+  ]
+}
